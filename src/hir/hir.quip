@@ -1,0 +1,481 @@
+// HIR - High-level Intermediate Representation
+//
+// the AST lowered into a name-resolved, desugared form
+// - locals are numbered per function, identifiers referring to them become `Local` expressions
+// - names which are not locals stay as `Path` until item/import resolution is implemented
+// - `elif` chains become nested `If`, `while` becomes `Loop` + `Break`
+// - `.pin`, `.*`, `[]` and `!` become dedicated expression kinds
+//
+// every node lives inside an arena of its HirBody and is referenced by its index
+
+@pure @const {
+    make util = @import "../util/pkg.quip"
+    make lexer = @import "../core/token.quip"
+}
+
+@pub
+make enum HirExprKind {
+    Error,
+    Unsupported,
+    Literal,
+    Local,
+    Path,
+    Binary,
+    Unary,
+    Update,
+    Call,
+    Field,
+    Index,
+    Deref,
+    Pin,
+    Copy,
+    Constructor,
+    Array,
+    EnumVariant,
+    Match,
+    Sizeof,
+    Lambda,
+}
+
+@pub
+make enum HirPatternKind {
+    Wildcard,   // `_`
+    Binding,    // `x` (binds the whole scrutinee)
+    Literal,    // `1`, `"a"`, `'c'`, `true`, `false`, `none`
+    EnumVariant,// `Enum.Variant`
+    Some,       // `some`
+    None,       // `none`
+}
+
+@pub
+make type HirCase {
+    @pub make kind: HirPatternKind = HirPatternKind.Wildcard
+    @pub make range: util::Range = .{}
+
+    @pub make pattern: uint = 0         // expression awaiting namespace resolution
+    @pub make has_pattern: bool = false
+    @pub make is_error: bool = false
+
+    @pub make lit: lexer::Token = .{}    // Literal
+
+    @pub make enum_name: str = ""        // EnumVariant
+    @pub make variant: uint = 0          // EnumVariant: index within the enum
+
+    @pub make bind: uint = 0             // Binding: local holding the scrutinee
+    @pub make has_bind: bool = false
+
+    @pub make body: uint = 0             // block of statements, when present
+    @pub make has_body: bool = false
+
+    @pub make result: uint = 0           // `=> expr` result, when present
+    @pub make has_result: bool = false
+}
+
+/// represents an expression in a hir body.
+@pub
+make type HirExpr {
+    @pub make requires_unsafe: bool = false
+    @pub make kind: HirExprKind = HirExprKind.Error
+    @pub make range: util::Range = .{}
+
+    @pub make lit: lexer::Token = .{}    // Literal; operator token for Binary and Unary
+    @pub make local: uint = 0            // Local
+    @pub make name: str = ""             // Path, Field, reason for Unsupported
+    // Preserve the identifier token separately from the entire receiver access.
+    @pub make member_span: util::Span = .{}
+    @pub make has_member_span: bool = false
+    @pub make postfix: bool = false
+
+    // Binary: left, Unary: operand, Call: callee, Field/Index/Deref/Pin/Copy: base
+    @pub make lhs: uint = 0
+    // Binary: right, Index: index
+    @pub make rhs: uint = 0
+    // Call: arguments, Constructor: fields
+    @pub make args: uint[] = []
+    // Call: the call is followed by a `catch` block, so its fallible result is unwrapped
+    @pub make catch_block: uint = 0
+    @pub make catch_bind: uint = 0
+    @pub make has_catch_bind: bool = false
+    @pub make has_catch: bool = false
+    // Constructor: the field name for each entry of `args` ("" for a positional field)
+    @pub make field_names: str[] = []
+    // EnumVariant: index of the variant within its enum
+    @pub make variant: uint = 0
+    // Match: scrutinee in `lhs`, case indices here
+    @pub make cases: uint[] = []
+    // Sizeof: index of the queried type in HirBody.types
+    @pub make ty: uint = 0
+    // Path (a type written as an expression, e.g. `Stack<int>.create`) and Constructor
+    // (`Slot<K, V> { ... }`): `ty` holds the written type, including its type arguments
+    @pub make has_ty: bool = false
+}
+
+@pub
+make enum HirStmtKind {
+    Let,
+    Assign,
+    Expr,
+    If,
+    Loop,
+    Break,
+    Continue,
+    Block,
+    Return,
+    Unsupported,
+    Match,
+}
+
+/// represents a statement in a hir body.
+@pub
+make type HirStmt {
+    @pub make kind: HirStmtKind = HirStmtKind.Unsupported
+    @pub make range: util::Range = .{}
+
+    @pub make local: uint = 0            // Let
+    @pub make target: uint = 0           // Assign: place expression
+    @pub make op: lexer::Token = .{}     // Assign: `=` or a compound operator such as `+=`
+
+    // Let: initializer, Assign: value, Expr: expression, Return: value, If: condition
+    @pub make value: uint = 0
+    @pub make has_value: bool = false
+
+    @pub make then_block: uint = 0       // If: then, Loop: body
+    @pub make else_block: uint = 0       // If
+    @pub make has_else: bool = false
+
+    @pub make name: str = ""             // Unsupported: construct that has no lowering yet
+
+    // Match: scrutinee in `value`, case indices here
+    @pub make cases: uint[] = []
+
+    // the statement carried an `@unsafe` tag (directly or through an enclosing `@unsafe` block)
+    @pub make is_unsafe: bool = false
+}
+
+/// groups hir statements and the resulting expression.
+@pub
+make type HirBlock {
+    @pub make end_span: util::Span = .{}
+    @pub make stmts: uint[] = []
+}
+
+/// represents a source-level type in a hir body.
+@pub
+make type HirType {
+    @pub make name: str = ""
+    @pub make args: uint[] = []          // indices into HirBody.types
+    @pub make range: util::Range = .{}
+    @pub make is_fallible: bool = false
+    @pub make is_optional: bool = false
+    @pub make is_array: bool = false
+    @pub make is_ref: bool = false       // synthesized `ref<Name>` (attached function receivers)
+    @pub make is_ptr: bool = false       // synthesized `ptr<Name>`
+    @pub make is_namespace: bool = false // `ns::Name`: `name` is the imported namespace, `args` the members
+}
+
+/// describes a local variable in a hir body.
+@pub
+make type HirLocal {
+    @pub make name_span: util::Span = .{}
+    @pub make scope_body: bool = false
+    @pub make hint_offset: uint = 0    // end of an unannotated source binding's identifier
+    @pub make name: str = ""
+    @pub make range: util::Range = .{}
+    @pub make ty: uint = 0
+    @pub make has_ty: bool = false
+    @pub make is_param: bool = false
+}
+
+/// owns the indexed expressions, statements, blocks, types, and locals of a body.
+@pub
+make type HirBody {
+    @pub make exprs: HirExpr[] = []
+    @pub make stmts: HirStmt[] = []
+    @pub make blocks: HirBlock[] = []
+    @pub make locals: HirLocal[] = []
+    @pub make types: HirType[] = []
+    @pub make cases: HirCase[] = []
+
+    @pub make param_count: uint = 0
+    @pub make root: uint = 0             // top-level block of the function
+}
+
+/// describes a function and its lowered body.
+@pub
+make type HirFunc {
+    // Opaque declaration key; independent of source offsets and unit indices.
+    @pub make declaration_id: str = ""
+    @pub make name_span: util::Span = .{}
+    @pub make name: str = ""
+    @pub make range: util::Range = .{}
+    @pub make tags: str[] = []
+
+    // `@external`: the body is provided by another object at link time, so no definition is emitted
+    @pub make is_external: bool = false
+    @pub make is_variadic: bool = false
+    @pub make export_name: str = ""
+    @pub make intrinsic_name: str = ""
+
+    // an attached function (`@impl T` or declared inside a `Type` body); its symbol is namespaced
+    // under its owner type rather than the module, so it is not module-mangled
+    @pub make is_attached: bool = false
+
+    // `@this` / `@impl`: an implicit `this` parameter precedes the written parameters
+    @pub make has_this: bool = false
+    @pub make is_lambda: bool = false
+    @pub make capture_locals: uint[] = []
+    @pub make capture_type_ids: uint[] = []
+
+    @pub make ret_ty: uint = 0           // index into body.types
+    @pub make has_ret_ty: bool = false
+
+    @pub make body: HirBody = .{}
+}
+
+@pub
+make enum HirItemKind {
+    Func,
+    Global,
+    Type,
+    Enum,
+    Alias,  // `make Name<G>: Type = <type>` — a compile-time type alias
+}
+
+// a compile-time type alias, parsed as a variable whose value is a type signature:
+// `make Name<T, K>: Type = SomeType<T, K>`. the aliased type is lowered into `body`, the
+// same way a struct's field types live in its own arena.
+@pub
+make type HirTypeAlias {
+    @pub make name: str = ""
+    @pub make range: util::Range = .{}
+    @pub make generics: str[] = []
+    @pub make item: uint = 0             // index into HirModule.items
+    @pub make body: HirBody = .{}
+    @pub make target: uint = 0           // index into body.types
+    @pub make has_target: bool = false
+}
+
+// top-level declaration, functions keep their body in HirModule.funcs
+@pub
+make type HirItem {
+    @pub make is_unsafe: bool = false
+    @pub make kind: HirItemKind = HirItemKind.Func
+    @pub make name: str = ""
+    @pub make display_name: str = ""
+    @pub make range: util::Range = .{}
+    @pub make func: uint = 0             // Func: index into HirModule.funcs
+    @pub make is_pure: bool = false      // Alias: the declaration carried a compile-time tag
+    // `@global_allocator`: the ambient allocator the compiler uses to allocate dynamic values
+    // (strings, arrays) that have no explicit allocator of their own
+    @pub make is_global_allocator: bool = false
+    @pub make is_default_allocator: bool = false
+    @pub make is_external_global: bool = false
+}
+
+// attached function inside a Type declaration or introduced via @impl T
+@pub
+make type HirAttachedFunc {
+    @pub make type_name: str = ""        // receiver type the attached function belongs to
+    @pub make name: str = ""             // attached function name as written
+    @pub make func: uint = 0             // index into HirModule.funcs
+}
+
+// a portable type shape. each unit interns its own types, so cross-unit signatures keep a
+// primitive id and/or the base source name plus the constructor/wrapper structure. namespaces are
+// flattened to their final member during collection.
+@pub
+make type HirTypeSig {
+    @pub make span: util::Span = .{}
+    @pub make prim: uint = 0             // ty::TY_* id when the type is a primitive, else 0
+    @pub make name: str = ""             // base type name, or `ptr` / `owned` / `ref`
+    @pub make args: HirTypeSig[] = []    // type arguments (and the pointee of pointer constructors)
+    @pub make is_ptr: bool = false
+    @pub make is_ref: bool = false
+    @pub make is_array: bool = false
+    @pub make is_optional: bool = false
+    @pub make is_fallible: bool = false
+}
+
+// a portable view of an attached function, collected from every already-analysed unit so that a
+// module can resolve (and validate) attached calls on types declared in its dependencies.
+@pub
+make type HirAttachedSig {
+    @pub make path: str = ""
+    @pub make source: ref<str>? = none
+    @pub make name_span: util::Span = .{}
+    @pub make is_unsafe: bool = false
+    @pub make symbol: str = ""
+    @pub make type_name: str = ""        // receiver type the attached function belongs to
+    @pub make name: str = ""             // attached function name as written
+    @pub make param_tys: HirTypeSig[] = []
+    @pub make param_count: uint = 0      // total parameters, including the implicit `this`
+    @pub make param_aggs: bool[] = []
+    @pub make has_this: bool = false
+    @pub make is_copy_fn: bool = false   // tagged `@copy`: `value !` on the receiver type calls it
+    @pub make has_ret: bool = false
+    @pub make ret_ty: HirTypeSig = .{}
+    @pub make ret_agg: bool = false
+}
+
+// a field of an imported struct, carrying the same portable type shape as attached returns
+@pub
+make type HirFieldSig {
+    @pub make name_span: util::Span = .{}
+    @pub make is_unsafe: bool = false
+    @pub make is_pub: bool = false
+    @pub make default_init: str = ""
+    @pub make default_lit: lexer::Token = .{}
+    @pub make has_default: bool = false
+    @pub make has_default_lit: bool = false
+    @pub make name: str = ""
+    @pub make ty: HirTypeSig = .{}
+    @pub make type_name: str = ""
+}
+
+// a portable view of a struct declaration, collected from every already-lowered unit
+@pub
+make type HirStructSig {
+    @pub make path: str = ""
+    @pub make source: ref<str>? = none
+    @pub make display_name: str = ""
+    @pub make name_span: util::Span = .{}
+    @pub make name: str = ""
+    @pub make fields: HirFieldSig[] = []
+}
+
+// a portable view of a free (non-attached) function, used to validate and classify calls such as
+// `ast::fresh_func()` from another module
+@pub
+make type HirFuncSig {
+    // True only when a source body has a conservative effect proof.
+    @pub make path: str = ""
+    @pub make source: ref<str>? = none
+    @pub make name_span: util::Span = .{}
+    @pub make is_unsafe: bool = false
+    @pub make module: str = ""
+    @pub make name: str = ""
+    @pub make is_variadic: bool = false
+    @pub make param_tys: HirTypeSig[] = []
+    @pub make param_aggs: bool[] = []
+    @pub make has_ret: bool = false
+    @pub make ret_ty: HirTypeSig = .{}
+    @pub make ret_agg: bool = false
+}
+
+// an enum declaration: variant order defines the runtime discriminant (0, 1, 2, ...)
+@pub
+make type HirEnum {
+    @pub make declaration_name: str = ""
+    @pub make variant_spans: util::Span[] = []
+    @pub make name: str = ""
+    @pub make variants: str[] = []
+    @pub make range: util::Range = .{}
+}
+
+// a field of a `Type` declaration: its declared type and (optional) default value live in the
+// owning struct's `body` arena, just like a function's parameters and body do
+@pub
+make type HirField {
+    @pub make is_unsafe: bool = false
+    @pub make name_span: util::Span = .{}
+    @pub make name: str = ""
+    @pub make range: util::Range = .{}
+
+    @pub make ty: uint = 0           // index into HirStruct.body.types
+    @pub make has_ty: bool = false
+
+    @pub make default_init: str = "" // attached helper for a nonliteral field default
+    @pub make default: uint = 0      // index into HirStruct.body.exprs
+    @pub make has_default: bool = false
+
+    @pub make is_pub: bool = false
+}
+
+// a `Type` declaration: the fields it declares plus the arena their types and defaults live in
+@pub
+make type HirStruct {
+    @pub make name_span: util::Span = .{}
+    @pub make declaration_name: str = ""
+    @pub make name: str = ""
+    @pub make range: util::Range = .{}
+    @pub make item: uint = 0         // index into HirModule.items
+    @pub make body: HirBody = .{}
+    @pub make fields: HirField[] = []
+
+    // a generic `Type Name <A, B>` is only a template: it has no fields or attached functions of its
+    // own. every distinct set of type arguments it is used with is lowered again from `ast_index`
+    // (the declaration's index in the unit's program) into a concrete struct named after the
+    // arguments (see `hir/mono.quip`)
+    @pub make generics: str[] = []
+    @pub make is_template: bool = false
+    @pub make is_instance: bool = false  // concrete instantiation produced by `hir/mono.quip`
+    @pub make ast_index: uint = 0
+}
+
+// the concrete types bound to a template's generic parameters while one instance is lowered: a
+// type argument is a tree of `HirType` nodes in `arena`, `roots[i]` being the root bound to `names[i]`
+@pub
+make type HirBindings {
+    @pub make names: str[] = []
+    @pub make roots: uint[] = []
+    @pub make arena: HirBody = .{}
+}
+
+/// collects the hir declarations and metadata for a source unit.
+@pub
+make type HirModule {
+    @pub make items: HirItem[] = []
+    @pub make funcs: HirFunc[] = []
+    @pub make attached_funcs: HirAttachedFunc[] = []
+    @pub make enums: HirEnum[] = []
+    @pub make consts: HirConst[] = []
+    @pub make structs: HirStruct[] = []
+    @pub make type_aliases: HirTypeAlias[] = []
+}
+
+// a top-level `make Name: T = <literal>` constant, inlined at its uses
+@pub
+make type HirConst {
+    @pub make is_unsafe: bool = false
+    @pub make name: str = ""
+    @pub make lit: lexer::Token = .{}
+    @pub make has_lit: bool = false
+}
+
+// a `@pub` symbol exported by a module, as seen by the modules that import it
+@pub
+make type HirExport {
+    @pub make is_unsafe: bool = false
+    @pub make global_type: str = ""
+    @pub make global_type_namespace: str = ""
+    @pub make alias_primitive: uint = 0
+    @pub make name: str = ""
+    @pub make is_external: bool = false
+    @pub make is_type: bool = false         // Type / Enum / compile-time type alias
+    @pub make is_unit: bool = false         // `@pub make x: unit = @import "..."`: a re-exported unit
+    @pub make unit_basename: str = ""       // for unit exports, the imported file's base name
+    @pub make is_enum: bool = false         // exported `Enum`: `variants` is populated
+    @pub make variants: str[] = []          // enum variant names, in discriminant order
+    @pub make has_lit: bool = false         // exported literal constant
+    @pub make lit: lexer::Token = .{}
+}
+
+// `make alias: unit = @import "path"`: the alias used in this file, the imported file's base name
+// (used for symbol mangling) and the public symbols it exports
+@pub
+make type HirImport {
+    @pub make alias: str = ""
+    @pub make basename: str = ""
+    @pub make exports: HirExport[] = []
+}
+
+// one reachable namespace chain (e.g. `os::syscall`) flattened for the checker: the dotted path a
+// file can write, the source path of the module members are defined in (for mangling), and exports
+/// describes a namespace made available to a hir module.
+@pub
+make type HirNamespace {
+    @pub make path: str = ""
+    @pub make module_name: str = ""
+    @pub make exports: HirExport[] = []
+    @pub make unit: uint = 0         // index of the unit the namespace refers to
+}

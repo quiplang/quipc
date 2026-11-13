@@ -1,0 +1,660 @@
+// results of the memory pass and the textual `--emit-mem` report
+
+@pure @const {
+    make std = @import "std"
+    make mir = @import "../mir/mir.quip"
+    make hir = @import "../hir/hir.quip"
+}
+
+// allocator/deallocator names visible to the current unit: its own tagged
+// functions plus everything collected from its dependencies
+/// stores allocator and deallocator names used during memory analysis.
+@pub
+make type MemContext {
+    @pub make alloc_names: str[] = ["alloc"]
+    @pub make free_names: str[] = ["free"]
+}
+
+/// describes a planned stack slot for a local.
+@pub
+make type MemSlot {
+    @pub make local: uint = 0
+    @pub make name: str = ""
+    @pub make ty: str = ""
+    @pub make slot: uint = 0
+    @pub make size: uint = 8
+    @pub make birth: uint = 0
+    @pub make kill: uint = 0
+    @pub make locked: bool = false    // ever pinned, the slot is never recycled
+    @pub make is_param: bool = false
+    @pub make is_temp: bool = false
+    @pub make is_copy: bool = false
+}
+
+/// tracks an allocation and whether its obligation has been satisfied.
+@pub
+make type MemObligation {
+    @pub make local: uint = 0         // current owner
+    @pub make name: str = ""
+    @pub make allocator: str = ""
+    @pub make opened_at: uint = 0
+    @pub make closed_at: uint = 0
+    @pub make freed: bool = false
+    @pub make transferred: bool = false
+    @pub make size: uint = 0          // requested payload bytes, excluding allocator overhead
+    @pub make size_known: bool = false
+    @pub make closed: bool = false
+    @pub make auto_released: bool = false
+    @pub make auto_cleanup: bool = false
+    @pub make aliases: uint[] = []
+}
+
+/// stores memory analysis results for one function.
+@pub
+make type MemFuncReport {
+    @pub make name: str = ""
+    @pub make is_external: bool = false
+    @pub make slots: MemSlot[] = []
+    @pub make obligations: MemObligation[] = []
+    @pub make stack_frame_size: uint = 0
+    @pub make unoptimized_stack_size: uint = 0
+    @pub make slot_count: uint = 0
+    @pub make total_vars: uint = 0
+    @pub make param_count: uint = 0
+    @pub make local_count: uint = 0
+    @pub make temp_count: uint = 0
+    @pub make alloc_count: uint = 0
+    @pub make freed_count: uint = 0
+    @pub make auto_free_count: uint = 0
+    @pub make transfer_count: uint = 0
+    @pub make est_heap_allocated: uint = 0
+    @pub make unknown_heap_count: uint = 0
+    @pub make unresolved_count: uint = 0
+    @pub make managed_heap_sites: uint = 0
+}
+
+/// collects memory analysis results for a module.
+@pub
+make type MemReport {
+    @pub make reused_functions: uint = 0
+    @pub make module_name: str = ""
+    @pub make funcs: MemFuncReport[] = []
+}
+
+// `std.heap.alloc` -> `alloc`
+@pub
+make last_segment (name: str) -> str {
+    make i = name.len()
+
+    while i > 0 {
+        i = i - 1
+
+        if name[i] == '.' {
+            make out: str = ""
+            make j = i + 1
+
+            while j < name.len() {
+                out.push(name[j])
+                j = j + 1
+            }
+
+            return out
+        }
+    }
+
+    return name
+}
+
+/// checks for name.
+@pub
+make has_name (names: ref<str[]>, seg: str) -> bool {
+    make i = 0
+
+    while i < names.*.len() {
+        if names.*[i] == seg {
+            return true
+        }
+
+        i = i + 1
+    }
+
+    return false
+}
+
+// appends every `@allocator` / `@deallocator` function of `module` to `ctx`
+/// collects allocator and deallocator declarations from hir.
+@pub
+make collect (module: ref<hir::HirModule>, ctx: ref<MemContext>) -> void {
+    make i = 0
+
+    while i < module.*.funcs.len() {
+        make f = module.*.funcs[i].pin
+
+        make is_alloc = false
+        make is_free = false
+
+        make ti = 0
+
+        while ti < f.*.tags.len() {
+            if f.*.tags[ti] == "allocator" {
+                is_alloc = true
+            }
+
+            if f.*.tags[ti] == "deallocator" {
+                is_free = true
+            }
+
+            ti = ti + 1
+        }
+
+        if is_alloc || is_free {
+            make seg = last_segment(f.*.name !)
+
+            if is_alloc && !has_name(ctx.*.alloc_names.pin, seg.copy()) {
+                ctx.*.alloc_names.push(seg !)
+            }
+
+            if is_free && !has_name(ctx.*.free_names.pin, seg.copy()) {
+                ctx.*.free_names.push(seg !)
+            }
+        }
+
+        i = i + 1
+    }
+
+    return
+}
+
+@pub
+make ends_with (s: str, suffix: str) -> bool {
+    if suffix.len() > s.len() { return false }
+
+    make off = s.len() - suffix.len()
+    make i: uint = 0
+
+    while i < suffix.len() {
+        if s[off + i] != suffix[i] { return false }
+
+        i = i + 1
+    }
+
+    return true
+}
+
+@pub
+make starts_with (s: str, prefix: str) -> bool {
+    if prefix.len() > s.len() { return false }
+
+    make i: uint = 0
+
+    while i < prefix.len() {
+        if s[i] != prefix[i] { return false }
+
+        i = i + 1
+    }
+
+    return true
+}
+
+/// Recognizes bundled library paths after the driver resolves absolute names.
+@pub
+make is_library_path (path: str) -> bool {
+    if starts_with(path.copy(), "library/") { return true }
+    make marker = "/library/"
+    make i = 0
+    while i + marker.len() <= path.len() {
+        make j = 0
+        while j < marker.len() && path[i + j] == marker[j] { j = j + 1 }
+        if j == marker.len() { return true }
+        i = i + 1
+    }
+    return false
+}
+
+make strip_bang (ty: str) -> str {
+    if ty.len() > 0 && ty[0] == '!' {
+        make out: str = ""
+        make i: uint = 1
+
+        while i < ty.len() {
+            out.push(ty[i])
+            i = i + 1
+        }
+
+        return out
+    }
+
+    return ty
+}
+
+make strip_question (ty: str) -> str {
+    if ty.len() > 0 && ty[ty.len() - 1] == '?' {
+        make out: str = ""
+        make i: uint = 0
+
+        while i < ty.len() - 1 {
+            out.push(ty[i])
+            i = i + 1
+        }
+
+        return out
+    }
+
+    return ty
+}
+
+/// extracts the nominal name from a rendered type.
+make nominal (name: str) -> str {
+    make i = name.len()
+
+    while i > 0 {
+        i = i - 1
+
+        if name[i] == '.' || name[i] == ':' {
+            make out: str = ""
+            make j = i + 1
+
+            while j < name.len() {
+                out.push(name[j])
+                j = j + 1
+            }
+
+            return out
+        }
+    }
+
+    return name
+}
+
+make strip_generics (name: str) -> str {
+    make out: str = ""
+    make i: uint = 0
+
+    while i < name.len() {
+        if name[i] == '<' {
+            return out
+        }
+
+        out.push(name[i])
+        i = i + 1
+    }
+
+    return out
+}
+
+/// finds the structure.
+make find_struct (name: str, structs: ref<mir::MirStruct[]>) -> uint {
+    make i: uint = 0
+
+    while i < structs.*.len() {
+        if structs.*[i].name == name { return i }
+
+        i = i + 1
+    }
+
+    return structs.*.len()
+}
+
+@pub
+make parse_uint (s: str) -> uint {
+    if s.len() == 0 { return 0 }
+
+    make result: uint = 0
+    make i: uint = 0
+
+    while i < s.len() {
+        make c = s[i]
+
+        if c < '0' || c > '9' { return result }
+
+        @unsafe make digit: uint = c
+        digit = digit - 48
+        result = result * 10 + digit
+        i = i + 1
+    }
+
+    return result
+}
+
+/// rounds a size up to an eight-byte boundary, using eight bytes for zero.
+@pub
+make align8 (sz: uint) -> uint {
+    if sz == 0 { return 8 }
+
+    return ((sz + 7) / 8) * 8
+}
+
+/// pads a string with spaces until it reaches the requested width.
+@pub
+make pad_right (s: str, width: uint) -> str {
+    make out = s.copy()
+
+    while out.len() < width {
+        out = out + " "
+    }
+
+    return out
+}
+
+/// Mirrors the LLVM backend's word-sized Quip storage and structure layouts.
+@pub
+make size_of_type (raw_ty: str, structs: ref<mir::MirStruct[]>) -> uint {
+    if raw_ty.len() == 0 {
+        return 8
+    }
+
+    if raw_ty[0] == '!' {
+        return 8 + size_of_type(strip_bang(raw_ty.copy()), structs)
+    }
+
+    make t = raw_ty.copy()
+
+    if ends_with(t.copy(), "?") {
+        return 8 + size_of_type(strip_question(t), structs)
+    }
+
+    if ends_with(t.copy(), "[]") {
+        return 24
+    }
+
+    if t == "str" || t == "String" {
+        return 24
+    }
+
+    if starts_with(t.copy(), "ref<") || starts_with(t.copy(), "ptr<") || starts_with(t.copy(), "owned<") {
+        return 8
+    }
+
+    if t == "int" || t == "uint" || t == "i64" || t == "u64" || t == "f64" {
+        return 8
+    }
+
+    if t == "i32" || t == "u32" || t == "f32" {
+        return 8
+    }
+
+    if t == "i16" || t == "u16" {
+        return 8
+    }
+
+    if t == "i8" || t == "u8" || t == "char" || t == "bool" {
+        return 8
+    }
+
+    if t == "void" {
+        return 0
+    }
+
+    make base_name = strip_generics(nominal(t.copy()))
+
+    if base_name.len() > 0 {
+        make sid = find_struct(base_name.copy(), structs)
+
+        if sid < structs.*.len() {
+            make total: uint = 0
+            make fi: uint = 0
+
+            while fi < structs.*[sid].fields.len() {
+                make fty = structs.*[sid].fields[fi].ty.copy()
+
+                if fty != t && fty != base_name {
+                    total = total + size_of_type(fty, structs)
+                } else {
+                    total = total + 8
+                }
+
+                fi = fi + 1
+            }
+
+            if total < 8 { total = 8 }
+
+            return total
+        }
+    }
+
+    return 8
+}
+
+@pub
+make compute_summary (fr: ref<MemFuncReport>) -> void {
+    fr.*.total_vars = fr.*.slots.len()
+    fr.*.param_count = 0
+    fr.*.local_count = 0
+    fr.*.temp_count = 0
+
+    make max_slot: uint = 0
+    make has_any_slot = false
+
+    make vi: uint = 0
+
+    while vi < fr.*.slots.len() {
+        make s = fr.*.slots[vi].pin
+
+        if s.*.is_param {
+            fr.*.param_count = fr.*.param_count + 1
+        } elif s.*.is_temp {
+            fr.*.temp_count = fr.*.temp_count + 1
+        } elif s.*.local > 0 {
+            fr.*.local_count = fr.*.local_count + 1
+        }
+
+        if s.*.slot > max_slot {
+            max_slot = s.*.slot
+        }
+
+        has_any_slot = true
+        vi = vi + 1
+    }
+
+    if has_any_slot {
+        fr.*.slot_count = max_slot + 1
+        make slot_sizes: uint[] = []
+        make si: uint = 0
+
+        while si <= max_slot {
+            slot_sizes.push(8)
+            si = si + 1
+        }
+
+        vi = 0
+
+        while vi < fr.*.slots.len() {
+            make sid = fr.*.slots[vi].slot
+            make sz = align8(fr.*.slots[vi].size)
+
+            if sz > slot_sizes[sid] {
+                slot_sizes[sid] = sz
+            }
+
+            vi = vi + 1
+        }
+
+        make total_frame: uint = 0
+        si = 0
+
+        while si <= max_slot {
+            total_frame = total_frame + slot_sizes[si]
+            si = si + 1
+        }
+
+        fr.*.stack_frame_size = total_frame
+    } else {
+        fr.*.slot_count = 0
+        fr.*.stack_frame_size = 0
+    }
+
+    make unopt: uint = 0
+    vi = 0
+
+    while vi < fr.*.slots.len() {
+        unopt = unopt + align8(fr.*.slots[vi].size)
+        vi = vi + 1
+    }
+
+    fr.*.unoptimized_stack_size = unopt
+
+    fr.*.alloc_count = fr.*.obligations.len()
+    fr.*.freed_count = 0
+    fr.*.auto_free_count = 0
+    fr.*.transfer_count = 0
+    fr.*.est_heap_allocated = 0
+    fr.*.unknown_heap_count = 0
+    fr.*.unresolved_count = 0
+
+    make oi: uint = 0
+
+    while oi < fr.*.obligations.len() {
+        make ob = fr.*.obligations[oi].pin
+
+        if ob.*.freed {
+            fr.*.freed_count = fr.*.freed_count + 1
+        } elif ob.*.transferred {
+            fr.*.transfer_count = fr.*.transfer_count + 1
+        } elif ob.*.auto_released {
+            fr.*.auto_free_count = fr.*.auto_free_count + 1
+        } else {
+            fr.*.unresolved_count = fr.*.unresolved_count + 1
+        }
+
+        if ob.*.size_known {
+            fr.*.est_heap_allocated = fr.*.est_heap_allocated + ob.*.size
+        } else { fr.*.unknown_heap_count = fr.*.unknown_heap_count + 1 }
+        oi = oi + 1
+    }
+
+    return
+}
+
+/// A statically known allocation argument, including a known zero-byte request.
+@pub
+make type HeapSize {
+    @pub make known: bool = false
+    @pub make bytes: uint = 0
+}
+
+@pub
+make allocation_size (op: ref<mir::MirOperand>, body: ref<mir::MirBody>, structs: ref<mir::MirStruct[]>, depth: uint) -> HeapSize {
+    make out = HeapSize {}
+    if depth > 16 { return out }
+    if op.*.is_sizeof {
+        out.known = true
+        out.bytes = size_of_type(op.*.name.copy(), structs)
+        return out
+    }
+    if op.*.kind == mir::MirOperandKind.Const && op.*.lit.lexeme.len() > 0 {
+        make text = op.*.lit.lexeme.copy()
+        make i = 0
+        while i < text.len() {
+            if text[i] < '0' || text[i] > '9' { return out }
+            i = i + 1
+        }
+        out.known = true
+        out.bytes = parse_uint(text)
+        return out
+    }
+    if (op.*.kind == mir::MirOperandKind.Copy || op.*.kind == mir::MirOperandKind.Move) && op.*.place.projs.len() == 0 {
+        // Multiple definitions can belong to branches or loops: do not guess.
+        make found = body.*.stmts.len()
+        make i = 0
+        while i < body.*.stmts.len() {
+            make s = body.*.stmts[i].pin
+            if s.*.kind == mir::MirStmtKind.Assign && s.*.place.local == op.*.place.local {
+                if found < body.*.stmts.len() { return out }
+                found = i
+            }
+            i = i + 1
+        }
+        if found < body.*.stmts.len() && body.*.stmts[found].rvalue.kind == mir::MirRvalueKind.Use {
+            return allocation_size(body.*.stmts[found].rvalue.a.pin, body, structs, depth + 1)
+        }
+    }
+    return out
+}
+
+// Count runtime-managed heap effects separately: these are potential sites,
+// not allocation counts, because capacity, input sizes and control flow vary.
+@pub
+make count_managed_sites (body: ref<mir::MirBody>) -> uint {
+    make count: uint = 0
+    make i = 0
+    while i < body.*.stmts.len() {
+        make s = body.*.stmts[i].pin
+        if s.*.kind == mir::MirStmtKind.Assign && s.*.place.local < body.*.locals.len() {
+            make ty = body.*.locals[s.*.place.local].ty.copy()
+            if (ty == "str" || ty == "String" || ends_with(ty.copy(), "[]"))
+                && s.*.rvalue.kind != mir::MirRvalueKind.Pin { count = count + 1 }
+        }
+        i = i + 1
+    }
+
+    i = 0
+    while i < body.*.terms.len() {
+        make t = body.*.terms[i].pin
+        if t.*.kind == mir::MirTermKind.Call {
+            if t.*.ret_ty == "str" || t.*.ret_ty == "String" || ends_with(t.*.ret_ty.copy(), "[]")
+                || t.*.name == "__quip_builtin.arr.push" || t.*.name == "__quip_builtin.str.push_char"
+                || t.*.name == "__quip_builtin.str.push_str" { count = count + 1 }
+        }
+        i = i + 1
+    }
+
+    return count
+}
+
+make pad_left (value: str, width: uint) -> str {
+    make out = value.copy()
+    while out.len() < width { out = " " + out }
+    return out
+}
+
+make heap_usage (f: ref<MemFuncReport>) -> str {
+    make dynamic = f.*.unknown_heap_count > 0 || f.*.managed_heap_sites > 0
+    if dynamic && f.*.est_heap_allocated == 0 { return "dynamic" }
+    make out = f.*.est_heap_allocated.to_str() + " B"
+    if dynamic { out = out + " + dynamic" }
+    return out
+}
+
+/// Shows the two memory estimates beside each function, without analysis internals.
+@pub
+make print (report: ref<MemReport>) -> void {
+    if report.*.funcs.len() == 0 { return }
+    make name_width: uint = 8
+    make stack_width: uint = 7
+    make heap_width: uint = 7
+    make count: uint = 0
+    make i = 0
+    while i < report.*.funcs.len() {
+        make f = report.*.funcs[i].pin
+        if !f.*.is_external {
+            count = count + 1
+            if f.*.name.len() > name_width { name_width = f.*.name.len() }
+            make stack = f.*.stack_frame_size.to_str() + " B"
+            make heap = heap_usage(f)
+            if stack.len() > stack_width { stack_width = stack.len() }
+            if heap.len() > heap_width { heap_width = heap.len() }
+        }
+        i = i + 1
+    }
+    if count == 0 { return }
+    make module_name: str = ""
+    i = 0
+    while i < report.*.module_name.len() {
+        make c = report.*.module_name[i]
+        if c == '/' { module_name = "" } else { module_name.push(c) }
+        i = i + 1
+    }
+    std::io::println("Memory estimates: " + module_name)
+    std::io::println("  " + pad_right("Function", name_width) + "  " + pad_left("Stack", stack_width) + "  " + pad_left("Heap", heap_width))
+    i = 0
+    while i < report.*.funcs.len() {
+        make f = report.*.funcs[i].pin
+        if !f.*.is_external {
+            make stack = f.*.stack_frame_size.to_str() + " B"
+            std::io::println("  " + pad_right(f.*.name.copy(), name_width) + "  " + pad_left(stack, stack_width) + "  " + pad_left(heap_usage(f), heap_width))
+        }
+        i = i + 1
+    }
+    std::io::println("  Heap: known allocation requests; dynamic = additional runtime-sized memory.")
+    return
+}

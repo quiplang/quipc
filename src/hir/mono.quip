@@ -1,0 +1,742 @@
+// monomorphization of generic types (src/hir/mono.quip)
+//
+// a generic `Type Name <A, B>` is only a template after lowering. this pass finds every use of a
+// template with concrete type arguments (`Name<int, String>`, in any unit, possibly through a
+// compile-time alias such as `std::collections::HashMap<K, V>`) and, for each distinct argument
+// list, lowers the declaration again with its parameters bound to those types. the result is an
+// ordinary struct plus attached functions named after the arguments (`Name_int_String`), living in
+// the unit that declares the template so names inside its bodies resolve exactly as they were
+// written. every use is then renamed to that instance, so the type checker and the rest of the
+// pipeline never see a generic type.
+//
+// the pass runs once, after every unit is lowered and before any unit is type-checked.
+
+@pure @const {
+    make std: unit = @import "std"
+
+    make ast = @import "../util/ast.quip"
+    make hir = @import "hir.quip"
+    make lowering = @import "lower.quip"
+    make ty = @import "../ty/ty.quip"
+
+    make diags = @import "../diag/diagnosis.quip"
+    make err = @import "../diag/err.quip"
+}
+
+// the parts of a unit this pass reads and extends
+/// provides the per-unit context used during monomorphization.
+@pub
+make type MonoUnit {
+    @pub make module_name: str = ""
+    @pub make module: ref<hir::HirModule>
+    @pub make program: ref<owned<ast::AST_Head>[]>
+    @pub make namespaces: ref<hir::HirNamespace[]>
+    @pub make os: str = ""
+    @pub make diag: ref<diags::Diagnostic>
+}
+
+// one instance still to be created: the template (`sidx` in the structs of `unit`), the name the
+// instance gets and the types its parameters are bound to
+/// records a concrete generic instance waiting to be created.
+make type MonoReq {
+    make unit: uint = 0
+    make sidx: uint = 0
+    make name: str = ""
+    make bindings: hir::HirBindings = .{}
+}
+
+/// instantiates generic types used across the supplied units.
+@pub
+make run (units: ref<MonoUnit[]>) -> void {
+    make m = Mono { units = units }
+
+    m.collect_instances()
+
+    make ui: uint = 0
+
+    while ui < units.*.len() {
+        m.scan_unit(ui)
+        ui = ui + 1
+    }
+
+    m.drain()
+    return
+}
+
+// Re-run monomorphization for the units selected by `dirty` only. Unchanged units keep their
+// already-instantiated HIR, so their existing instances are registered up front and reused rather
+// than created again. `altered[u]` is set for every unit whose HIR this pass touched.
+/// instantiates generics for dirty units and marks units changed by the pass.
+@pub
+make run_for (units: ref<MonoUnit[]>, dirty: ref<bool[]>, altered: ref<bool[]>) -> void {
+    make m = Mono { units = units, altered = altered }
+
+    m.collect_instances()
+
+    make ui: uint = 0
+
+    while ui < units.*.len() {
+        if ui < dirty.*.len() && dirty.*[ui] { m.scan_unit(ui) }
+
+        ui = ui + 1
+    }
+
+    m.drain()
+    return
+}
+
+make is_wrapper_name (name: str) -> bool {
+    return name == "ptr" || name == "owned" || name == "ref" || name == "variant"
+}
+
+make type Mono {
+    make units: ref<MonoUnit[]>
+    make reqs: MonoReq[] = []
+    make next: uint = 0
+    // optional output: units whose HIR this pass modified
+    make altered: ref<bool[]>? = none
+    make validating: bool = false
+
+    // instances already requested, with the unit that declares each one
+    make inst_names: str[] = []
+    make inst_units: uint[] = []
+
+    /// marks a unit as altered when change tracking is enabled.
+    @this
+    make mark (u: uint) -> void {
+        match this.altered {
+            none {}
+            some {
+                if u < some.*.len() { some.*[u] = true }
+            }
+        }
+    }
+
+    // register instances retained in units that were not lowered again, so this pass rewrites
+    // uses to the existing declaration instead of appending a duplicate
+    @this
+    make collect_instances () -> void {
+        make u: uint = 0
+
+        while u < this.units.*.len() {
+            for structure : this.units.*[u].module.*.structs {
+                if structure.is_instance {
+                    this.inst_names.push(structure.name.copy())
+                    this.inst_units.push(u)
+                }
+            }
+
+            u = u + 1
+        }
+    }
+
+
+    /// scans the unit.
+    @this
+    make scan_unit (u: uint) -> void {
+        make nf = this.units.*[u].module.*.funcs.len()
+        make fi: uint = 0
+
+        while fi < nf {
+            this.scan_func(u, fi)
+            fi = fi + 1
+        }
+
+        make ns = this.units.*[u].module.*.structs.len()
+        make si: uint = 0
+
+        while si < ns {
+            this.scan_struct(u, si)
+            si = si + 1
+        }
+    }
+
+    /// scans the function.
+    @this
+    make scan_func (u: uint, fi: uint) -> void {
+        make md = this.units.*[u].module
+        make body = md.*.funcs[fi].body.pin
+
+        if md.*.funcs[fi].has_ret_ty {
+            this.rewrite_type(u, body, md.*.funcs[fi].ret_ty, 0)
+        }
+
+        this.scan_body(u, body)
+    }
+
+    /// scans the structure.
+    @this
+    make scan_struct (u: uint, si: uint) -> void {
+        make md = this.units.*[u].module
+
+        if md.*.structs[si].is_template {
+            this.validate_template(u, si)
+            return
+        }
+
+        make body = md.*.structs[si].body.pin
+        make fi: uint = 0
+
+        while fi < md.*.structs[si].fields.len() {
+            if md.*.structs[si].fields[fi].has_ty {
+                this.rewrite_type(u, body, md.*.structs[si].fields[fi].ty, 0)
+            }
+
+            fi = fi + 1
+        }
+
+        this.scan_body(u, body)
+    }
+
+    // Lower a disposable symbolic instance so type applications in an unused template are checked.
+    @this
+    make validate_template (u: uint, si: uint) -> void {
+        make md = this.units.*[u].module
+        make bindings = hir::HirBindings {}
+        make gi: uint = 0
+        while gi < md.*.structs[si].generics.len() {
+            make name = md.*.structs[si].generics[gi].copy()
+            bindings.names.push(name.copy())
+            bindings.roots.push(bindings.arena.types.len())
+            bindings.arena.types.push(hir::HirType { name = name })
+            gi = gi + 1
+        }
+
+        make temporary = hir::HirModule {}
+        lowering::lower_struct(temporary.pin, this.units.*[u].program, md.*.structs[si].ast_index, this.units.*[u].os, this.units.*[u].diag, md.*.structs[si].name.copy(), bindings.pin)
+        this.validating = true
+
+        for structure : temporary.structs {
+            make body = structure.body.pin
+
+            for field : structure.fields {
+                if field.has_ty { this.rewrite_type(u, body, field.ty, 0) }
+            }
+
+            this.scan_body(u, body)
+        }
+
+        for function : temporary.funcs {
+            make body = function.body.pin
+
+            if function.has_ret_ty { this.rewrite_type(u, body, function.ret_ty, 0) }
+
+            this.scan_body(u, body)
+        }
+
+        this.validating = false
+    }
+
+    // rewrite every type written in a body: local and parameter types, `@sizeof`, and the types
+    // spelled in expressions (`Stack<int>.create()`, `Slot<K, V> { ... }`)
+    @this
+    make scan_body (u: uint, body: ref<hir::HirBody>) -> void {
+        make li: uint = 0
+
+        while li < body.*.locals.len() {
+            if body.*.locals[li].has_ty && !(this.validating && body.*.locals[li].is_param && body.*.locals[li].name == "this") {
+                this.rewrite_type(u, body, body.*.locals[li].ty, 0)
+            }
+
+            li = li + 1
+        }
+
+        make ei: uint = 0
+
+        while ei < body.*.exprs.len() {
+            if body.*.exprs[ei].kind == hir::HirExprKind.Sizeof {
+                this.rewrite_type(u, body, body.*.exprs[ei].ty, 0)
+            } elif body.*.exprs[ei].has_ty {
+                make tidx = body.*.exprs[ei].ty
+
+                if this.rewrite_type(u, body, tidx, 0) {
+                    body.*.exprs[ei].name = body.*.types[tidx].name !
+                }
+            }
+
+            ei = ei + 1
+        }
+    }
+
+
+    // rewrite the type tree at `idx` of `body`, written in unit `u`: every application of a
+    // template (directly or through an alias) is replaced by a plain reference to its instance.
+    // returns true when the node itself became an instance reference.
+    @this
+    make rewrite_type (u: uint, body: ref<hir::HirBody>, idx: uint, depth: uint) -> bool {
+        if idx >= body.*.types.len() || depth > 32 {
+            return false
+        }
+
+        make nargs = body.*.types[idx].args.len()
+        make name: str = body.*.types[idx].name.copy()
+
+        if body.*.types[idx].is_namespace {
+            if nargs == 0 {
+                return false
+            }
+
+            // the last member carries the type arguments: `a::b::Name<T>`
+            make last_idx = body.*.types[idx].args[nargs - 1]
+            make ai: uint = 0
+
+            while ai < body.*.types[last_idx].args.len() {
+                this.rewrite_type(u, body, body.*.types[last_idx].args[ai], depth)
+                ai = ai + 1
+            }
+
+            make path: str = name.copy()
+            make pi: uint = 0
+
+            while pi + 1 < nargs {
+                path = path + "::" + (body.*.types[body.*.types[idx].args[pi]].name !)
+                pi = pi + 1
+            }
+
+            make target = this.find_namespace(u, path)
+
+            if target >= this.units.*.len() {
+                return false
+            }
+
+            make member: str = body.*.types[last_idx].name !
+            make arg_idx: uint[] = []
+            make ci: uint = 0
+
+            while ci < body.*.types[last_idx].args.len() {
+                arg_idx.push(body.*.types[last_idx].args[ci])
+                ci = ci + 1
+            }
+
+            return this.apply(u, target, body, idx, member, arg_idx, depth)
+        }
+
+        make ai: uint = 0
+
+        while ai < nargs {
+            this.rewrite_type(u, body, body.*.types[idx].args[ai], depth)
+            ai = ai + 1
+        }
+
+        if is_wrapper_name(name.copy()) {
+            return false
+        }
+
+        make arg_idx: uint[] = []
+        make ci: uint = 0
+
+        while ci < nargs {
+            arg_idx.push(body.*.types[idx].args[ci])
+            ci = ci + 1
+        }
+
+        return this.apply(u, u, body, idx, name, arg_idx, depth)
+    }
+
+    // `member<args>` as seen from unit `ctx` and declared in unit `t`: a template is instantiated,
+    // an alias is expanded and the expansion rewritten in the alias's own unit
+    @this
+    make apply (ctx: uint, t: uint, body: ref<hir::HirBody>, idx: uint, member: str, arg_idx: uint[], depth: uint) -> bool {
+        make sidx = this.find_template(t, member.copy())
+
+        if sidx < this.units.*[t].module.*.structs.len() {
+            make want = this.units.*[t].module.*.structs[sidx].generics.len()
+
+            if want != arg_idx.len() {
+                make d = diags::Diag.err(err::Err.TypeMismatch, body.*.types[idx].range !, "wrong number of type arguments")
+                make t = "`" + member.copy() + "` takes " + want.to_str() + " type argument(s), found " + arg_idx.len().to_str()
+                d.label(t)
+                this.units.*[ctx].diag.*.report(d)
+                return false
+            }
+
+            if this.validating { return false }
+
+            make inst: str = member.copy()
+            make ai: uint = 0
+
+            while ai < arg_idx.len() {
+                inst = inst + "_" + this.canon(body, arg_idx[ai])
+                ai = ai + 1
+            }
+
+            this.request(t, sidx, inst.copy(), body, arg_idx)
+            this.become(body, idx, inst.copy())
+
+            if ctx != t {
+                this.ensure_stub(ctx, inst)
+            }
+
+            return true
+        }
+
+        make ali = this.find_alias(t, member.copy())
+
+        if ali < this.units.*[t].module.*.type_aliases.len() {
+            make alias = this.units.*[t].module.*.type_aliases[ali].pin
+
+            if alias.*.generics.len() != arg_idx.len() {
+                make d = diags::Diag.err(err::Err.TypeMismatch, body.*.types[idx].range !, "wrong number of type arguments")
+                d.label("`" + member.copy() + "` takes " + alias.*.generics.len().to_str() + " type argument(s), found " + arg_idx.len().to_str())
+                this.units.*[ctx].diag.*.report(d)
+                return false
+            }
+
+            if !alias.*.has_target || this.validating {
+                return false
+            }
+
+            make root = this.copy_subst(alias.*.body.pin, alias.*.target, body, alias.*.generics.pin, arg_idx)
+            make instantiated = this.rewrite_type(t, body, root, depth + 1)
+            // Variant aliases need their structural layout in MIR and exported
+            // field signatures, even when they do not instantiate a template.
+            make expanded = body.*.types[root].pin
+
+            if !instantiated && (expanded.*.is_namespace || expanded.*.name != "variant") {
+                return false
+            }
+
+            make original = body.*.types[idx].pin
+            original.*.name = expanded.*.name.copy()
+            original.*.args = expanded.*.args !
+            original.*.is_namespace = expanded.*.is_namespace
+            original.*.is_fallible = original.*.is_fallible || expanded.*.is_fallible
+            original.*.is_optional = original.*.is_optional || expanded.*.is_optional
+            original.*.is_array = original.*.is_array || expanded.*.is_array
+            original.*.is_ref = original.*.is_ref || expanded.*.is_ref
+            original.*.is_ptr = original.*.is_ptr || expanded.*.is_ptr
+
+            if instantiated && ctx != t {
+                this.ensure_stub(ctx, original.*.name.copy())
+            }
+
+            return true
+        }
+
+        return false
+    }
+
+    // turn the node at `idx` into a plain reference to the instance `inst`, keeping its modifiers
+    @this
+    make become (body: ref<hir::HirBody>, idx: uint, inst: str) -> void {
+        body.*.types[idx].name = inst
+        body.*.types[idx].args = []
+        body.*.types[idx].is_namespace = false
+    }
+
+    // copy the alias target at `sidx` of `src` into `dst`, substituting each alias parameter by
+    // the use-site type argument at the same position
+    @this
+    make copy_subst (src: ref<hir::HirBody>, sidx: uint, dst: ref<hir::HirBody>, names: ref<str[]>, arg_idx: uint[]) -> uint {
+        make sname: str = src.*.types[sidx].name !
+
+        if src.*.types[sidx].args.len() == 0 && !src.*.types[sidx].is_namespace {
+            make k: uint = 0
+
+            while k < names.*.len() {
+                if names.*[k] == sname {
+                    make arg_id = arg_idx[k]
+                    make v = src.*.types[sidx].pin
+
+                    if !v.*.is_fallible && !v.*.is_optional && !v.*.is_array && !v.*.is_ref && !v.*.is_ptr {
+                        return arg_id
+                    }
+
+                    make c = hir::HirType {}
+
+                    c.name = dst.*.types[arg_id].name !
+                    c.range = dst.*.types[arg_id].range.copy()
+                    c.is_fallible = dst.*.types[arg_id].is_fallible || v.*.is_fallible
+                    c.is_optional = dst.*.types[arg_id].is_optional || v.*.is_optional
+                    c.is_array = dst.*.types[arg_id].is_array || v.*.is_array
+                    c.is_ref = dst.*.types[arg_id].is_ref || v.*.is_ref
+                    c.is_ptr = dst.*.types[arg_id].is_ptr || v.*.is_ptr
+                    c.is_namespace = dst.*.types[arg_id].is_namespace
+                    make ai: uint = 0
+
+                    while ai < dst.*.types[arg_id].args.len() {
+                        c.args.push(dst.*.types[arg_id].args[ai])
+                        ai = ai + 1
+                    }
+
+                    make id = dst.*.types.len()
+                    dst.*.types.push(c)
+                    return id
+                }
+
+                k = k + 1
+            }
+        }
+
+        make c = hir::HirType {}
+        make v = src.*.types[sidx].pin
+        c.name = sname
+        c.range = v.*.range.copy()
+        c.is_fallible = v.*.is_fallible
+        c.is_optional = v.*.is_optional
+        c.is_array = v.*.is_array
+        c.is_ref = v.*.is_ref
+        c.is_ptr = v.*.is_ptr
+        c.is_namespace = v.*.is_namespace
+
+        make ai: uint = 0
+
+        while ai < src.*.types[sidx].args.len() {
+            c.args.push(this.copy_subst(src, src.*.types[sidx].args[ai], dst, names, arg_idx !))
+            ai = ai + 1
+        }
+
+        make id = dst.*.types.len()
+        dst.*.types.push(c)
+        return id
+    }
+
+
+    // text identifying a type argument inside an instance name
+    @this
+    make canon (body: ref<hir::HirBody>, idx: uint) -> str {
+        make s: str = body.*.types[idx].name !
+
+        // an unresolved namespaced type is named by its last member
+        if body.*.types[idx].is_namespace && body.*.types[idx].args.len() > 0 {
+            make last = body.*.types[idx].args[body.*.types[idx].args.len() - 1]
+            s = body.*.types[last].name !
+        }
+
+        make ai: uint = 0
+
+        while ai < body.*.types[idx].args.len() {
+            if !body.*.types[idx].is_namespace {
+                s = s + "_" + this.canon(body, body.*.types[idx].args[ai])
+            }
+
+            ai = ai + 1
+        }
+
+        if body.*.types[idx].is_array { s = s + "_arr" }
+
+        if body.*.types[idx].is_optional { s = s + "_opt" }
+
+        if body.*.types[idx].is_fallible { s = s + "_fal" }
+
+        if body.*.types[idx].is_ref { s = s + "_ref" }
+
+        if body.*.types[idx].is_ptr { s = s + "_ptr" }
+
+        return s
+    }
+
+
+    @this
+    make find_namespace (u: uint, path: str) -> uint {
+        make i: uint = 0
+
+        while i < this.units.*[u].namespaces.*.len() {
+            if this.units.*[u].namespaces.*[i].path == path {
+                return this.units.*[u].namespaces.*[i].unit
+            }
+
+            i = i + 1
+        }
+
+        return this.units.*.len()
+    }
+
+    @this
+    make find_template (t: uint, name: str) -> uint {
+        make i: uint = 0
+
+        while i < this.units.*[t].module.*.structs.len() {
+            if this.units.*[t].module.*.structs[i].is_template && this.units.*[t].module.*.structs[i].name == name {
+                return i
+            }
+
+            i = i + 1
+        }
+
+        return this.units.*[t].module.*.structs.len()
+    }
+
+    @this
+    make find_alias (t: uint, name: str) -> uint {
+        make i: uint = 0
+
+        while i < this.units.*[t].module.*.type_aliases.len() {
+            if this.units.*[t].module.*.type_aliases[i].name == name {
+                return i
+            }
+
+            i = i + 1
+        }
+
+        return this.units.*[t].module.*.type_aliases.len()
+    }
+
+    /// checks for item.
+    @this
+    make has_item (u: uint, name: str) -> bool {
+        make i: uint = 0
+
+        while i < this.units.*[u].module.*.items.len() {
+            if this.units.*[u].module.*.items[i].name == name {
+                return true
+            }
+
+            i = i + 1
+        }
+
+        return false
+    }
+
+    // a bodyless `Type` item, so a unit that only refers to a type declared elsewhere still
+    // resolves its name (and with it the attached functions registered under that name)
+    @this
+    make ensure_stub (u: uint, name: str) -> void {
+        if this.has_item(u, name.copy()) {
+            return
+        }
+
+        this.mark(u)
+        make item = hir::HirItem {}
+
+        item.kind = hir::HirItemKind.Type
+        item.name = name
+        this.units.*[u].module.*.items.push(item)
+    }
+
+
+    /// checks whether a generic instance has already been registered.
+    @this
+    make known (t: uint, name: str) -> bool {
+        make i: uint = 0
+
+        while i < this.inst_names.len() {
+            if this.inst_units[i] == t && this.inst_names[i] == name {
+                return true
+            }
+
+            i = i + 1
+        }
+
+        return false
+    }
+
+    // queue the creation of the instance `name` of template `sidx` of unit `t`; the arguments are
+    // the type trees at `arg_idx` of `body`
+    @this
+    make request (t: uint, sidx: uint, name: str, body: ref<hir::HirBody>, arg_idx: uint[]) -> void {
+        if this.known(t, name.copy()) {
+            return
+        }
+
+        this.mark(t)
+        this.inst_names.push(name.copy())
+        this.inst_units.push(t)
+
+        make r = MonoReq {}
+
+        r.unit = t
+        r.sidx = sidx
+        r.name = name
+
+        make gi: uint = 0
+
+        while gi < this.units.*[t].module.*.structs[sidx].generics.len() {
+            r.bindings.names.push(this.units.*[t].module.*.structs[sidx].generics[gi] !)
+            gi = gi + 1
+        }
+
+        make ai: uint = 0
+
+        while ai < arg_idx.len() {
+            r.bindings.roots.push(this.extract(body, arg_idx[ai], r.bindings.arena.pin))
+            ai = ai + 1
+        }
+
+        this.reqs.push(r)
+    }
+
+    // copy a type argument into a binding arena. a namespaced type becomes its last member's bare
+    // name: the instance is lowered in another unit, where the use site's namespaces mean nothing
+    @this
+    make extract (src: ref<hir::HirBody>, idx: uint, dst: ref<hir::HirBody>) -> uint {
+        make c = hir::HirType {}
+
+        c.range = src.*.types[idx].range.copy()
+        c.is_fallible = src.*.types[idx].is_fallible
+        c.is_optional = src.*.types[idx].is_optional
+        c.is_array = src.*.types[idx].is_array
+        c.is_ref = src.*.types[idx].is_ref
+        c.is_ptr = src.*.types[idx].is_ptr
+
+        make from = idx
+
+        if src.*.types[idx].is_namespace && src.*.types[idx].args.len() > 0 {
+            from = src.*.types[idx].args[src.*.types[idx].args.len() - 1]
+        }
+
+        c.name = src.*.types[from].name !
+
+        make ai: uint = 0
+
+        while ai < src.*.types[from].args.len() {
+            c.args.push(this.extract(src, src.*.types[from].args[ai], dst))
+            ai = ai + 1
+        }
+
+        make id = dst.*.types.len()
+        dst.*.types.push(c)
+        return id
+    }
+
+    /// processes queued generic instantiation requests.
+    @this
+    make drain () -> void {
+        while this.next < this.reqs.len() {
+            make ri = this.next
+            this.next = this.next + 1
+            this.instantiate(ri)
+        }
+    }
+
+    /// lowers a queued generic instance with its bound type arguments.
+    @this
+    make instantiate (ri: uint) -> void {
+        make t = this.reqs[ri].unit
+        make md = this.units.*[t].module
+        make ast_index = md.*.structs[this.reqs[ri].sidx].ast_index
+
+        // the argument types are resolved from the template's unit: make sure every named one exists
+        make ni: uint = 0
+
+        while ni < this.reqs[ri].bindings.arena.types.len() {
+            make nm: str = this.reqs[ri].bindings.arena.types[ni].name.copy()
+
+            if ty::TyInterner.prim(nm.copy()) == ty::TY_ERROR && !is_wrapper_name(nm.copy()) {
+                this.ensure_stub(t, nm)
+            }
+
+            ni = ni + 1
+        }
+
+        make f0 = md.*.funcs.len()
+        make s0 = md.*.structs.len()
+
+        lowering::lower_struct(md, this.units.*[t].program, ast_index, this.units.*[t].os, this.units.*[t].diag, this.reqs[ri].name !, this.reqs[ri].bindings.pin)
+
+        // the new bodies may name further instances
+        make fi = f0
+
+        while fi < md.*.funcs.len() {
+            this.scan_func(t, fi)
+            fi = fi + 1
+        }
+
+        make si = s0
+
+        while si < md.*.structs.len() {
+            this.scan_struct(t, si)
+            si = si + 1
+        }
+    }
+}

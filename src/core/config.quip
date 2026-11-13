@@ -1,147 +1,404 @@
 @pure @const {
-make std = @import "../../library/std/pkg.quip"
-make cffi = @import "../../library/std/ffi/cffi.quip"
+    make std = @import "std"
+    make c = @import "../../library/std/ffi/c.quip"
 }
 
-// ====
+@unsafe @external make uname (buffer: ptr<any>) -> i32
 
+make native_platform_name () -> str {
+    @target "macos" {
+        return unix_platform_name()
+    }
+    @target "linux" {
+        return unix_platform_name()
+    }
+    return ""
+}
+
+make unix_platform_name () -> str {
+    // Darwin's utsname has five 256-byte fields. Linux's is smaller.
+    // The NUL-terminated sysname is the first field on both systems.
+    make buffer: str = ""
+    buffer.reserve(1280) catch { return "" }
+    @unsafe {
+        if uname(buffer.data) != 0 { return "" }
+        make system = c::to_str(buffer.data)
+        if system == "Darwin" { return "macos" }
+        if system == "Linux" { return "linux" }
+    }
+    return ""
+}
+
+/// identifies the operation requested on the command line.
 @pub
 make enum CommandKind {
+    None,
     Compile,
     Build,
     Run,
-    None
+    Init,
+    Help,
+    Version,
 }
 
+/// stores command-line options and the inputs needed by the driver.
 @pub
 make type Config {
 
-    make command: CommandKind
+    @pub make command: CommandKind
 
-    make input: std::io::Path
-    make output: std::io::Path
+    @pub make input: std::io::Path? = none
+    @pub make output: std::io::Path
 
-    make optimization: std::Optimization
-    make options: std::Options
-    make mode: std::Mode
+    @pub make optimization: std::Optimization
+    @pub make options: std::Options
+    @pub make mode: std::Mode
     make platform: std::Platform
+    @pub make platform_name: str   // resolved OS name for @target selection
 
-    make package_names: str[]
-    make package_paths: std::io::Path[]
+    @pub make package_names: str[]
+    @pub make package_paths: std::io::Path[]
+
+    make packages: std::collections::Map<std::io::Path>
+
+    @pub make native_libraries: str[] = []
+    @pub make run_args: str[] = []
+    @pub make build_args: str[] = []
+    @pub make run_project: bool = false
+
+    @pub make emit_mir: bool = false
+    @pub make emit_mem: bool = false
+
+    @pub make emit_llvm: bool = false        // print textual LLVM IR and stop (debug)
+    @pub make entry: str = "main"            // entry point function name
+    @pub make output_set: bool = false       // true if `-o` was given
+    @pub make name: str = ""                 // optional executable basename
+    @pub make keep_llvm: bool = false
+    @pub make progress: bool = true
+    @pub make entry_set: bool = false
+    @pub make intermediate_directory: str = ""
+    @pub make build_step: str = ""
 
     @pub
     make init () -> Config {
         make config = Config {}
+
         config.command = CommandKind.None
 
+        if std::os::getenv("QUIPC_NO_PROGRESS") == "1" { config.progress = false }
+
         config.output = std::io::Path.create("target/debug/")
+
+        config.optimization = std::Optimization.None
         config.options = std::Options.default()
         config.mode = std::Mode.Debug
         config.platform = std::Platform.Native
+        config.platform_name = native_platform_name()
 
         config.package_names = []
         config.package_paths = []
 
+        config.packages = std::collections::Map<std::io::Path>.create()
 
-        // Config.parse(argv, config.pin)
+
 
         return config
     }
 
     @pub @this
-    make parse (argv: ptr<char>[]) -> !void {
+    make add_package (name: str, path: str) -> !void {
+        if name.len() == 0 || path.len() < 5 { return error.InvalidArgument }
 
-        make iter = argv.iter()
+        if path[path.len() - 5] != '.' || path[path.len() - 4] != 'q' ||
+            path[path.len() - 3] != 'u' || path[path.len() - 2] != 'i' || path[path.len() - 1] != 'p' {
+            std::io::println("import aliases require a .quip source path")
+            return error.InvalidArgument
+        }
 
-        for item : iter {
+        make i: uint = 0
 
-            make t = item.to_str()
+        while i < name.len() {
+            make c = name[i]
 
-            match t {
-                "compile" {
-                    this.command = CommandKind.Compile
+            if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || (i > 0 && c >= '0' && c <= '9')) {
+                std::io::println("invalid source alias: " + name)
 
-                    match iter.next() {
-                        f: ptr<char> {
-                            make tt = f.to_str()
-                            this.input = std::io::Path.create(tt)
-                        }
+                return error.InvalidArgument
+            }
 
-                        none {
-                            return error.InvalidArgument
-                        }
-                    }
-                }
+            i = i + 1
+        }
 
-                "build" {
-                    this.command = CommandKind.Build
-                    this.input = std::io::Path.create("./build.quip")
-                }
+        for existing : this.package_names.iter() {
+            if existing == name {
+                std::io::println("duplicate source alias: " + name)
 
-                "run" { this.command = CommandKind.Run }
-
-                "-o" {
-                    match iter.next() {
-                        f: ptr<char> {
-                            make tt = f.to_str()
-                            this.output = std::io::Path.create(tt)
-                        }
-
-                        none {
-                            return error.InvalidArgument
-                        }
-                    }
-                }
-
-                "-O2" { this.optimization = std::Optimization.Standard }
-                "-O3" { this.optimization = std::Optimization.Aggressive }
-
-                "--show-debug" { this.options.show_quipc_debug = true }
-                "--show-warnings" { this.options.show_warnings = true }
-                "--memory_dump" { this.options.show_memory_dump = true }
-
-                "--release" { this.mode = std::Mode.Release }
-
-                "--platform=" {
-                    match iter.next() {
-                        f: ptr<char> {
-                            make tt = f.to_str()
-                            match tt {
-                                "windows" { this.platform = std::Platform.Windows }
-                                "linux" { this.platform = std::Platform.Linux }
-                                "macos" { this.platform = std::Platform.Macos }
-                            }
-                        }
-
-                        none {
-                            return error.InvalidArgument
-                        }
-                    }
-                }
-
-                "--package" {
-                    match iter.next() {
-                        name: ptr<char> {
-                            make name_str = name.to_str()
-                            match iter.next() {
-                                path: ptr<char> {
-                                    make path_str = path.to_str()
-                                    this.package_names.push(name_str)
-                                    this.package_paths.push(std::io::Path.create(path_str))
-                                }
-                                none { return error.InvalidArgument }
-                            }
-                        }
-                        none { return error.InvalidArgument }
-                    }
-                }
-
-                _ {
-                    this.command = CommandKind.None
-                    this.optimization = std::Optimization.None
-                }
-
+                return error.InvalidArgument
             }
         }
+
+        this.package_names.push(name)
+        this.package_paths.push(std::io::Path.create(path))
+        return
+    }
+
+    /// parses and registers a source alias and path from a command-line argument.
+    @this
+    make parse_package (text: str) -> !void {
+        // A tuple is one argv value, so spaces and commas inside quoted paths survive.
+        make values: str[] = []
+        make i: uint = 0
+
+        while i < text.len() && (text[i] == ' ' || text[i] == '\t') { i = i + 1 }
+
+        if i >= text.len() || text[i] != '(' { return error.InvalidArgument }
+
+        i = i + 1
+        make part: uint = 0
+
+        while part < 2 {
+            while i < text.len() && (text[i] == ' ' || text[i] == '\t') { i = i + 1 }
+
+            if i >= text.len() || text[i] != '"' { return error.InvalidArgument }
+
+            i = i + 1
+            make value: str = ""
+            make closed = false
+
+            while i < text.len() {
+                make c = text[i]
+                i = i + 1
+
+                if c == '"' { closed = true break }
+
+                if c == '\\' {
+                    if i >= text.len() { return error.InvalidArgument }
+
+                    c = text[i]
+                    i = i + 1
+
+                    if c != '\\' && c != '"' { return error.InvalidArgument }
+                }
+
+                value.push(c)
+            }
+
+            if !closed { return error.InvalidArgument }
+
+            values.push(value)
+
+            while i < text.len() && (text[i] == ' ' || text[i] == '\t') { i = i + 1 }
+
+            if i >= text.len() { return error.InvalidArgument }
+
+            if part == 0 {
+                if text[i] != ',' { return error.InvalidArgument }
+            } else {
+                if text[i] != ')' { return error.InvalidArgument }
+            }
+
+            i = i + 1
+            part = part + 1
+        }
+
+        while i < text.len() && (text[i] == ' ' || text[i] == '\t') { i = i + 1 }
+
+        if i != text.len() { return error.InvalidArgument }
+
+        this.add_package(values[0] !, values[1] !) catch { return error.InvalidArgument }
+
+        return
+    }
+
+    /// parses the command line into compiler options.
+    @pub @this
+    make parse (argv: ptr<char>[]) -> !void {
+
+        make i: uint = 0
+
+        while i < argv.len() {
+
+            make item = argv[i]
+            make t = c::to_str(item)
+
+            if t == "init" {
+                this.command = CommandKind.Init
+
+                if i + 1 < argv.len() {
+                    make f = argv[i + 1]
+                    i = i + 1
+                    make tt = c::to_str(f)
+                    this.input = std::io::Path.create(tt)
+
+                } else {
+
+                    return error.InvalidArgument
+                }
+
+            } elif t == "compile" {
+                this.command = CommandKind.Compile
+
+
+                if i + 1 < argv.len() {
+                    make f = argv[i + 1]
+                    i = i + 1
+                    make tt = c::to_str(f)
+
+                    if tt.len() == 0 || tt[0] == '-' { return error.InvalidArgument }
+
+                    this.input = std::io::Path.create(tt)
+
+                } else {
+                    return error.InvalidArgument
+                }
+
+            } elif t == "build" {
+
+                this.command = CommandKind.Build
+                this.input = std::io::Path.create("./build.quip")
+
+                if i + 1 < argv.len() {
+                    make next_argument = c::to_str(argv[i + 1])
+
+                    if next_argument.len() > 0 && next_argument[0] != '-' {
+                        this.build_step = next_argument
+                        i = i + 1
+                    }
+                }
+
+            } elif t == "run" {
+                this.command = CommandKind.Run
+                this.run_project = true
+                this.input = std::io::Path.create("src/main.quip")
+
+                if i + 1 < argv.len() {
+                    make next = c::to_str(argv[i + 1])
+
+                    if next.len() > 0 && next[0] != '-' {
+                        this.input = std::io::Path.create(next)
+                        this.run_project = false
+                        i = i + 1
+                    }
+                }
+            } elif t == "--" && this.command == CommandKind.Build {
+                i++
+                while i < argv.len() { this.build_args.push(c::to_str(argv[i])) i++ }
+                break
+            } elif t == "--" && this.command == CommandKind.Run {
+                i = i + 1
+
+                while i < argv.len() { this.run_args.push(c::to_str(argv[i])) i = i + 1 }
+
+                break
+
+            } elif t == "--version" || t == "-V" {
+                this.command = CommandKind.Version
+            } elif t == "-h" || t == "--help" || t == "help" {
+                this.command = CommandKind.Help
+
+            } elif t == "-o" || t == "--output" {
+                if i + 1 < argv.len() {
+                    make f = argv[i + 1]
+                    i = i + 1
+                    make tt = c::to_str(f)
+                    this.output = std::io::Path.create(tt)
+                    this.output_set = true
+                } else {
+                    return error.InvalidArgument
+                }
+            } elif t == "--name" {
+                if i + 1 < argv.len() {
+                    i = i + 1
+                    this.name = c::to_str(argv[i])
+                } else {
+                    return error.InvalidArgument
+                }
+            } elif t == "--link" {
+                if i + 1 >= argv.len() { return error.InvalidArgument }
+                i = i + 1
+                this.native_libraries.push(c::to_str(argv[i]))
+            } elif t == "--keep-llvm" {
+                this.keep_llvm = true
+            } elif t == "--emit-llvm" {
+                this.emit_llvm = true
+            } elif t == "--entry" {
+                if i + 1 < argv.len() {
+                    make f = argv[i + 1]
+                    i = i + 1
+                    this.entry = c::to_str(f)
+                    this.entry_set = true
+                } else {
+                    return error.InvalidArgument
+                }
+            } elif t == "-O2" {
+                this.optimization = std::Optimization.Standard
+            } elif t == "-O3" {
+                this.optimization = std::Optimization.Aggressive
+            } elif t == "-Os" {
+                this.optimization = std::Optimization.Size
+            } elif t == "--no-progress" {
+                this.progress = false
+            } elif t == "--show-debug" || t == "--verbose" {
+                this.options.show_quipc_debug = true
+            } elif t == "--hide-warnings" {
+                this.options.hide_warnings = true
+            } elif t == "--memory-dump" {
+                this.options.show_memory_dump = true
+            } elif t == "--emit-mir" {
+                this.emit_mir = true
+            } elif t == "--emit-mem" {
+                this.emit_mem = true
+            } elif t == "--release" {
+                this.mode = std::Mode.Release
+            } elif t == "--debug" || t == "-g" {
+                this.mode = std::Mode.Debug
+            } elif t == "--platform" {
+                if i + 1 < argv.len() {
+                    make f = argv[i + 1]
+                    i = i + 1
+                    make tt = c::to_str(f)
+
+                    if tt == "windows" {
+                        this.platform = std::Platform.Windows
+                        this.platform_name = "windows"
+                    } elif tt == "linux" {
+                        this.platform = std::Platform.Linux
+                        this.platform_name = "linux"
+                    } elif tt == "macos" {
+                        this.platform = std::Platform.Macos
+                        this.platform_name = "macos"
+                    }
+                } else {
+                    return error.InvalidArgument
+                }
+            } elif t == "--alias" {
+                if i + 1 >= argv.len() { return error.InvalidArgument }
+
+                i = i + 1
+                this.parse_package(c::to_str(argv[i])) catch {
+                    std::io::println("expected --alias=(\"name\", \"path\") (quote the tuple in your shell)")
+                    return error.InvalidArgument
+                }
+            } elif t.len() >= 8 && t[0] == '-' && t[1] == '-' && t[2] == 'a' && t[3] == 'l' && t[4] == 'i' && t[5] == 'a' && t[6] == 's' && t[7] == '=' {
+                make tuple: str = ""
+                make ti: uint = 8
+
+                while ti < t.len() { tuple.push(t[ti]) ti = ti + 1 }
+
+                this.parse_package(tuple) catch {
+                    std::io::println("expected --alias=(\"name\", \"path\") (quote the tuple in your shell)")
+                    return error.InvalidArgument
+                }
+            } elif this.command == CommandKind.Build && this.build_step.len() == 0 && t.len() > 0 && t[0] != '-' {
+                this.build_step = t
+            } else {
+                // argv[0] is the executable; every other unknown argument is an error.
+                if i > 0 { return error.InvalidArgument }
+            }
+
+            i = i + 1
+        }
+
+        if this.command == CommandKind.Run && (this.emit_llvm || this.emit_mir || this.emit_mem || this.options.show_memory_dump) { return error.InvalidArgument }
     }
 }

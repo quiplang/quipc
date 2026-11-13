@@ -1,0 +1,107 @@
+@pure @const {
+    make hir = @import "../hir/hir.quip"
+    make util = @import "../util/pkg.quip"
+    make ty = @import "../ty/ty.quip"
+}
+
+@pub
+make type UseCheck {
+    @pub make kind: uint = 0
+    @pub make range: util::Range = .{}
+    @pub make span: util::Span = .{}
+    @pub make path: str = ""
+    @pub make source: str = ""
+    @pub make has_source: bool = false
+    @pub make owner: str = ""
+    @pub make name: str = ""
+    @pub make block: uint = 0
+}
+
+@pub
+make unsafe_function (function: ref<hir::HirFunc>) -> bool {
+    for tag : function.*.tags {
+        if tag == "unsafe" { return true }
+    }
+
+    return false
+}
+
+@pub
+make require_unsafe (depth: uint, checks: ref<UseCheck[]>, required: bool, range: util::Range) -> void {
+    if required && depth == 0 { checks.*.push(UseCheck { kind = 0, range = range }) }
+}
+
+@pub
+make require_unsafe_local (depth: uint, checks: ref<UseCheck[]>, function: ref<hir::HirFunc>, range: util::Range) -> void {
+    if unsafe_function(function) && depth == 0 { checks.*.push(UseCheck { kind = 1, range = range, span = function.*.name_span.copy() }) }
+}
+
+@pub
+make require_unsafe_origin (depth: uint, checks: ref<UseCheck[]>, required: bool, range: util::Range, path: str, source: ref<str>?, span: util::Span) -> void {
+    if !required || depth > 0 { return }
+
+    make check = UseCheck { kind = 2, range = range, path = path, span = span }
+    match source { none {} some { check.source = some.*.copy() check.has_source = true } }
+    checks.*.push(check)
+}
+
+@pub
+make require_unsafe_field (depth: uint, checks: ref<UseCheck[]>, structs: ref<hir::HirStructSig[]>, required: bool, range: util::Range, owner: str, name: str) -> void {
+    if required && depth == 0 { checks.*.push(UseCheck { kind = 3, range = range, owner = owner, name = name }) }
+}
+
+@pub
+make require_syscall_unsafe (depth: uint, checks: ref<UseCheck[]>, range: util::Range) -> void {
+    if depth == 0 { checks.*.push(UseCheck { kind = 4, range = range }) }
+}
+
+@pub
+make is_array_copy (function: ref<hir::HirFunc>, owner: str) -> bool {
+    if owner.len() < 2 || owner[owner.len() - 1] != ']' || owner[owner.len() - 2] != '[' { return false }
+
+    for tag : function.*.tags {
+        if tag == "copy" { return true }
+    }
+
+    return false
+}
+
+@pub
+make record_catch (checks: ref<UseCheck[]>, body: ref<hir::HirBody>, expression: ref<hir::HirExpr>, needs_value: bool) -> void {
+    if needs_value {
+        checks.*.push(UseCheck { kind = 5, range = expression.*.range.copy(), block = expression.*.catch_block })
+    }
+}
+
+@pub
+make record_invalid_pattern (checks: ref<UseCheck[]>, range: util::Range) -> void {
+    checks.*.push(UseCheck { kind = 6, range = range })
+}
+
+@pub
+make record_field_access (checks: ref<UseCheck[]>, owner: str, name: str, range: util::Range) -> void {
+    checks.*.push(UseCheck { kind = 7, range = range, owner = owner, name = name })
+}
+
+
+@pub
+make type ClosureCheck {
+    @pub make expr: uint = 0
+    @pub make kind: uint = 0 // capture (0) or capturing lambda return (1)
+    @pub make ty: uint = ty::TY_ERROR
+    @pub make range: util::Range = .{}
+}
+
+@pub
+make type ClosureShape {
+    @pub make complete: bool = true
+    @pub make ty: uint = ty::TY_ERROR
+    @pub make children: uint[] = []
+}
+
+@pub
+make type FieldCheck {
+    @pub make range: util::Range
+    @pub make name: str
+    @pub make owner: str
+}

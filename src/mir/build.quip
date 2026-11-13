@@ -1,0 +1,2095 @@
+// HIR -> MIR
+//
+// nested expressions are decomposed into temporaries, structured control flow becomes basic blocks
+// locals get `StorageLive` where they are declared and `StorageDead` when their block falls through
+
+@pure @const {
+    make lexer = @import "../core/token.quip"
+    make hir = @import "../hir/hir.quip"
+    make mir = @import "mir.quip"
+    make typeck = @import "../ty/check.quip"
+    make ty = @import "../ty/ty.quip"
+    make util = @import "../util/pkg.quip"
+}
+
+/// lowers a checked hir module to mir.
+@pub
+make build (module: ref<hir::HirModule>, checked: ref<typeck::ModuleTypeck>, tys: ref<ty::TyInterner>, external_structs: ref<hir::HirStructSig[]>, attached: ref<hir::HirAttachedSig[]>) -> mir::MirModule {
+    make previous = mir::MirModule {}
+    make reuse: bool[] = []
+
+    return build_cached(module, checked, tys, external_structs, attached, previous.pin, reuse.pin)
+}
+
+/// lowers checked hir while reusing eligible previous mir functions.
+@pub
+make build_cached (module: ref<hir::HirModule>, checked: ref<typeck::ModuleTypeck>, tys: ref<ty::TyInterner>, external_structs: ref<hir::HirStructSig[]>, attached: ref<hir::HirAttachedSig[]>, previous: ref<mir::MirModule>, reuse: ref<bool[]>) -> mir::MirModule {
+    make out = mir::MirModule {}
+
+    for signature : attached.* {
+        out.attached_symbols.push(mir::MirAttachedSymbol {
+            owner = signature.type_name !, name = signature.name !, symbol = signature.symbol !,
+        })
+    }
+
+    for method : module.*.attached_funcs {
+        if method.func < module.*.funcs.len() {
+            out.attached_symbols.push(mir::MirAttachedSymbol {
+                owner = method.type_name !, name = method.name !, symbol = module.*.funcs[method.func].name !,
+            })
+        }
+    }
+
+    make i = 0
+
+    while i < module.*.funcs.len() {
+        if i < reuse.*.len() && reuse.*[i] && i < previous.*.funcs.len() {
+            out.reused_functions = out.reused_functions + 1
+            out.funcs.push(previous.*.funcs[i])
+            i = i + 1
+            continue
+        }
+
+        make f = module.*.funcs[i].pin
+
+        make body = mir::MirBody {}
+        make b = Builder.create(f.*.body.pin, body.pin, checked, tys, module, i)
+        make mf = b.build_func(f)
+        mf.body = body
+
+        out.funcs.push(mf)
+        i = i + 1
+    }
+
+    i = 0
+
+    while i < module.*.items.len() {
+        make item = module.*.items[i].pin
+
+        if item.*.is_global_allocator {
+            make global = mir::MirGlobal {}
+
+            global.name = item.*.name.copy()
+            global.initializer = item.*.func
+            global.is_default_allocator = item.*.is_default_allocator
+            global.is_external = item.*.is_external_global
+            out.globals.push(global)
+        }
+
+        i = i + 1
+    }
+
+    // carry struct layouts through for codegen: field order and rendered field types
+    make si = 0
+
+    while si < module.*.structs.len() {
+        make hs = module.*.structs[si].pin
+
+        make ms = mir::MirStruct {}
+
+        ms.name = hs.*.name !
+
+        make fi = 0
+
+        while fi < hs.*.fields.len() {
+            make hf = hs.*.fields[fi].pin
+
+            make mf = mir::MirField {}
+
+            mf.name = hf.*.name !
+            mf.default_init = hf.*.default_init.copy()
+
+            if hf.*.has_ty {
+                mf.ty = type_name(hs.*.body.pin, hf.*.ty)
+            }
+
+            if hf.*.has_default && hf.*.default < hs.*.body.exprs.len() {
+                make value = hs.*.body.exprs[hf.*.default].pin
+
+                if value.*.kind == hir::HirExprKind.Literal {
+                    mf.default_lit.kind = value.*.lit.kind
+                    mf.default_lit.lexeme = value.*.lit.lexeme.copy()
+                    mf.default_lit.span = value.*.lit.span
+                    mf.has_default = true
+                }
+            }
+
+            ms.fields.push(mf)
+            fi = fi + 1
+        }
+
+        out.structs.push(ms)
+        si = si + 1
+    }
+
+    si = 0
+
+    while si < external_structs.*.len() {
+        make sig = external_structs.*[si].pin
+        make oi = 0
+
+        while oi < out.structs.len() {
+            if out.structs[oi].name == sig.*.name { break }
+
+            oi = oi + 1
+        }
+
+        if oi < out.structs.len() {
+            if out.structs[oi].fields.len() == 0 && sig.*.fields.len() > 0 {
+                make fi = 0
+
+                while fi < sig.*.fields.len() {
+                    make hf = sig.*.fields[fi].pin
+                    make mf = mir::MirField {}
+
+                    mf.name = hf.*.name !
+                    mf.ty = hf.*.type_name !
+                    mf.default_init = hf.*.default_init.copy()
+                    mf.has_default = hf.*.has_default_lit
+                    mf.default_lit.kind = hf.*.default_lit.kind
+                    mf.default_lit.lexeme = hf.*.default_lit.lexeme.copy()
+                    mf.default_lit.span = hf.*.default_lit.span
+                    out.structs[oi].fields.push(mf)
+                    fi = fi + 1
+                }
+            }
+        } else {
+            make ms = mir::MirStruct {}
+
+            ms.name = sig.*.name !
+            make fi = 0
+
+            while fi < sig.*.fields.len() {
+                make hf = sig.*.fields[fi].pin
+                make mf = mir::MirField {}
+
+                mf.name = hf.*.name !
+                mf.ty = hf.*.type_name !
+                mf.default_init = hf.*.default_init.copy()
+                mf.has_default = hf.*.has_default_lit
+                mf.default_lit.kind = hf.*.default_lit.kind
+                mf.default_lit.lexeme = hf.*.default_lit.lexeme.copy()
+                mf.default_lit.span = hf.*.default_lit.span
+                ms.fields.push(mf)
+                fi = fi + 1
+            }
+
+            out.structs.push(ms)
+        }
+
+        si = si + 1
+    }
+
+    return out
+}
+
+// rendered source name for an interned type id, used to type MIR locals and temporaries.
+// iterative (no recursion) so a malformed/self-referential interned type cannot loop forever:
+// wrapper types accumulate an `opens`/`tail` pair, the base primitive/adt name is emitted last.
+make ty_name (module: ref<hir::HirModule>, tys: ref<ty::TyInterner>, id: uint) -> str {
+    make opens: str = ""
+    make tail: str = ""
+    make cur = id
+    make guard = 0
+
+    while guard < 64 {
+        make kind = tys.*.kind_of(cur)
+
+        if kind == ty::TyKind.Array || kind == ty::TyKind.Optional {
+            make inner = ty_name(module, tys, tys.*.elem_of(cur))
+
+            if inner.len() > 0 && inner[0] == '!' { inner = "(" + inner + ")" }
+
+            make suffix: str = "[]"
+
+            if kind == ty::TyKind.Optional { suffix = "?" }
+
+            return opens + inner + suffix + tail
+        } elif kind == ty::TyKind.Fallible {
+            opens = opens + "!"
+            cur = tys.*.elem_of(cur)
+        } elif kind == ty::TyKind.Ptr {
+            opens = opens + "ptr<"
+            tail = ">" + tail
+            cur = tys.*.elem_of(cur)
+        } elif kind == ty::TyKind.Owned {
+            opens = opens + "owned<"
+            tail = ">" + tail
+            cur = tys.*.elem_of(cur)
+        } elif kind == ty::TyKind.Ref {
+            opens = opens + "ref<"
+            tail = ">" + tail
+            cur = tys.*.elem_of(cur)
+        } else {
+            make base = ty_base_name(module, tys, kind, cur)
+
+            if base.len() == 0 { return "" }
+
+            return opens + base + tail
+        }
+
+        guard = guard + 1
+    }
+
+    return ""
+}
+
+/// renders the base name of an interned type for mir.
+make ty_base_name (module: ref<hir::HirModule>, tys: ref<ty::TyInterner>, kind: ty::TyKind, id: uint) -> str {
+    if kind == ty::TyKind.Variant {
+        make members = tys.*.args_of(id)
+        make result: str = "variant<"
+        make i: uint = 0
+
+        while i < members.len() {
+            if i > 0 { result = result + ", " }
+
+            result = result + ty_name(module, tys, members[i])
+            i = i + 1
+        }
+
+        return result + ">"
+    }
+
+    if kind == ty::TyKind.Infer { return "any" }
+
+    if kind == ty::TyKind.Void { return "void" }
+
+    if kind == ty::TyKind.Bool { return "bool" }
+
+    if kind == ty::TyKind.I8 { return "i8" }
+
+    if kind == ty::TyKind.I16 { return "i16" }
+
+    if kind == ty::TyKind.I32 { return "i32" }
+
+    if kind == ty::TyKind.I64 { return "i64" }
+
+    if kind == ty::TyKind.U8 { return "u8" }
+
+    if kind == ty::TyKind.U16 { return "u16" }
+
+    if kind == ty::TyKind.U32 { return "u32" }
+
+    if kind == ty::TyKind.U64 { return "u64" }
+
+    if kind == ty::TyKind.Int { return "int" }
+
+    if kind == ty::TyKind.Uint { return "uint" }
+
+    if kind == ty::TyKind.F32 { return "f32" }
+
+    if kind == ty::TyKind.F64 { return "f64" }
+
+    if kind == ty::TyKind.Float { return "float" }
+
+    if kind == ty::TyKind.Str { return "str" }
+
+    if kind == ty::TyKind.StrBuf { return "String" }
+
+    if kind == ty::TyKind.Char { return "char" }
+
+    if kind == ty::TyKind.ErrorVal { return "error" }
+
+    if kind == ty::TyKind.Func { return "fn" }
+
+    if kind == ty::TyKind.Adt {
+        make def = tys.*.def_of(id)
+
+        if def < module.*.items.len() {
+            return module.*.items[def].name.copy()
+        }
+    }
+
+    return ""
+}
+
+make type_name (body: ref<hir::HirBody>, id: uint) -> str {
+    make t = body.*.types[id].pin
+
+    // Namespace arguments are path segments, not generic parameters.
+    if t.*.is_namespace && t.*.args.len() > 0 {
+        make name = type_name(body, t.*.args[t.*.args.len() - 1])
+
+        if t.*.is_ref { name = "ref<" + name + ">" }
+
+        if t.*.is_ptr { name = "ptr<" + name + ">" }
+
+        if t.*.is_array { name = name + "[]" }
+
+        if t.*.is_optional { name = name + "?" }
+
+        if t.*.is_fallible { name = "!" + name }
+
+        return name
+    }
+
+    make s: str = ""
+
+    if t.*.is_fallible { s = "!" }
+
+    s = s + t.*.name !
+
+    if t.*.args.len() > 0 {
+        s = s + "<"
+        make i = 0
+
+        while i < t.*.args.len() {
+            if i > 0 { s = s + ", " }
+
+            s = s + type_name(body, t.*.args[i])
+            i = i + 1
+        }
+
+        s = s + ">"
+    }
+
+    if t.*.is_array { s = s + "[]" }
+
+    if t.*.is_optional { s = s + "?" }
+
+    return s
+}
+
+make is_variant_name (name: str) -> bool {
+    make prefix: str = "variant<"
+
+    if name.len() <= prefix.len() { return false }
+
+    if name[name.len() - 1] != '>' { return false }
+
+    make i: uint = 0
+
+    while i < prefix.len() {
+        if name[i] != prefix[i] { return false }
+
+        i = i + 1
+    }
+
+    return true
+}
+
+// `+=` -> `+`
+make compound_op (kind: lexer::TokenKind) -> str {
+    match kind {
+        lexer::TokenKind.PlusEqual { return "+" }
+
+        lexer::TokenKind.MinusEqual { return "-" }
+
+        lexer::TokenKind.AsteriskEqual { return "*" }
+
+        lexer::TokenKind.SlashEqual { return "/" }
+
+        lexer::TokenKind.PercentEqual { return "%" }
+
+        lexer::TokenKind.AmpersandEqual { return "&" }
+
+        lexer::TokenKind.PipeEqual { return "|" }
+
+        lexer::TokenKind.CaretEqual { return "^" }
+
+        lexer::TokenKind.ShiftLeftEqual { return "<<" }
+
+        lexer::TokenKind.ShiftRightEqual { return ">>" }
+        _ { return "" }
+    }
+
+    return ""
+}
+
+/// gets the local for the place.
+make local_place (local: uint) -> mir::MirPlace {
+    make p = mir::MirPlace {}
+
+    p.local = local
+
+    return p
+}
+
+/// constructs a mir place that dereferences the given local.
+make pointer_place (local: uint) -> mir::MirPlace {
+    make result = local_place(local)
+    make dereference = mir::MirProj {}
+
+    dereference.kind = mir::MirProjKind.Deref
+    result.projs.push(dereference)
+    return result
+}
+
+
+/// lowers a hir function body into mir locals, statements, and terminators.
+make type Builder {
+    make src: ref<hir::HirBody>
+    make body: ref<mir::MirBody>        // owned by the caller, see hir/lower.quip
+    make checked: ref<typeck::ModuleTypeck>
+    make tys: ref<ty::TyInterner>
+    make module: ref<hir::HirModule>
+    make func_idx: uint = 0
+    make cur_range: util::Range = .{}   // source range attached to the next emitted node
+
+    make cur: uint = 0
+    make loop_exits: uint[] = []
+    make loop_heads: uint[] = []
+
+    // locals whose storage is live, in declaration order
+    make live: uint[] = []
+
+    @pub
+    make create (src: ref<hir::HirBody>, body: ref<mir::MirBody>, checked: ref<typeck::ModuleTypeck>, tys: ref<ty::TyInterner>, module: ref<hir::HirModule>, func_idx: uint) -> Builder {
+        make b = Builder { src = src, body = body, checked = checked, tys = tys, module = module, func_idx = func_idx }
+
+        return b
+    }
+
+    // typeck decides whether a use moves or copies (`!` and copy types read as Copy)
+    @this
+    make is_copy_use (e: uint) -> bool {
+        if this.func_idx >= this.checked.*.funcs.len() { return false }
+
+        make uses = this.checked.*.funcs[this.func_idx].uses.len()
+
+        if e >= uses { return false }
+
+        return this.checked.*.funcs[this.func_idx].uses[e] == 1
+    }
+
+    // resolved type of expression `e`, rendered as a source-like signature
+    @this
+    make expr_ty (e: uint) -> str {
+        if this.func_idx >= this.checked.*.funcs.len() { return "" }
+
+        make res = this.checked.*.funcs[this.func_idx].pin
+
+        if e >= res.*.expr_tys.len() { return "" }
+
+        return ty_name(this.module, this.tys, res.*.expr_tys[e])
+    }
+
+    /// checks whether a checked expression has an aggregate representation.
+    @this
+    make expr_is_aggregate (e: uint) -> bool {
+        if this.func_idx >= this.checked.*.funcs.len() { return false }
+
+        make res = this.checked.*.funcs[this.func_idx].pin
+
+        if e >= res.*.expr_tys.len() { return false }
+
+        make id = res.*.expr_tys[e]
+        make kind = this.tys.*.kind_of(id)
+
+        if kind == ty::TyKind.Fallible { return true }
+
+        if kind == ty::TyKind.Array || kind == ty::TyKind.Optional || kind == ty::TyKind.Variant {
+            return true
+        }
+
+        if kind == ty::TyKind.Str || kind == ty::TyKind.StrBuf {
+            return true
+        }
+
+        if kind == ty::TyKind.Adt {
+            make def = this.tys.*.def_of(id)
+
+            if def < this.module.*.items.len() {
+                return this.module.*.items[def].kind == hir::HirItemKind.Type
+            }
+        }
+
+        return false
+    }
+
+    /// returns a checked call argument type, or the supplied fallback.
+    @this
+    make call_arg_type (e: uint, arg: uint, fallback: str) -> str {
+        if this.func_idx >= this.checked.*.funcs.len() { return fallback }
+
+        make res = this.checked.*.funcs[this.func_idx].pin
+        make i: uint = 0
+
+        while i < res.*.abi_exprs.len() {
+            if res.*.abi_exprs[i] == e && arg < res.*.abi_arg_counts[i] {
+                make id = res.*.abi_arg_types[res.*.abi_arg_starts[i] + arg]
+
+                return ty_name(this.module, this.tys, id)
+            }
+
+            i = i + 1
+        }
+
+        return fallback
+    }
+
+    /// returns a call argument’s checked aggregate classification, or the fallback.
+    @this
+    make call_arg_aggregate (e: uint, arg: uint, fallback: bool) -> bool {
+        if this.func_idx >= this.checked.*.funcs.len() { return fallback }
+
+        make res = this.checked.*.funcs[this.func_idx].pin
+        make result = fallback
+        make i: uint = 0
+
+        while i < res.*.abi_exprs.len() {
+            if res.*.abi_exprs[i] == e && arg < res.*.abi_arg_counts[i] {
+                result = res.*.abi_arg_aggs[res.*.abi_arg_starts[i] + arg]
+                i = res.*.abi_exprs.len()
+            } else {
+                i = i + 1
+            }
+        }
+
+        return result
+    }
+
+    /// returns a call result’s checked aggregate classification, or the fallback.
+    @this
+    make call_ret_aggregate (e: uint, fallback: bool) -> bool {
+        if this.func_idx >= this.checked.*.funcs.len() { return fallback }
+
+        make res = this.checked.*.funcs[this.func_idx].pin
+        make result = fallback
+        make i: uint = 0
+
+        while i < res.*.abi_exprs.len() {
+            if res.*.abi_exprs[i] == e {
+                result = res.*.abi_ret_aggs[i]
+                i = res.*.abi_exprs.len()
+            } else {
+                i = i + 1
+            }
+        }
+
+        return result
+    }
+
+    /// builds the function.
+    @this
+    make build_func (f: ref<hir::HirFunc>) -> mir::MirFunc {
+        make out = mir::MirFunc {}
+
+        out.name = f.*.name !
+        out.range = f.*.range !
+        out.is_external = f.*.is_external
+        out.is_variadic = f.*.is_variadic
+        out.export_name = f.*.export_name.copy()
+        out.intrinsic_name = f.*.intrinsic_name.copy()
+        out.is_lambda = f.*.is_lambda
+        out.is_attached = f.*.is_attached
+        make rty: str = ""
+
+        if f.*.has_ret_ty {
+            rty = type_name(this.src, f.*.ret_ty)
+        }
+
+        if this.func_idx < this.checked.*.funcs.len() {
+            make ck = this.checked.*.funcs[this.func_idx].pin
+
+            if ck.*.ret_ty != ty::TY_ERROR && ck.*.ret_ty != ty::TY_VOID {
+                rty = ty_name(this.module, this.tys, ck.*.ret_ty)
+            }
+        }
+
+        out.ret_ty = rty.copy()
+
+        // _0 is the return place, HIR local `n` becomes MIR local `n + 1`
+        make return_local = mir::MirLocal {}
+
+        return_local.ty = rty.copy()
+        this.body.*.locals.push(return_local)
+
+        make li = 0
+
+        while li < this.src.*.locals.len() {
+            make hl = this.src.*.locals[li].pin
+
+            make ml = mir::MirLocal {}
+
+            ml.name = hl.*.name !
+            ml.is_param = hl.*.is_param
+            ml.range = hl.*.range !
+            make lty: str = ""
+
+            if hl.*.has_ty {
+                lty = type_name(this.src, hl.*.ty)
+            }
+
+            // prefer the checker's resolved local type so inferred locals get a concrete layout
+            ml.ty = this.resolved_local_ty(li, lty)
+
+            if this.func_idx < this.checked.*.funcs.len() {
+                make ck = this.checked.*.funcs[this.func_idx].pin
+
+                if li < ck.*.local_tys.len() {
+                    ml.is_copy = this.type_is_copy(ck.*.local_tys[li])
+                }
+            }
+
+            this.body.*.locals.push(ml)
+            li = li + 1
+        }
+
+        this.body.*.param_count = this.src.*.param_count
+
+        for capture : f.*.capture_locals { this.body.*.capture_locals.push(capture + 1) }
+
+        this.cur_range = f.*.range !
+        this.cur = this.new_block()
+        this.block(this.src.*.root)
+
+        if !this.is_terminated() {
+            make ret = mir::MirTerm {}
+
+            ret.kind = mir::MirTermKind.Return
+            this.terminate(ret)
+        }
+
+        // blocks created inside dead code have no predecessors
+        make bi = 0
+
+        while bi < this.body.*.terms.len() {
+            if this.body.*.terms[bi].kind == mir::MirTermKind.None {
+                this.body.*.terms[bi].kind = mir::MirTermKind.Unreachable
+            }
+
+            bi = bi + 1
+        }
+
+        while this.loop_exits.len() > 0 { make _ = this.loop_exits.pop() }
+
+        while this.loop_heads.len() > 0 { make _ = this.loop_heads.pop() }
+
+        while this.live.len() > 0 { make _ = this.live.pop() }
+
+        return out
+    }
+
+    // value semantics for memory analysis: primitives, pointers and payload-free enums
+    @this
+    make type_is_copy (id: uint) -> bool {
+        if this.tys.*.is_copy(id) {
+            return true
+        }
+
+        if this.tys.*.kind_of(id) == ty::TyKind.Adt {
+            make def = this.tys.*.def_of(id)
+
+            if def < this.module.*.items.len() {
+                return this.module.*.items[def].kind == hir::HirItemKind.Enum
+            }
+        }
+
+        if this.tys.*.kind_of(id) == ty::TyKind.Variant {
+            make args = this.tys.*.args_of(id)
+            make i = 0
+
+            while i < args.len() {
+                if !this.type_is_copy(args[i]) {
+                    return false
+                }
+
+                i = i + 1
+            }
+
+            return true
+        }
+
+        return false
+    }
+
+    /// returns the checked type name of a local, or the supplied fallback.
+    @this
+    make resolved_local_ty (li: uint, fallback: str) -> str {
+        if this.func_idx >= this.checked.*.funcs.len() {
+            return fallback
+        }
+
+        make ck = this.checked.*.funcs[this.func_idx].pin
+
+        if li >= ck.*.local_tys.len() {
+            return fallback
+        }
+
+        make resolved = ty_name(this.module, this.tys, ck.*.local_tys[li])
+
+        if resolved.len() == 0 {
+            return fallback
+        }
+
+        return resolved
+    }
+
+
+    /// creates the block.
+    @this
+    make new_block () -> uint {
+        make id = this.body.*.terms.len()
+        this.body.*.terms.push(mir::MirTerm {})
+        return id
+    }
+
+    @this
+    make is_terminated () -> bool {
+        return this.body.*.terms[this.cur].kind != mir::MirTermKind.None
+    }
+
+    // code following `return` or `break` is dead, a terminated block ignores further statements
+    @this
+    make terminate (t: mir::MirTerm) -> void {
+        if this.is_terminated() { return }
+
+        make cur = this.cur
+        this.body.*.terms[cur].kind = t.kind
+        this.body.*.terms[cur].target = t.target
+        this.body.*.terms[cur].other = t.other
+        this.body.*.terms[cur].cond = t.cond
+        this.body.*.terms[cur].func = t.func
+
+        while this.body.*.terms[cur].args.len() > 0 { make _ = this.body.*.terms[cur].args.pop() }
+
+        while this.body.*.terms[cur].arg_tys.len() > 0 { make _ = this.body.*.terms[cur].arg_tys.pop() }
+
+        while this.body.*.terms[cur].arg_aggs.len() > 0 { make _ = this.body.*.terms[cur].arg_aggs.pop() }
+
+        this.body.*.terms[cur].args = t.args
+        this.body.*.terms[cur].arg_tys = t.arg_tys
+        this.body.*.terms[cur].arg_aggs = t.arg_aggs
+        this.body.*.terms[cur].c_abi = t.c_abi
+        this.body.*.terms[cur].variadic_fixed = t.variadic_fixed
+        this.body.*.terms[cur].has_receiver = t.has_receiver
+        this.body.*.terms[cur].ret_ty = t.ret_ty
+        this.body.*.terms[cur].ret_agg = t.ret_agg
+        this.body.*.terms[cur].dest = t.dest
+
+        if t.name.len() > 0 {
+            this.body.*.terms[cur].name = t.name !
+        }
+
+        this.body.*.terms[cur].range = this.cur_range !
+    }
+
+    @this
+    make emit (s: mir::MirStmt) -> void {
+        if this.is_terminated() { return }
+
+        s.block = this.cur
+        s.range = this.cur_range !
+        this.body.*.stmts.push(s)
+    }
+
+    /// creates the temp.
+    @this
+    make new_temp () -> uint {
+        make id = this.body.*.locals.len()
+
+        make tmp = mir::MirLocal {}
+
+        tmp.is_temp = true
+        this.body.*.locals.push(tmp)
+
+        return id
+    }
+
+    // a temporary whose type is taken from the expression it will hold
+    @this
+    make new_expr_temp (e: uint) -> uint {
+        make id = this.body.*.locals.len()
+        make tmp = mir::MirLocal {}
+
+        tmp.is_temp = true
+        tmp.ty = this.expr_ty(e)
+
+        if this.func_idx < this.checked.*.funcs.len() {
+            make ck = this.checked.*.funcs[this.func_idx].pin
+
+            if e < ck.*.expr_tys.len() {
+                tmp.is_copy = this.type_is_copy(ck.*.expr_tys[e])
+            }
+        }
+
+        this.body.*.locals.push(tmp)
+        return id
+    }
+
+    /// emits an assignment of an rvalue to a mir place.
+    @this
+    make assign (place: mir::MirPlace, rv: mir::MirRvalue) -> void {
+        make s = mir::MirStmt {}
+
+        s.kind = mir::MirStmtKind.Assign
+        s.place = place
+        s.rvalue = rv
+        this.emit(s)
+    }
+
+    /// emits a mir storage-lifetime statement for a local.
+    @this
+    make storage (kind: mir::MirStmtKind, local: uint) -> void {
+        make s = mir::MirStmt {}
+
+        s.kind = kind
+        s.local = local
+        this.emit(s)
+    }
+
+    // Freeze an lvalue's address before reading it or evaluating the RHS.
+    // Index expressions, pointer-returning calls and field receivers run once.
+    @this
+    make stable_place (expression: uint) -> mir::MirPlace {
+        if this.src.*.exprs[expression].kind == hir::HirExprKind.Local {
+            return this.place(expression)
+        }
+
+        make address = this.new_temp()
+        this.body.*.locals[address].ty = "ptr<" + this.expr_ty(expression) + ">"
+        this.body.*.locals[address].is_copy = true
+        this.storage(mir::MirStmtKind.StorageLive, address)
+
+        make pointer = mir::MirRvalue {}
+
+        pointer.kind = mir::MirRvalueKind.Pin
+        pointer.place = this.place(expression)
+        this.assign(local_place(address), pointer)
+        return pointer_place(address)
+    }
+
+    /// constructs a place for a previously evaluated assignment target.
+    @this
+    make frozen_place (expression: uint, local: uint) -> mir::MirPlace {
+        if this.src.*.exprs[expression].kind == hir::HirExprKind.Local {
+            return local_place(local)
+        }
+
+        return pointer_place(local)
+    }
+
+    // evaluates the rvalue into a fresh temporary
+    @this
+    make materialize (e: uint) -> uint {
+        make rv = this.rvalue(e)
+        make tmp = this.new_expr_temp(e)
+        this.storage(mir::MirStmtKind.StorageLive, tmp)
+        this.assign(local_place(tmp), rv)
+        return tmp
+    }
+
+
+    /// lowers a hir block into mir.
+    @this
+    make block (id: uint) -> void {
+        make mark = this.live.len()
+
+        make blk = this.src.*.blocks[id].pin
+        make i = 0
+
+        while i < blk.*.stmts.len() {
+            this.stmt(blk.*.stmts[i])
+            i = i + 1
+        }
+
+        if blk.*.end_span.end > blk.*.end_span.start { this.cur_range = util::Range.of(blk.*.end_span.start, blk.*.end_span.end) }
+
+        while this.live.len() > mark {
+            make local = this.live.pop()
+
+            if !this.is_terminated() {
+                this.storage(mir::MirStmtKind.StorageDead, local)
+            }
+        }
+    }
+
+    /// lowers a hir statement into mir.
+    @this
+    make stmt (id: uint) -> void {
+        make src = this.src
+        make s = src.*.stmts[id].pin
+        this.cur_range = s.*.range !
+
+        match s.*.kind {
+            hir::HirStmtKind.Let {
+                make local = s.*.local + 1
+
+                // the initializer is evaluated before the new local is born
+                if s.*.has_value {
+                    make rv = this.rvalue(s.*.value)
+                    this.storage(mir::MirStmtKind.StorageLive, local)
+                    this.assign(local_place(local), rv)
+                } else {
+                    this.storage(mir::MirStmtKind.StorageLive, local)
+                    // Dynamic arrays start as an empty descriptor, including
+                    // when the declaration omits an explicit initializer.
+                    make local_ty = this.body.*.locals[local].ty.copy()
+
+                    if local_ty.len() >= 2 && local_ty[local_ty.len() - 2] == '[' && local_ty[local_ty.len() - 1] == ']' {
+                        make empty = mir::MirRvalue {}
+                        empty.kind = mir::MirRvalueKind.Aggregate
+                        this.assign(local_place(local), empty)
+                    }
+                }
+
+                this.live.push(local)
+            }
+
+            hir::HirStmtKind.Assign {
+                if s.*.op.kind == lexer::TokenKind.Equal {
+                    make target = this.place(s.*.target)
+                    this.assign(target, this.rvalue(s.*.value))
+                } else {
+                    make target = this.stable_place(s.*.target)
+                    make address = target.local
+                    make old = this.new_expr_temp(s.*.target)
+                    this.storage(mir::MirStmtKind.StorageLive, old)
+
+                    make saved = mir::MirRvalue {}
+
+                    saved.kind = mir::MirRvalueKind.Use
+                    saved.a.kind = mir::MirOperandKind.Copy
+                    saved.a.place = this.frozen_place(s.*.target, address)
+                    this.assign(local_place(old), saved)
+
+                    make value = mir::MirRvalue {}
+
+                    value.kind = mir::MirRvalueKind.Binary
+                    value.op = compound_op(s.*.op.kind)
+                    value.a.kind = mir::MirOperandKind.Copy
+                    value.a.place = local_place(old)
+                    value.b = this.operand(s.*.value)
+                    this.assign(target, value)
+
+                    this.storage(mir::MirStmtKind.StorageDead, old)
+
+                    if this.src.*.exprs[s.*.target].kind != hir::HirExprKind.Local {
+                        this.storage(mir::MirStmtKind.StorageDead, address)
+                    }
+                }
+            }
+
+            hir::HirStmtKind.Expr {
+                make tmp = 0
+
+                if this.src.*.exprs[s.*.value].kind == hir::HirExprKind.Call {
+                    tmp = this.call(s.*.value)
+                } else {
+                    tmp = this.materialize(s.*.value)
+                }
+
+                this.storage(mir::MirStmtKind.StorageDead, tmp)
+            }
+
+            hir::HirStmtKind.If {
+                make cond = this.operand(s.*.value)
+
+                make then_bb = this.new_block()
+                make else_bb = 0
+
+                if s.*.has_else {
+                    else_bb = this.new_block()
+                }
+
+                make join_bb = this.new_block()
+
+                make br = mir::MirTerm {}
+
+                br.kind = mir::MirTermKind.Branch
+                br.cond = cond
+                br.target = then_bb
+
+                if s.*.has_else {
+                    br.other = else_bb
+                } else {
+                    br.other = join_bb
+                }
+
+                this.terminate(br)
+
+                this.cur = then_bb
+                this.block(s.*.then_block)
+                this.goto(join_bb)
+
+                if s.*.has_else {
+                    this.cur = else_bb
+                    this.block(s.*.else_block)
+                    this.goto(join_bb)
+                }
+
+                this.cur = join_bb
+            }
+
+            hir::HirStmtKind.Loop {
+                make head_bb = this.new_block()
+                make exit_bb = this.new_block()
+
+                this.goto(head_bb)
+                this.cur = head_bb
+
+                this.loop_exits.push(exit_bb)
+                this.loop_heads.push(head_bb)
+                this.block(s.*.then_block)
+                this.loop_heads.pop()
+                this.loop_exits.pop()
+
+                this.goto(head_bb)
+                this.cur = exit_bb
+            }
+
+            hir::HirStmtKind.Block {
+                this.block(s.*.then_block)
+            }
+
+            hir::HirStmtKind.Break {
+                make exit_bb = this.loop_exits[this.loop_exits.len() - 1]
+                this.goto(exit_bb)
+            }
+
+            hir::HirStmtKind.Continue {
+                make head_bb = this.loop_heads[this.loop_heads.len() - 1]
+                this.goto(head_bb)
+            }
+
+            hir::HirStmtKind.Return {
+                if s.*.has_value {
+                    this.assign(local_place(0), this.rvalue(s.*.value))
+                }
+
+                make ret = mir::MirTerm {}
+
+                ret.kind = mir::MirTermKind.Return
+                this.terminate(ret)
+            }
+
+            hir::HirStmtKind.Unsupported {
+                make u = mir::MirStmt {}
+
+                u.kind = mir::MirStmtKind.Unsupported
+                u.name = s.*.name !
+                this.emit(u)
+            }
+
+            hir::HirStmtKind.Match {
+                make svtmp = 0
+
+                if s.*.has_value {
+                    svtmp = this.materialize(s.*.value)
+                } else {
+                    svtmp = this.new_temp()
+                    this.storage(mir::MirStmtKind.StorageLive, svtmp)
+                }
+
+                make join_bb = this.new_block()
+
+                make ci = 0
+
+                while ci < s.*.cases.len() {
+                    make hc = this.src.*.cases[s.*.cases[ci]].pin
+                    make hit = this.new_block()
+                    make miss = this.new_block()
+
+                    this.branch_on_case(svtmp, hc, hit, miss)
+
+                    this.cur = hit
+                    this.emit_match_case(hc, svtmp, 0, false)
+                    this.goto(join_bb)
+
+                    this.cur = miss
+                    ci = ci + 1
+                }
+
+                this.goto(join_bb)
+                this.cur = join_bb
+            }
+        }
+    }
+
+    // jumps to `target` unless the current block already ended with `return` or `break`
+    @this
+    make goto (target: uint) -> void {
+        if this.is_terminated() { return }
+
+        make g = mir::MirTerm {}
+
+        g.kind = mir::MirTermKind.Goto
+        g.target = target
+        this.terminate(g)
+    }
+
+
+    // ends the current block with a test for `hc` against the scrutinee in `svtmp`, continuing in
+    // `hit` when the pattern matches and `miss` otherwise
+    @this
+    make branch_on_case (svtmp: uint, hc: ref<hir::HirCase>, hit: uint, miss: uint) -> void {
+        if hc.*.kind == hir::HirPatternKind.Wildcard || hc.*.kind == hir::HirPatternKind.Binding {
+            this.goto(hit)
+            return
+        }
+
+        make tok = lexer::Token {}
+        make op = "=="
+
+        if hc.*.kind == hir::HirPatternKind.EnumVariant {
+            tok.kind = lexer::TokenKind.LiteralNum
+            tok.lexeme = hc.*.variant.to_str()
+        } elif hc.*.kind == hir::HirPatternKind.Literal {
+            tok = hc.*.lit !
+        } elif hc.*.kind == hir::HirPatternKind.Some {
+            tok.kind = lexer::TokenKind.LiteralNum
+            tok.lexeme = "0"
+            op = "!="
+
+            if svtmp < this.body.*.locals.len() {
+                make sty = this.body.*.locals[svtmp].ty !
+
+                if sty.len() > 0 && sty[sty.len() - 1] == '?' {
+                    op = "__optional_some"
+                } elif is_variant_name(sty !) {
+                    op = "__variant_is"
+                    tok.lexeme = (hc.*.bind + 1).to_str()
+                }
+            }
+        } elif hc.*.kind == hir::HirPatternKind.None {
+            tok.kind = lexer::TokenKind.LiteralNum
+            tok.lexeme = "0"
+            op = "=="
+
+            if svtmp < this.body.*.locals.len() {
+                make sty = this.body.*.locals[svtmp].ty !
+
+                if sty.len() > 0 && sty[sty.len() - 1] == '?' {
+                    op = "__optional_none"
+                }
+            }
+        } else {
+            this.goto(miss)
+            return
+        }
+
+        if svtmp < this.body.*.locals.len() {
+            make sty = this.body.*.locals[svtmp].ty !
+
+            if sty.len() > 0 && sty[0] == '!' {
+                if hc.*.is_error { op = "__fallible_error" }
+
+                if hc.*.kind == hir::HirPatternKind.Some { op = "__fallible_ok" }
+            }
+        }
+
+        make ct = this.new_temp()
+        this.storage(mir::MirStmtKind.StorageLive, ct)
+
+        make a = mir::MirOperand {}
+
+        a.kind = mir::MirOperandKind.Copy
+        a.place = local_place(svtmp)
+
+        make b = mir::MirOperand {}
+
+        b.kind = mir::MirOperandKind.Const
+        b.lit = tok
+
+        make rv = mir::MirRvalue {}
+
+        rv.kind = mir::MirRvalueKind.Binary
+
+        if op == "__variant_is" { rv.name = this.body.*.locals[hc.*.bind + 1].ty.copy() }
+
+        rv.op = op
+        rv.a = a
+        rv.b = b
+        this.assign(local_place(ct), rv)
+
+        make cond = mir::MirOperand {}
+
+        cond.kind = mir::MirOperandKind.Move
+        cond.place = local_place(ct)
+
+        make br = mir::MirTerm {}
+
+        br.kind = mir::MirTermKind.Branch
+        br.cond = cond
+        br.target = hit
+        br.other = miss
+        this.terminate(br)
+    }
+
+    // runs one case body inside the current (`hit`) block. when `has_dest`, a `=> expr` result is
+    // written to `dest`; otherwise it is evaluated for its side effects.
+    @this
+    make emit_match_case (hc: ref<hir::HirCase>, svtmp: uint, dest: uint, has_dest: bool) -> void {
+        if hc.*.has_bind {
+            make bl = hc.*.bind + 1
+            this.storage(mir::MirStmtKind.StorageLive, bl)
+
+            make a = mir::MirOperand {}
+
+            a.kind = mir::MirOperandKind.Copy
+            a.place = local_place(svtmp)
+
+            make rv = mir::MirRvalue {}
+
+            rv.kind = mir::MirRvalueKind.Use
+            rv.a = a
+
+            if hc.*.kind == hir::HirPatternKind.Some && svtmp < this.body.*.locals.len() {
+                make sty = this.body.*.locals[svtmp].ty !
+
+                if (sty.len() > 0 && sty[sty.len() - 1] == '?')
+                    || (is_variant_name(sty !)) || (sty.len() > 0 && sty[0] == '!') {
+                    rv.kind = mir::MirRvalueKind.OptionalPayload
+                    rv.a.kind = mir::MirOperandKind.Move
+                }
+            }
+
+            this.assign(local_place(bl), rv)
+
+            this.live.push(bl)
+        }
+
+        if hc.*.has_body {
+            this.block(hc.*.body)
+        }
+
+        if hc.*.has_result {
+            if has_dest {
+                this.assign(local_place(dest), this.rvalue(hc.*.result))
+            } else {
+                if this.src.*.exprs[hc.*.result].kind == hir::HirExprKind.Call {
+                    make t = this.call(hc.*.result)
+                    this.storage(mir::MirStmtKind.StorageDead, t)
+                } else {
+                    make t = this.materialize(hc.*.result)
+                    this.storage(mir::MirStmtKind.StorageDead, t)
+                }
+            }
+        }
+
+        if hc.*.has_bind {
+            if !this.is_terminated() {
+                this.storage(mir::MirStmtKind.StorageDead, hc.*.bind + 1)
+            }
+
+            this.live.pop()
+        }
+    }
+
+
+    /// lowers a hir expression into a mir rvalue.
+    @this
+    make rvalue (e: uint) -> mir::MirRvalue {
+        make src = this.src
+        make ex = src.*.exprs[e].pin
+        this.cur_range = ex.*.range !
+        make rv = mir::MirRvalue {}
+
+        if ex.*.kind == hir::HirExprKind.Binary
+            && (ex.*.lit.kind == lexer::TokenKind.DoubleAmpersand
+                || ex.*.lit.kind == lexer::TokenKind.DoublePipe) {
+            make lhs = this.materialize(ex.*.lhs)
+            make result = this.new_expr_temp(e)
+            this.storage(mir::MirStmtKind.StorageLive, result)
+
+            make rhs_bb = this.new_block()
+            make short_bb = this.new_block()
+            make join_bb = this.new_block()
+
+            make br = mir::MirTerm {}
+
+            br.kind = mir::MirTermKind.Branch
+            br.cond.kind = mir::MirOperandKind.Copy
+            br.cond.place = local_place(lhs)
+
+            if ex.*.lit.kind == lexer::TokenKind.DoubleAmpersand {
+                br.target = rhs_bb
+                br.other = short_bb
+            } else {
+                br.target = short_bb
+                br.other = rhs_bb
+            }
+
+            this.terminate(br)
+
+            this.cur = short_bb
+            make short_value = mir::MirRvalue {}
+
+            short_value.kind = mir::MirRvalueKind.Use
+            short_value.a.kind = mir::MirOperandKind.Const
+            short_value.a.lit.kind = lexer::TokenKind.KeyTrue
+
+            if ex.*.lit.kind == lexer::TokenKind.DoubleAmpersand {
+                short_value.a.lit.kind = lexer::TokenKind.KeyFalse
+            }
+
+            this.assign(local_place(result), short_value)
+            this.goto(join_bb)
+
+            this.cur = rhs_bb
+            this.assign(local_place(result), this.rvalue(ex.*.rhs))
+            this.goto(join_bb)
+            this.cur = join_bb
+
+            rv.kind = mir::MirRvalueKind.Use
+            rv.a.kind = mir::MirOperandKind.Move
+            rv.a.place = local_place(result)
+
+            return rv
+        }
+
+        match ex.*.kind {
+            hir::HirExprKind.Binary {
+                rv.kind = mir::MirRvalueKind.Binary
+                rv.op = ex.*.lit.lexeme !
+                make left = this.operand(ex.*.lhs)
+                make left_type = this.expr_ty(ex.*.lhs)
+                make left_source = left.place.local
+                make left_direct = left.place.projs.len() == 0
+                make left_pin: uint = 0
+
+                if (left_type == "str" || left_type == "String") && (left.kind == mir::MirOperandKind.Copy || left.kind == mir::MirOperandKind.Move) {
+                    left_pin = this.operator_borrow(left.pin, left_type.copy())
+                    left.place = this.operator_deref(left_pin)
+                    left.kind = mir::MirOperandKind.Copy
+                } elif this.operator_scalar_copy(ex.*.lhs) && (left.kind == mir::MirOperandKind.Copy || left.kind == mir::MirOperandKind.Move) {
+                    // Evaluate a primitive left operand before evaluating the right.
+                    make temp = this.new_expr_temp(ex.*.lhs)
+                    this.storage(mir::MirStmtKind.StorageLive, temp)
+                    make copy = mir::MirRvalue {}
+                    copy.kind = mir::MirRvalueKind.Use
+                    left.kind = mir::MirOperandKind.Copy
+                    copy.a = left
+                    this.assign(local_place(temp), copy)
+                    left = mir::MirOperand {}
+                    left.kind = mir::MirOperandKind.Copy
+                    left.place = local_place(temp)
+                    left.ty = left_type.copy()
+                }
+
+                make right = this.operand(ex.*.rhs)
+                make right_type = this.expr_ty(ex.*.rhs)
+
+                if (right_type == "str" || right_type == "String") && (right.kind == mir::MirOperandKind.Copy || right.kind == mir::MirOperandKind.Move) {
+                    make right_pin: uint = 0
+
+                    if left_pin != 0 && left_direct && right.place.projs.len() == 0 && left_source == right.place.local {
+                        right_pin = left_pin
+                    } else { right_pin = this.operator_borrow(right.pin, right_type.copy()) }
+
+                    right.place = this.operator_deref(right_pin)
+                    right.kind = mir::MirOperandKind.Copy
+                }
+
+                rv.a = left
+                rv.b = right
+            }
+
+            hir::HirExprKind.Update {
+                make target = this.stable_place(ex.*.lhs)
+                make address = target.local
+                make previous = this.new_expr_temp(e)
+                this.storage(mir::MirStmtKind.StorageLive, previous)
+
+                make saved = mir::MirRvalue {}
+
+                saved.kind = mir::MirRvalueKind.Use
+                saved.a.kind = mir::MirOperandKind.Copy
+                saved.a.place = this.frozen_place(ex.*.lhs, address)
+                this.assign(local_place(previous), saved)
+
+                make updated = mir::MirRvalue {}
+
+                updated.kind = mir::MirRvalueKind.Binary
+                updated.op = "+"
+
+                if ex.*.lit.kind == lexer::TokenKind.MinusMinus {
+                    updated.op = "-"
+                }
+
+                updated.a.kind = mir::MirOperandKind.Copy
+                updated.a.place = local_place(previous)
+                updated.b.kind = mir::MirOperandKind.Const
+                updated.b.lit.kind = lexer::TokenKind.LiteralNum
+                updated.b.lit.lexeme = "1"
+                updated.b.ty = this.expr_ty(e)
+
+                if updated.b.ty == "float" || updated.b.ty == "f32" || updated.b.ty == "f64" {
+                    updated.b.lit.lexeme = "1.0"
+                }
+
+                if updated.b.ty.len() > 3 && updated.b.ty[0] == 'p' && updated.b.ty[1] == 't' && updated.b.ty[2] == 'r' && updated.b.ty[3] == '<' {
+                    updated.b.ty = "int"
+                }
+
+                this.assign(target, updated)
+
+                rv.kind = mir::MirRvalueKind.Use
+                rv.a.kind = mir::MirOperandKind.Copy
+
+                if ex.*.postfix {
+                    rv.a.place = local_place(previous)
+                } else {
+                    make result = this.new_expr_temp(e)
+                    this.storage(mir::MirStmtKind.StorageLive, result)
+                    make read = mir::MirRvalue {}
+
+                    read.kind = mir::MirRvalueKind.Use
+                    read.a.kind = mir::MirOperandKind.Copy
+                    read.a.place = this.frozen_place(ex.*.lhs, address)
+                    this.assign(local_place(result), read)
+                    rv.a.place = local_place(result)
+                }
+
+                if this.src.*.exprs[ex.*.lhs].kind != hir::HirExprKind.Local {
+                    this.storage(mir::MirStmtKind.StorageDead, address)
+                }
+            }
+
+            hir::HirExprKind.Unary {
+                rv.kind = mir::MirRvalueKind.Unary
+                rv.op = ex.*.lit.lexeme !
+                rv.a = this.operand(ex.*.lhs)
+            }
+
+            hir::HirExprKind.Pin {
+                rv.kind = mir::MirRvalueKind.Pin
+                rv.place = this.place(ex.*.lhs)
+            }
+
+            hir::HirExprKind.Lambda {
+                rv.kind = mir::MirRvalueKind.Aggregate
+                rv.name = ex.*.name !
+
+                for capture : ex.*.args { rv.ops.push(this.operand(capture)) }
+            }
+
+            hir::HirExprKind.Constructor {
+                rv.kind = mir::MirRvalueKind.Aggregate
+                make i = 0
+
+                while i < ex.*.args.len() {
+                    rv.ops.push(this.operand(ex.*.args[i]))
+
+                    if i < ex.*.field_names.len() {
+                        rv.field_names.push(ex.*.field_names[i] !)
+                    } else {
+                        rv.field_names.push("")
+                    }
+
+                    i = i + 1
+                }
+            }
+
+            hir::HirExprKind.Array {
+                rv.kind = mir::MirRvalueKind.Aggregate
+                make i = 0
+
+                while i < ex.*.args.len() {
+                    rv.ops.push(this.operand(ex.*.args[i]))
+                    i = i + 1
+                }
+            }
+
+            hir::HirExprKind.EnumVariant {
+                rv.kind = mir::MirRvalueKind.Use
+                rv.a = this.operand(e)
+            }
+
+            hir::HirExprKind.Call {
+                make dest = this.call(e)
+                rv.kind = mir::MirRvalueKind.Use
+                rv.a.kind = mir::MirOperandKind.Move
+                rv.a.place = local_place(dest)
+            }
+
+            hir::HirExprKind.Unsupported {
+                rv.kind = mir::MirRvalueKind.Unsupported
+                rv.name = ex.*.name !
+            }
+
+            hir::HirExprKind.Match {
+                make svtmp = 0
+
+                if ex.*.lhs < this.src.*.exprs.len() {
+                    svtmp = this.materialize(ex.*.lhs)
+                } else {
+                    svtmp = this.new_temp()
+                    this.storage(mir::MirStmtKind.StorageLive, svtmp)
+                }
+
+                make res = this.new_expr_temp(e)
+                this.storage(mir::MirStmtKind.StorageLive, res)
+                make join_bb = this.new_block()
+
+                make ci = 0
+
+                while ci < ex.*.cases.len() {
+                    make hc = this.src.*.cases[ex.*.cases[ci]].pin
+                    make hit = this.new_block()
+                    make miss = this.new_block()
+
+                    this.branch_on_case(svtmp, hc, hit, miss)
+
+                    this.cur = hit
+                    this.emit_match_case(hc, svtmp, res, true)
+                    this.goto(join_bb)
+
+                    this.cur = miss
+                    ci = ci + 1
+                }
+
+                this.goto(join_bb)
+                this.cur = join_bb
+
+                rv.kind = mir::MirRvalueKind.Use
+                rv.a.kind = mir::MirOperandKind.Move
+                rv.a.place = local_place(res)
+            }
+
+            hir::HirExprKind.Error {
+                rv.kind = mir::MirRvalueKind.Unsupported
+                rv.name = "error"
+            }
+
+            _ {
+                rv.kind = mir::MirRvalueKind.Use
+                rv.a = this.operand(e)
+            }
+        }
+
+        return rv
+    }
+
+    @this
+    make operator_borrow (op: ref<mir::MirOperand>, ty_name: str) -> uint {
+        make holder = this.new_temp()
+        this.body.*.locals[holder].ty = "ref<" + ty_name + ">"
+        this.body.*.locals[holder].is_copy = true
+        this.storage(mir::MirStmtKind.StorageLive, holder)
+        make rv = mir::MirRvalue {}
+        rv.kind = mir::MirRvalueKind.Pin
+        rv.place = op.*.place
+        this.assign(local_place(holder), rv)
+        return holder
+    }
+
+    @this
+    make operator_deref (holder: uint) -> mir::MirPlace {
+        make place = local_place(holder)
+        make projection = mir::MirProj {}
+        projection.kind = mir::MirProjKind.Deref
+        place.projs.push(projection)
+        return place
+    }
+
+    @this
+    make operator_scalar_copy (e: uint) -> bool {
+        if this.func_idx >= this.checked.*.funcs.len() { return false }
+
+        make res = this.checked.*.funcs[this.func_idx].pin
+
+        if e >= res.*.expr_tys.len() { return false }
+
+        return this.type_is_copy(res.*.expr_tys[e])
+    }
+
+    // a plain use moves the value out of its owner, typeck marks copy types and `!` as Copy
+    @this
+    make operand (e: uint) -> mir::MirOperand {
+        make src = this.src
+        make ex = src.*.exprs[e].pin
+        this.cur_range = ex.*.range !
+        make op = mir::MirOperand {}
+
+        op.range = ex.*.range.copy()
+        op.ty = this.expr_ty(e)
+
+        if op.ty == "fn" && this.func_idx < this.checked.*.funcs.len() {
+            make checked = this.checked.*.funcs[this.func_idx].pin
+
+            if e < checked.*.expr_tys.len() {
+                make id = checked.*.expr_tys[e]
+
+                if this.tys.*.kind_of(id) == ty::TyKind.Func {
+                    op.function_ret = ty_name(this.module, this.tys, this.tys.*.elem_of(id))
+
+                    for argument : this.tys.*.args_of(id) { op.function_args.push(ty_name(this.module, this.tys, argument)) }
+                }
+            }
+        }
+
+        if ex.*.kind == hir::HirExprKind.Sizeof {
+            op.kind = mir::MirOperandKind.Const
+            op.lit.kind = lexer::TokenKind.LiteralNum
+            op.lit.lexeme = "0"
+            op.is_sizeof = true
+            op.name = type_name(this.src, ex.*.ty)
+
+            return op
+        }
+
+        if this.is_const_expr(e) {
+            op.kind = mir::MirOperandKind.Const
+            op.lit = this.const_lit(e)
+
+            return op
+        }
+
+        match ex.*.kind {
+            hir::HirExprKind.Literal {
+                op.kind = mir::MirOperandKind.Const
+                op.lit = ex.*.lit !
+            }
+
+            hir::HirExprKind.EnumVariant {
+                // an enum value is its variant's ordinal, materialized as an integer constant
+                op.kind = mir::MirOperandKind.Const
+                make tok = lexer::Token {}
+
+                tok.kind = lexer::TokenKind.LiteralNum
+                tok.lexeme = ex.*.variant.to_str()
+                op.lit = tok
+            }
+
+            hir::HirExprKind.Path {
+                op.kind = mir::MirOperandKind.Path
+
+                if ex.*.name == "__syscall" {
+                    op.name = "syscall"
+                } else {
+                    op.name = ex.*.name !
+                }
+            }
+
+            hir::HirExprKind.Copy {
+                op.kind = mir::MirOperandKind.Copy
+                op.place = this.place(ex.*.lhs)
+            }
+
+            hir::HirExprKind.Local {
+                op.kind = this.use_kind(e)
+                op.place = this.place(e)
+            }
+
+            hir::HirExprKind.Field {
+                make target = this.attached_target(e)
+
+                if op.ty == "fn" && target.len() > 0 {
+                    op.kind = mir::MirOperandKind.Path
+                    op.name = target
+
+                    return op
+                }
+
+                op.kind = this.use_kind(e)
+                op.place = this.place(e)
+            }
+
+            hir::HirExprKind.Index {
+                op.kind = this.use_kind(e)
+                op.place = this.place(e)
+            }
+
+            hir::HirExprKind.Deref {
+                op.kind = this.use_kind(e)
+                op.place = this.place(e)
+            }
+
+            hir::HirExprKind.Call {
+                op.kind = mir::MirOperandKind.Move
+                op.place = local_place(this.call(e))
+            }
+
+            _ {
+                op.kind = mir::MirOperandKind.Move
+                op.place = local_place(this.materialize(e))
+            }
+        }
+
+        return op
+    }
+
+    /// uses the kind.
+    @this
+    make use_kind (e: uint) -> mir::MirOperandKind {
+        if this.is_copy_use(e) {
+            return mir::MirOperandKind.Copy
+        }
+
+        return mir::MirOperandKind.Move
+    }
+
+    /// lowers a hir expression into a mir place.
+    @this
+    make place (e: uint) -> mir::MirPlace {
+        make src = this.src
+        make ex = src.*.exprs[e].pin
+        this.cur_range = ex.*.range !
+
+        match ex.*.kind {
+            hir::HirExprKind.Local {
+                return local_place(ex.*.local + 1)
+            }
+
+            hir::HirExprKind.Field {
+                make p = this.place(ex.*.lhs)
+                make proj = mir::MirProj {}
+
+                proj.kind = mir::MirProjKind.Field
+                proj.name = ex.*.name !
+                p.projs.push(proj)
+                return p
+            }
+
+            hir::HirExprKind.Deref {
+                make p = this.place(ex.*.lhs)
+                make proj = mir::MirProj {}
+
+                proj.kind = mir::MirProjKind.Deref
+                p.projs.push(proj)
+                return p
+            }
+
+            hir::HirExprKind.Index {
+                make p = this.place(ex.*.lhs)
+                make proj = mir::MirProj {}
+
+                proj.kind = mir::MirProjKind.Index
+                proj.index = this.operand_local(ex.*.rhs)
+                p.projs.push(proj)
+                return p
+            }
+
+            _ {}
+        }
+
+        return local_place(this.materialize(e))
+    }
+
+    // index projections need the index in a local
+    @this
+    make operand_local (e: uint) -> uint {
+        make ex = this.src.*.exprs[e].pin
+
+        if ex.*.kind == hir::HirExprKind.Local {
+            return ex.*.local + 1
+        }
+
+        return this.materialize(e)
+    }
+
+    // ends the current block with a call and continues in a new one
+    @this
+    make call (e: uint) -> uint {
+        make src = this.src
+        make ex = src.*.exprs[e].pin
+        this.cur_range = ex.*.range !
+
+        make t = mir::MirTerm {}
+
+        t.kind = mir::MirTermKind.Call
+
+        make callee = src.*.exprs[ex.*.lhs].pin
+
+        if callee.*.kind == hir::HirExprKind.Field && this.is_ns_call(e) {
+            // namespace call (`alias::name`): typeck resolved the symbol, there is no receiver
+            make target = this.attached_target(e)
+            make op = mir::MirOperand {}
+
+            op.kind = mir::MirOperandKind.Path
+            op.name = target.copy()
+            t.func = op
+            t.name = target
+        } elif callee.*.kind == hir::HirExprKind.Field && this.attached_target(e).len() > 0 {
+            // attached-function call: typeck resolved the mangled symbol, the receiver is the
+            // first argument
+            make target = this.attached_target(e)
+            make op = mir::MirOperand {}
+
+            op.kind = mir::MirOperandKind.Path
+            op.name = target.copy()
+            t.func = op
+            t.name = target
+
+            // the implicit receiver is borrowed (`ref<Owner>`), never consumed, so it is always
+            // passed as a copy regardless of the owner type. A type path (`Path.create`,
+            // `std::io::Path.create`) names the owner without a value, so it passes no receiver.
+            if !this.is_type_receiver(callee.*.lhs) {
+                make recv = this.operand(callee.*.lhs)
+
+                if recv.kind == mir::MirOperandKind.Move {
+                    recv.kind = mir::MirOperandKind.Copy
+                }
+
+                t.args.push(recv)
+                make receiver_ty = this.expr_ty(callee.*.lhs)
+
+                if receiver_ty == "char" || receiver_ty == "bool" || receiver_ty == "int" || receiver_ty == "uint"
+                    || receiver_ty == "i8" || receiver_ty == "i16" || receiver_ty == "i32" || receiver_ty == "i64"
+                    || receiver_ty == "u8" || receiver_ty == "u16" || receiver_ty == "u32" || receiver_ty == "u64"
+                    || receiver_ty == "float" || receiver_ty == "f32" || receiver_ty == "f64" {
+                    t.arg_tys.push(receiver_ty)
+                } elif receiver_ty.len() > 4 && receiver_ty[0] == 'r' && receiver_ty[1] == 'e'
+                    && receiver_ty[2] == 'f' && receiver_ty[3] == '<' {
+                    t.arg_tys.push(receiver_ty)
+                } else {
+                    t.arg_tys.push("ref<" + receiver_ty + ">")
+                }
+
+                t.arg_aggs.push(false)
+                t.has_receiver = true
+            }
+        } else {
+            t.func = this.operand(ex.*.lhs)
+            t.name = this.callee_name(ex.*.lhs)
+        }
+
+        make i = 0
+
+        while i < ex.*.args.len() {
+            t.args.push(this.operand(ex.*.args[i]))
+            t.arg_tys.push(this.call_arg_type(e, i, this.expr_ty(ex.*.args[i])))
+            t.arg_aggs.push(this.call_arg_aggregate(e, i, this.expr_is_aggregate(ex.*.args[i])))
+            i = i + 1
+        }
+
+        if this.func_idx < this.checked.*.funcs.len() {
+            make checked = this.checked.*.funcs[this.func_idx].pin
+
+            for ce : checked.*.c_exprs {
+                if ce == e { t.c_abi = true }
+            }
+
+            make vi: uint = 0
+
+            while vi < checked.*.variadic_exprs.len() {
+                if checked.*.variadic_exprs[vi] == e { t.variadic_fixed = checked.*.variadic_counts[vi] }
+
+                vi = vi + 1
+            }
+        }
+
+        t.ret_ty = this.expr_ty(e)
+
+        if this.func_idx < this.checked.*.funcs.len() {
+            make checked = this.checked.*.funcs[this.func_idx].pin
+
+            if e < checked.*.call_tys.len() {
+                make raw = checked.*.call_tys[e]
+
+                if raw != ty::TY_ERROR { t.ret_ty = ty_name(this.module, this.tys, raw) }
+            }
+        }
+
+        t.ret_agg = this.call_ret_aggregate(e, this.expr_is_aggregate(e))
+
+        if t.ret_ty.len() > 0 && t.ret_ty[0] == '!' { t.ret_agg = true }
+
+        make dest = this.new_expr_temp(e)
+        this.body.*.locals[dest].ty = t.ret_ty.copy()
+        this.storage(mir::MirStmtKind.StorageLive, dest)
+        t.dest = local_place(dest)
+
+        make next = this.new_block()
+        t.target = next
+        this.terminate(t)
+        this.cur = next
+
+        if ex.*.has_catch {
+            make success = this.new_block()
+            make failure = this.new_block()
+            make join = this.new_block()
+            make cond = this.new_temp()
+            this.storage(mir::MirStmtKind.StorageLive, cond)
+            make test = mir::MirRvalue {}
+
+            test.kind = mir::MirRvalueKind.Binary
+            test.op = "__fallible_ok"
+            test.a.kind = mir::MirOperandKind.Copy
+            test.a.place = local_place(dest)
+            this.assign(local_place(cond), test)
+            make branch = mir::MirTerm {}
+
+            branch.kind = mir::MirTermKind.Branch
+            branch.cond.kind = mir::MirOperandKind.Move
+            branch.cond.place = local_place(cond)
+            branch.target = success
+            branch.other = failure
+            make result = this.new_expr_temp(e)
+            this.storage(mir::MirStmtKind.StorageLive, result)
+            this.terminate(branch)
+
+            this.cur = success
+            make payload = mir::MirRvalue {}
+
+            payload.kind = mir::MirRvalueKind.OptionalPayload
+            payload.a.kind = mir::MirOperandKind.Move
+            payload.a.place = local_place(dest)
+            this.assign(local_place(result), payload)
+            this.goto(join)
+
+            this.cur = failure
+
+            if ex.*.has_catch_bind {
+                make bound = ex.*.catch_bind + 1
+                this.storage(mir::MirStmtKind.StorageLive, bound)
+                make error_value = mir::MirRvalue {}
+
+                error_value.kind = mir::MirRvalueKind.Binary
+                error_value.op = "__fallible_code"
+                error_value.a.kind = mir::MirOperandKind.Move
+                error_value.a.place = local_place(dest)
+                this.assign(local_place(bound), error_value)
+            }
+
+            this.block(ex.*.catch_block)
+
+            if !this.is_terminated() {
+                make cleared = mir::MirRvalue {}
+
+                cleared.kind = mir::MirRvalueKind.Binary
+                cleared.op = "__zero"
+                this.assign(local_place(result), cleared)
+            }
+
+            this.goto(join)
+            this.cur = join
+
+            return result
+        }
+
+        return dest
+    }
+
+    // whether typeck resolved the call `e` as a namespace call (`alias::name`)
+    @this
+    make is_type_receiver (e: uint) -> bool {
+        if this.is_const_expr(e) { return false }
+
+        make src = this.src
+        make ex = src.*.exprs[e].pin
+
+        match ex.*.kind {
+            hir::HirExprKind.Path { return true }
+
+            hir::HirExprKind.Field { return this.is_type_receiver(ex.*.lhs) }
+            _ {}
+        }
+
+        return false
+    }
+
+    @this
+    make is_ns_call (e: uint) -> bool {
+        if this.func_idx >= this.checked.*.funcs.len() {
+            return false
+        }
+
+        make res = this.checked.*.funcs[this.func_idx].pin
+
+        if e >= res.*.ns_calls.len() {
+            return false
+        }
+
+        return res.*.ns_calls[e] != 0
+    }
+
+    @this
+    make is_const_expr (e: uint) -> bool {
+        if this.func_idx >= this.checked.*.funcs.len() {
+            return false
+        }
+
+        make res = this.checked.*.funcs[this.func_idx].pin
+        make i: uint = 0
+
+        while i < res.*.const_exprs.len() {
+            if res.*.const_exprs[i] == e {
+                return true
+            }
+
+            i = i + 1
+        }
+
+        return false
+    }
+
+    /// retrieves the checked constant literal associated with an expression.
+    @this
+    make const_lit (e: uint) -> lexer::Token {
+        if this.func_idx < this.checked.*.funcs.len() {
+            make res = this.checked.*.funcs[this.func_idx].pin
+            make i: uint = 0
+
+            while i < res.*.const_exprs.len() {
+                if res.*.const_exprs[i] == e {
+                    make st = res.*.const_lits[i].pin
+                    make ct = lexer::Token {}
+
+                    ct.kind = st.*.kind
+                    ct.lexeme = st.*.lexeme.copy()
+                    ct.span = st.*.span
+
+                    return ct
+                }
+
+                i = i + 1
+            }
+        }
+
+        return lexer::Token {}
+    }
+
+    // mangled symbol typeck resolved for the attached-function call `e`
+    @this
+    make attached_target (e: uint) -> str {
+        if this.func_idx >= this.checked.*.funcs.len() {
+            make empty: str = ""
+
+            return empty
+        }
+
+        make res = this.checked.*.funcs[this.func_idx].pin
+        make i: uint = 0
+
+        while i < res.*.call_exprs.len() {
+            if res.*.call_exprs[i] == e {
+                return res.*.call_names[i] !
+            }
+
+            i = i + 1
+        }
+
+        make empty: str = ""
+
+        return empty
+    }
+
+    // `std.heap.alloc` -> "std.heap.alloc", `heap.free` -> "free", local-based -> ""
+    @this
+    make callee_name (e: uint) -> str {
+        make ex = this.src.*.exprs[e].pin
+
+        match ex.*.kind {
+            hir::HirExprKind.Path {
+                make n = ex.*.name !
+
+                if n == "__syscall" {
+                    return "syscall"
+                }
+
+                return n
+            }
+
+            hir::HirExprKind.Field {
+                make base = this.callee_name(ex.*.lhs)
+                make field = ex.*.name !
+
+                if base.len() == 0 {
+                    return field
+                }
+
+                return base + "." + field
+            }
+
+            _ {}
+        }
+
+        make empty: str = ""
+
+        return empty
+    }
+}

@@ -1,0 +1,296 @@
+// symbol resolution
+//
+// builds a symbol table for a module and reports declarations that collide:
+//   - two top-level items with the same name (funcs, globals, types, enums, aliases)
+//   - two members with the same name inside one Type (fields / attached functions)
+//   - two variants with the same name inside one enum
+//
+// the table also records the internal (mangled) name each symbol compiles to, which later
+// phases consume. local variables are resolved during HIR lowering (see `Lowerer.declare`),
+// which is where the lexical scope structure is still available.
+
+@pure @const {
+    make util = @import "../../util/pkg.quip"
+    make hir = @import "../../hir/hir.quip"
+
+    make diags = @import "../../diag/diagnosis.quip"
+    make e = @import "../../diag/err.quip"
+}
+
+@pub
+make enum SymbolKind {
+    Func,
+    Global,
+    Type,
+    Enum,
+    Alias,
+    EnumVariant,
+    Field,
+    AttachedFunc,
+}
+
+// a declaration is `Defined`. a use seen before any declaration is `NotResolved`
+// and is promoted to `Defined` when that declaration is registered.
+@pub
+make enum SymbolState {
+    Defined,
+    NotResolved,
+}
+
+/// describes a declaration recorded by symbol checking.
+@pub
+make type Symbol {
+    make name: str = ""
+    make kind: SymbolKind = SymbolKind.Func
+    make range: util::Range = .{}
+
+    // index into the matching HirModule table:
+    //   Func / Global / Type / Enum / Alias -> HirModule.items
+    //   AttachedFunc                        -> HirModule.attached_funcs
+    //   Field                               -> HirModule.structs[owner_struct].fields
+    //   EnumVariant                         -> HirModule.enums[owner_struct].variants
+    make index: uint = 0
+    make owner: str = ""        // declaring type (Field/AttachedFunc) or enum (EnumVariant)
+    make owner_struct: uint = 0 // index of the owning struct / enum, when applicable
+    make mangle: str = ""       // internal name used by later phases
+    make state: SymbolState = SymbolState.Defined
+}
+
+/// stores symbols discovered in a hir module.
+@pub
+make type SymbolTable {
+    make symbols: Symbol[] = []
+
+    // add a symbol; returns its index
+    @pub @this
+    make add (sym: Symbol) -> uint {
+        make id = this.symbols.len()
+        this.symbols.push(sym)
+        return id
+    }
+
+    // index of the first symbol with this name, or symbols.len() when there is none
+    @pub @this
+    make find (name: str) -> uint {
+        make i: uint = 0
+
+        while i < this.symbols.len() {
+            if this.symbols[i].name == name {
+                return i
+            }
+
+            i = i + 1
+        }
+
+        return this.symbols.len()
+    }
+
+    // index of the attached function declared for `owner` with this name, or symbols.len()
+    @pub @this
+    make find_attached_func (owner: str, name: str) -> uint {
+        make i: uint = 0
+
+        while i < this.symbols.len() {
+            make s = this.symbols[i].pin
+
+            if s.*.kind == SymbolKind.AttachedFunc && s.*.owner == owner && s.*.name == name {
+                return i
+            }
+
+            i = i + 1
+        }
+
+        return this.symbols.len()
+    }
+
+    // true when any symbol was used and never declared
+    @pub @this
+    make has_unresolved () -> bool {
+        make i: uint = 0
+
+        while i < this.symbols.len() {
+            if this.symbols[i].state == SymbolState.NotResolved {
+                return true
+            }
+
+            i = i + 1
+        }
+
+        return false
+    }
+}
+
+/// collects module symbols and reports invalid or duplicate declarations.
+@pub
+make check (module: ref<hir::HirModule>, diag: ref<diags::Diagnostic>) -> SymbolTable {
+    make st = SymbolTable {}
+
+    // methods are lowered as Func items under their mangled name, so a duplicate method on the
+    // same owner is caught here just like any other duplicate top-level name
+    make i: uint = 0
+
+    while i < module.*.items.len() {
+        make item = module.*.items[i].pin
+
+        if item.*.name.len() > 0 {
+            make prev = st.find(item.*.name)
+
+            if prev < st.symbols.len() {
+                if st.symbols[prev].state == SymbolState.NotResolved {
+                    st.symbols[prev].state = SymbolState.Defined
+                    st.symbols[prev].kind = kind_of(item.*.kind)
+                    st.symbols[prev].range = item.*.range !
+                    st.symbols[prev].index = i
+                    st.symbols[prev].mangle = item.*.name !
+                } else {
+                    report_duplicate(diag, item.*.name, item.*.range !, st.symbols[prev].range !)
+                }
+            } else {
+                make sym = Symbol {}
+
+                sym.name = item.*.name !
+                sym.kind = kind_of(item.*.kind)
+                sym.range = item.*.range !
+                sym.index = i
+                sym.mangle = item.*.name !
+                sym.state = SymbolState.Defined
+                st.add(sym)
+            }
+        }
+
+        i = i + 1
+    }
+
+    make mi: uint = 0
+
+    while mi < module.*.attached_funcs.len() {
+        make m = module.*.attached_funcs[mi].pin
+        make previous = st.find_attached_func(m.*.type_name.copy(), m.*.name.copy())
+
+        if previous < st.symbols.len() {
+            make old = module.*.attached_funcs[st.symbols[previous].index].pin
+            report_duplicate(diag, m.*.type_name + "." + m.*.name, module.*.funcs[m.*.func].range.copy(), module.*.funcs[old.*.func].range.copy())
+        }
+
+        make sym = Symbol {}
+
+        sym.name = m.*.name !
+        sym.kind = SymbolKind.AttachedFunc
+        sym.owner = m.*.type_name !
+        sym.index = mi
+        sym.mangle = module.*.funcs[m.*.func].name !
+        st.add(sym)
+        mi = mi + 1
+    }
+
+    make si: uint = 0
+
+    while si < module.*.structs.len() {
+        check_struct(module, si, diag)
+        si = si + 1
+    }
+
+    make ei: uint = 0
+
+    while ei < module.*.enums.len() {
+        check_enum(module, ei, diag)
+        ei = ei + 1
+    }
+
+    return st
+}
+
+// a struct's fields and attached functions live in one namespace: a name may appear only once
+make check_struct (module: ref<hir::HirModule>, si: uint, diag: ref<diags::Diagnostic>) -> void {
+    make s = module.*.structs[si].pin
+
+    make fi: uint = 0
+
+    while fi < s.*.fields.len() {
+        make field = s.*.fields[fi].pin
+
+        // a field colliding with an earlier field
+        make fj: uint = 0
+
+        while fj < fi {
+            if s.*.fields[fj].name == field.*.name {
+                report_duplicate(diag, field.*.name, field.*.range !, s.*.fields[fj].range !)
+            }
+
+            fj = fj + 1
+        }
+
+        // a field colliding with an attached function
+        make mi: uint = 0
+
+        while mi < module.*.attached_funcs.len() {
+            make m = module.*.attached_funcs[mi].pin
+
+            if m.*.type_name == s.*.name && m.*.name == field.*.name {
+                make mf = module.*.funcs[m.*.func].pin
+                report_duplicate(diag, field.*.name, field.*.range !, mf.*.range !)
+            }
+
+            mi = mi + 1
+        }
+
+        fi = fi + 1
+    }
+}
+
+// two variants of one enum must have distinct names
+make check_enum (module: ref<hir::HirModule>, ei: uint, diag: ref<diags::Diagnostic>) -> void {
+    make en = module.*.enums[ei].pin
+
+    make vi: uint = 0
+
+    while vi < en.*.variants.len() {
+        make vj: uint = 0
+
+        while vj < vi {
+            if en.*.variants[vj] == en.*.variants[vi] {
+                make range = en.*.range.copy()
+
+                if vi < en.*.variant_spans.len() { range = util::Range.of(en.*.variant_spans[vi].start, en.*.variant_spans[vi].end) }
+
+                make d = diags::Diag.err(e::Err.DuplicateSymbol, range, "duplicate enum variant")
+
+                if vj < en.*.variant_spans.len() { d.attach(diags::Label.create(util::Range.of(en.*.variant_spans[vj].start, en.*.variant_spans[vj].end), "previous variant declared here")) }
+
+                d.label("variant `" + en.*.variants[vi] + "` is declared more than once")
+                d.help("rename one of the variants")
+                diag.*.report(d)
+            }
+
+            vj = vj + 1
+        }
+
+        vi = vi + 1
+    }
+}
+
+make report_duplicate (diag: ref<diags::Diagnostic>, name: str, range: util::Range, prev: util::Range) -> void {
+    make d = diags::Diag.err(e::Err.DuplicateSymbol, range, "duplicate symbol")
+    d.label("`" + name + "` is declared more than once")
+    d.attach(diags::Label.create(prev, "previous declaration of `" + name + "` is here"))
+    d.help("rename one of the declarations")
+    diag.*.report(d)
+}
+
+/// maps a hir item kind to its symbol kind.
+make kind_of (k: hir::HirItemKind) -> SymbolKind {
+    match k {
+        hir::HirItemKind.Func { return SymbolKind.Func }
+
+        hir::HirItemKind.Global { return SymbolKind.Global }
+
+        hir::HirItemKind.Type { return SymbolKind.Type }
+
+        hir::HirItemKind.Enum { return SymbolKind.Enum }
+
+        hir::HirItemKind.Alias { return SymbolKind.Alias }
+        _ { return SymbolKind.Func }
+    }
+
+    return SymbolKind.Func
+}

@@ -1,0 +1,11 @@
+// native primitives required by the core runtime.
+@target "macos" {
+    @pub @const { make MAP_PRIVATE: i32 = 2 make MAP_ANON: i32 = 4096 }
+    @pub @unsafe @external make getpagesize () -> i32
+    @pub @unsafe @external make mmap (address: ptr<any>, length: u64, protection: i32, flags: i32, fd: i32, offset: i64) -> ptr<any>
+    @pub @unsafe @external make munmap (address: ptr<any>, length: u64) -> i32
+    @pub @unsafe @external make exit (status: i32) -> void
+    @pub @unsafe @external make abort () -> void
+    @pub @unsafe @external @variadic make printf (format: ptr<char>) -> i32
+    @pub @unsafe @external @variadic make dprintf (fd: i32, format: ptr<char>) -> i32
+}

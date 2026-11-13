@@ -1,0 +1,247 @@
+@pure @const {
+    @target "macos" make os = @import "platform/macos.quip"
+    @target "linux" make os = @import "platform/linux.quip"
+}
+
+@pure @const {
+    make memory = @import "memory.quip"
+    make bytes = @import "bytes.quip"
+    make strings = @import "str.quip"
+}
+
+make type Descriptor {
+    make kind: uint
+    make size: uint
+    make count: uint
+    make element: ptr<Descriptor>
+    make fields: ptr<Field>
+}
+
+make type Field { make offset: uint make schema: ptr<Descriptor> }
+make type Closure { make code: uint make environment: ptr<Descriptor> make references: uint }
+make type Array { make data: ptr<char> make length: uint make capacity: uint }
+
+@unsafe
+make closure_data (value: ptr<Closure>) -> ptr<char> {
+    @unsafe make raw: ptr<char> = value
+    return raw + (@sizeof Closure)
+}
+
+@unsafe
+make closure_release_value (handle: uint) -> void {
+    if handle == 0 { return }
+
+    @unsafe make value: ptr<Closure> = handle
+
+    value.*.references = value.*.references - 1
+
+    if value.*.references == 0 {
+        value_drop(closure_data(value), value.*.environment)
+        memory::memory_free(value)
+    }
+}
+
+@pub @unsafe @export "__quip_closure_retain"
+make closure_retain (handle: uint) -> uint {
+    if handle != 0 {
+        @unsafe make value: ptr<Closure> = handle
+        value.*.references = value.*.references + 1
+    }
+
+    return handle
+}
+
+@pub @unsafe @export "__quip_closure_release"
+make closure_release (handle: ptr<uint>) -> void {
+    make value = handle.*
+    handle.* = 0
+    closure_release_value(value)
+}
+
+@pub @unsafe @export "__quip_closure_new"
+make closure_new (code: uint, environment: ptr<Descriptor>) -> uint {
+    @unsafe make null: ptr<Descriptor> = 0
+    make size: uint = @sizeof Closure
+
+    if environment != null {
+        if environment.*.size > 9223372036854775807 - size { os::exit(70) }
+
+        size = size + environment.*.size
+    }
+
+    @unsafe make raw: ptr<char> = memory::memory_allocate(size)
+    @unsafe make empty: ptr<char> = 0
+
+    if raw == empty { os::exit(70) }
+
+    bytes::zero(raw, size)
+    @unsafe make value: ptr<Closure> = raw
+    value.*.code = code
+    value.*.environment = environment
+    value.*.references = 1
+    @unsafe make handle: uint = value
+    return handle
+}
+
+@pub @unsafe @export "__quip_closure_code"
+make closure_code (handle: uint) -> uint {
+    if handle == 0 { os::exit(70) }
+
+    @unsafe make value: ptr<Closure> = handle
+    return value.*.code
+}
+
+@pub @unsafe @export "__quip_closure_env"
+make closure_environment (handle: uint) -> uint {
+    if handle == 0 { os::exit(70) }
+
+    @unsafe make value: ptr<Closure> = handle
+    @unsafe make address: uint = closure_data(value)
+    return address
+}
+
+@pub @unsafe @export "__quip_value_copy"
+make value_copy (destination: ptr<char>, source: ptr<char>, schema: ptr<Descriptor>) -> void {
+    @unsafe make null: ptr<Descriptor> = 0
+
+    if schema == null || destination == source { return }
+
+    bytes::copy(destination, source, schema.*.size)
+    make kind: uint = schema.*.kind
+
+    if kind == 1 {
+        @unsafe make dst: ptr<str> = destination
+        @unsafe make src: ptr<str> = source
+        strings::str_copy(dst, src)
+    } elif kind == 2 {
+        @unsafe make src: ptr<Array> = source
+        @unsafe make dst: ptr<Array> = destination
+        @unsafe make empty: ptr<char> = 0
+        dst.*.data = empty
+        dst.*.length = 0
+        dst.*.capacity = 0
+        make length: uint = src.*.length
+        make element = schema.*.element
+
+        if length > 0 {
+            make size: uint = element.*.size
+
+            if size == 0 || length > 9223372036854775807 / size { os::exit(70) }
+
+            @unsafe make data: ptr<char> = memory::memory_allocate(length * size)
+
+            if data == empty { os::exit(70) }
+
+            bytes::zero(data, length * size)
+            dst.*.data = data
+            dst.*.length = length
+            dst.*.capacity = length
+            make i: uint = 0
+            while i < length { value_copy(data + i * size, src.*.data + i * size, element) i = i + 1 }
+        }
+    } elif kind == 3 {
+        make fields = schema.*.fields
+        make i: uint = 0
+        while i < schema.*.count {
+            make field = fields + i
+            value_copy(destination + field.*.offset, source + field.*.offset, field.*.schema)
+            i = i + 1
+        }
+    } elif kind == 4 {
+        @unsafe make value: ptr<uint> = destination
+        closure_retain(value.*)
+    } elif kind == 5 || kind == 6 {
+        @unsafe make tag: ptr<uint> = source
+
+        if (tag.* != 0) == (kind == 5) { value_copy(destination + 8, source + 8, schema.*.element) }
+    } elif kind == 7 {
+        @unsafe make src: ptr<ptr<char>> = source
+        @unsafe make dst: ptr<ptr<char>> = destination
+        @unsafe make empty: ptr<char> = 0
+
+        if src.* != empty {
+            make element = schema.*.element
+            @unsafe make data: ptr<char> = memory::memory_allocate_owned(element.*.size)
+
+            if data == empty { os::exit(70) }
+
+            value_copy(data, src.*, element)
+            dst.* = data
+        }
+    } elif kind == 8 {
+        @unsafe make tag: ptr<uint> = source
+
+        if tag.* < schema.*.count {
+            make fields = schema.*.fields
+            make field = fields + tag.*
+            value_copy(destination + 8, source + 8, field.*.schema)
+        }
+    }
+}
+
+@pub @unsafe @export "__quip_value_move"
+make value_move (destination: ptr<char>, source: ptr<char>, schema: ptr<Descriptor>) -> void {
+    @unsafe make null: ptr<Descriptor> = 0
+
+    if schema == null || destination == source { return }
+
+    bytes::move(destination, source, schema.*.size)
+    bytes::zero(source, schema.*.size)
+}
+
+@pub @unsafe @export "__quip_value_drop"
+make value_drop (value: ptr<char>, schema: ptr<Descriptor>) -> void {
+    @unsafe make null: ptr<Descriptor> = 0
+    @unsafe make empty: ptr<char> = 0
+
+    if schema == null || value == empty { return }
+
+    make kind: uint = schema.*.kind
+
+    if kind == 1 {
+        @unsafe make string: ptr<str> = value
+        strings::str_free(string)
+    } elif kind == 2 {
+        @unsafe make list: ptr<Array> = value
+
+        if list.*.capacity > 0 && list.*.data != empty {
+            make element = schema.*.element
+            make i: uint = 0
+            while i < list.*.length { value_drop(list.*.data + i * element.*.size, element) i = i + 1 }
+
+            memory::memory_free(list.*.data)
+        }
+    } elif kind == 3 {
+        make fields = schema.*.fields
+        make i: uint = 0
+        while i < schema.*.count {
+            make field = fields + i
+            value_drop(value + field.*.offset, field.*.schema)
+            i = i + 1
+        }
+    } elif kind == 4 {
+        @unsafe make handle: ptr<uint> = value
+        closure_release(handle)
+    } elif kind == 5 || kind == 6 {
+        @unsafe make tag: ptr<uint> = value
+
+        if (tag.* != 0) == (kind == 5) { value_drop(value + 8, schema.*.element) }
+    } elif kind == 7 {
+        @unsafe make pointer: ptr<ptr<char>> = value
+
+        if pointer.* != empty {
+            value_drop(pointer.*, schema.*.element)
+            memory::memory_free_owned(pointer.*)
+        }
+    } elif kind == 8 {
+        @unsafe make tag: ptr<uint> = value
+
+        if tag.* < schema.*.count {
+            make fields = schema.*.fields
+            make field = fields + tag.*
+            value_drop(value + 8, field.*.schema)
+        }
+    }
+
+    bytes::zero(value, schema.*.size)
+}

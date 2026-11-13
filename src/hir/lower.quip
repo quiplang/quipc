@@ -1,0 +1,2820 @@
+// AST -> HIR lowering
+//
+// the AST is only read, never consumed, so it stays available for diagnostics
+
+@pure @const {
+    make std: unit = @import "std"
+
+    make ast = @import "../util/ast.quip"
+    make util = @import "../util/pkg.quip"
+    make lexer = @import "../core/token.quip"
+
+    make hir = @import "hir.quip"
+    make mangle = @import "../semantics/symbol/mangle.quip"
+
+    make diag = @import "../diag/diagnosis.quip"
+    make err = @import "../diag/err.quip"
+
+}
+
+/// whether `name` is a scalar primitive type; these are the owners whose `this` receiver is the\
+/// value itself rather than a reference.
+make is_scalar_type_name (name: str) -> bool {
+    return name == "int" || name == "uint" || name == "char" || name == "bool"
+        || name == "i8" || name == "i16" || name == "i32" || name == "i64"
+        || name == "u8" || name == "u16" || name == "u32" || name == "u64"
+        || name == "f32" || name == "f64" || name == "float"
+}
+
+// the tag information that platform selection needs
+make type TagInfo {
+    make is_target: bool
+    make is_weak: bool
+    make is_unsafe: bool
+    make target: str
+}
+
+/// read a node's `@target` value and `@weak` presence. single-argument on purpose: the reference\
+/// compiler cannot resolve a call that passes a `ptr<ast::AST_Head>` alongside another argument.
+make scan_tags (node: ptr<ast::AST_Head>) -> TagInfo {
+    make info = TagInfo {}
+
+    info.is_target = false
+    info.is_weak = false
+    info.is_unsafe = false
+    info.target = ""
+
+    make i: uint = 0
+
+    while i < node.*.tags.len() {
+        @unsafe make tag: ptr<ast::AST_Tag> = node.*.tags[i]
+        make nm = tag.*.name.lexeme
+
+        if nm == "target" {
+            info.is_target = true
+            info.target = tag.*.target
+        } elif nm == "weak" {
+            info.is_weak = true
+        } elif nm == "unsafe" {
+            info.is_unsafe = true
+        }
+
+        i = i + 1
+    }
+
+    return info
+}
+
+/// true when the node carries a compile-time tag `@pure`. `Type` is a\
+/// compile-time-only Type, so declarations using it must be marked as such.
+make node_has_compile_time_tag (node: ptr<ast::AST_Head>) -> bool {
+    make i: uint = 0
+
+    while i < node.*.tags.len() {
+        @unsafe make tag: ptr<ast::AST_Tag> = node.*.tags[i]
+        make nm = tag.*.name.lexeme
+
+        if nm == "pure" {
+            return true
+        }
+
+        i = i + 1
+    }
+
+    return false
+}
+
+/// true when the node carries the tag named `name`.
+make node_has_tag (node: ptr<ast::AST_Head>, name: str) -> bool {
+    make i: uint = 0
+
+    while i < node.*.tags.len() {
+        @unsafe make tag: ptr<ast::AST_Tag> = node.*.tags[i]
+
+        if tag.*.name.lexeme == name {
+            return true
+        }
+
+        i = i + 1
+    }
+
+    return false
+}
+
+/// the type name carried by an `@impl Type` tag, or "" when the node has no `@impl`.
+make node_impl_type (node: ptr<ast::AST_Head>) -> str {
+    make i: uint = 0
+
+    while i < node.*.tags.len() {
+        @unsafe make tag: ptr<ast::AST_Tag> = node.*.tags[i]
+
+        if tag.*.name.lexeme == "impl" {
+            match tag.*.sig_type {
+                some {
+                    @unsafe make sig: ptr<ast::AST_TypeSig> = some
+                    make owner: str = ""
+
+                    while sig.*.is_namespace && sig.*.inner.len() > 1 {
+                        @unsafe make prefix: ptr<ast::AST_TypeSig> = sig.*.inner[0].*.pin
+                        owner = owner + prefix.*.name.lexeme + "::"
+                        sig = sig.*.inner[sig.*.inner.len() - 1].*.pin
+                    }
+
+                    owner = owner + sig.*.name.lexeme
+
+                    if sig.*.is_array { owner = owner + "[]" }
+
+                    return owner
+                }
+                _ {}
+            }
+        }
+
+        i = i + 1
+    }
+
+    make empty: str = ""
+
+    return empty
+}
+
+/// one `some` match per helper: the reference compiler rejects a nested `some`\
+/// bind with the same name as an enclosing one (E1117).
+make collect_const (node: ptr<ast::AST_Head>, consts: ref<hir::HirConst[]>) {
+    // `@import` is parsed as a literal-valued variable, but its name must stay a namespace
+    // path rather than inline as the import string
+    if node_has_tag(node, "import") {
+        return
+    }
+
+    match node.*.var {
+        some {
+            @unsafe make ev: ptr<ast::AST_Var> = some
+            make before = consts.*.len()
+            collect_const_val(ev, consts)
+
+            if node_has_tag(node, "unsafe") {
+                while before < consts.*.len() { consts.*[before].is_unsafe = true before = before + 1 }
+            }
+        }
+        none {}
+    }
+}
+
+/// collects the constant val.
+make collect_const_val (ev: ptr<ast::AST_Var>, consts: ref<hir::HirConst[]>) {
+    match ev.*.val {
+        some {
+            @unsafe make val: ptr<ast::AST_Head> = some
+
+            if node_has_tag(val, "import") {
+                return
+            }
+
+            collect_const_expr(val, ev.*.name.lexeme !, consts)
+        }
+        none {}
+    }
+}
+
+/// collects the constant expression.
+make collect_const_expr (val: ptr<ast::AST_Head>, name: str, consts: ref<hir::HirConst[]>) {
+    match val.*.expr {
+        some {
+            @unsafe make ex: ptr<ast::AST_Expr> = some
+
+            if ex.*.kind == ast::ExprKind.Literal {
+                make hc = hir::HirConst {}
+
+                hc.name = name.copy()
+                hc.lit = ex.*.literal !
+                hc.has_lit = true
+                consts.*.push(hc)
+            }
+        }
+        none {}
+    }
+}
+
+/// lowers an ast program to hir for the selected target platform.
+@pub
+make lower (program: ref<owned<ast::AST_Head>[]>, os: str, diagnostics: ref<diag::Diagnostic>) -> hir::HirModule {
+    make module = hir::HirModule {}
+
+    // pre-pass: record every enum declaration so `Enum.Variant` values can be lowered
+    // regardless of whether the enum appears before or after the function that uses it, and
+    // collect top-level literal constants so bare names (`STDOUT`, `MODE_FILE`, ...) inline
+    make ei = 0
+
+    while ei < program.*.len() {
+        @unsafe make enode: ptr<ast::AST_Head> = program.*[ei].*.pin
+
+        match enode.*.enum_node {
+            some {
+                @unsafe make ee: ptr<ast::AST_Enum> = some
+                make he = hir::HirEnum {}
+
+                he.name = ee.*.name.lexeme !
+                he.declaration_name = he.name.copy()
+                he.range = enode.*.range !
+
+                make vi = 0
+
+                while vi < ee.*.variants.len() {
+                    he.variants.push(ee.*.variants[vi].lexeme !)
+                    he.variant_spans.push(ee.*.variants[vi].span.copy())
+                    vi = vi + 1
+                }
+
+                module.enums.push(he)
+            }
+            none {}
+        }
+
+        collect_const(enode, module.consts.pin)
+
+        ei = ei + 1
+    }
+
+    // `@target` / `@weak` groups: only the statements that apply to the selected platform
+    // make it into HIR
+    make matched = false
+
+    make i = 0
+
+    while i < program.*.len() {
+        @unsafe make node: ptr<ast::AST_Head> = program.*[i].*.pin
+
+        if node.*.status == ast::AST_Status.Error { std::io::println("  parse error node") }
+
+        make info = scan_tags(node)
+        make keep = true
+
+        if info.is_target {
+            make tv = info.target
+
+            if tv == os.copy() || (tv == "darwin" && os.copy() == "macos") || (tv == "macos" && os.copy() == "darwin") {
+                matched = true
+            } else {
+                keep = false
+            }
+        } elif info.is_weak {
+            if !matched {
+                matched = true
+            } else {
+                keep = false
+            }
+        } else {
+            matched = false
+        }
+
+        if !keep {
+            i = i + 1
+            continue
+        }
+
+        match node.*.kind {
+            ast::AST_Kind.Func {
+                @unsafe make f: ptr<ast::AST_Func> = node.*.func.unwrap()
+                make impl_ty = node_impl_type(node)
+
+                make body = hir::HirBody {}
+                make lw = Lowerer.create(body.pin, os.copy(), module.enums.pin, module.consts.pin, diagnostics, module.funcs.pin)
+
+                if impl_ty.len() > 0 {
+                    lw.cur_owner = impl_ty.copy()
+                    lw.cur_has_this = !node_has_tag(node, "static")
+                    lw.owner_type_from_tag(node)
+                }
+
+                make hf = lw.lower_func(f, node)
+                hf.body = body
+
+                make fi = module.funcs.len()
+
+                make item = hir::HirItem {}
+
+                item.kind = hir::HirItemKind.Func
+                item.name = hf.name !
+                item.range = hf.range !
+                item.func = fi
+
+                module.items.push(item)
+                module.funcs.push(hf)
+
+                if impl_ty.len() > 0 {
+                    make m = hir::HirAttachedFunc {}
+
+                    m.type_name = impl_ty
+                    m.name = f.*.name.lexeme !
+                    m.func = fi
+                    module.attached_funcs.push(m)
+                }
+            }
+
+            ast::AST_Kind.Var {
+                @unsafe make v: ptr<ast::AST_Var> = node.*.var.unwrap()
+
+                // a compile-time type alias is parsed as a variable whose value is a type
+                // signature: `make Name<T>: Type = SomeType<T>`. it becomes a `HirTypeAlias`
+                // item instead of a global, so the alias resolves as a type.
+                make is_alias = false
+
+                if v.*.val != none {
+                    @unsafe make av: ptr<ast::AST_Head> = v.*.val.unwrap()
+                    match av.*.expr {
+                        none {}
+
+                        alias_ex: owned<ast::AST_Expr> {
+                            if alias_ex.*.kind == ast::ExprKind.TypeSig && alias_ex.*.type_sig != none {
+                                is_alias = true
+                            }
+                        }
+                    }
+                }
+
+                if is_alias {
+                    make ai = named_item(hir::HirItemKind.Alias, v.*.name.lexeme !, node.*.range !)
+                    ai.is_pure = node_has_compile_time_tag(node)
+
+                    make ta = hir::HirTypeAlias {}
+
+                    ta.name = v.*.name.lexeme !
+                    ta.range = node.*.range !
+                    ta.item = module.items.len()
+
+                    make ggi = 0
+
+                    while ggi < v.*.generics.len() {
+                        ta.generics.push(v.*.generics[ggi].lexeme !)
+                        ggi = ggi + 1
+                    }
+
+                    @unsafe make aav: ptr<ast::AST_Head> = v.*.val.unwrap()
+                    match aav.*.expr {
+                        none {}
+
+                        alias_ty: owned<ast::AST_Expr> {
+                            @unsafe make ats: ptr<ast::AST_TypeSig> = alias_ty.*.type_sig.unwrap()
+
+                            make alw = Lowerer.create(ta.body.pin, os.copy(), module.enums.pin, module.consts.pin, diagnostics, module.funcs.pin)
+                            ta.target = alw.lower_type(ats)
+                            ta.has_target = true
+                        }
+                    }
+
+                    module.items.push(ai)
+                    module.type_aliases.push(ta)
+                    i = i + 1
+                    continue
+                }
+
+                make gi = named_item(hir::HirItemKind.Global, v.*.name.lexeme !, node.*.range !)
+                gi.is_unsafe = node_has_tag(node, "unsafe")
+                gi.is_global_allocator = node_has_tag(node, "global_allocator")
+                gi.is_default_allocator = node_has_tag(node, "default_allocator")
+
+                if gi.is_global_allocator && v.*.sig_type != none && v.*.val != none {
+                    make init = hir::HirFunc {}
+
+                    init.name = "__quip_global_init_" + gi.name.copy()
+                    init.range = node.*.range !
+                    make lw = Lowerer.create(init.body.pin, os.copy(), module.enums.pin, module.consts.pin, diagnostics, module.funcs.pin)
+                    @unsafe make signature: ptr<ast::AST_TypeSig> = v.*.sig_type.unwrap()
+                    init.ret_ty = lw.lower_type(signature)
+                    init.has_ret_ty = true
+                    @unsafe make value: ptr<ast::AST_Head> = v.*.val.unwrap()
+                    make ret = hir::HirStmt {}
+
+                    ret.kind = hir::HirStmtKind.Return
+                    ret.has_value = true
+                    ret.value = lw.lower_expr(value)
+                    ret.range = node.*.range !
+                    make block = hir::HirBlock {}
+
+                    block.stmts.push(lw.push_stmt(ret))
+                    init.body.root = lw.push_block(block)
+                    gi.func = module.funcs.len()
+                    module.funcs.push(init)
+                }
+
+                module.items.push(gi)
+            }
+
+            ast::AST_Kind.Type {
+                @unsafe make t: ptr<ast::AST_Type> = node.*.type_node.unwrap()
+                make owner = t.*.name.lexeme !
+
+                make no_bindings = hir::HirBindings {}
+
+                lower_struct(module.pin, program, i, os.copy(), diagnostics, owner, no_bindings.pin)
+            }
+
+            ast::AST_Kind.Enum {
+                @unsafe make en: ptr<ast::AST_Enum> = node.*.enum_node.unwrap()
+                module.items.push(named_item(hir::HirItemKind.Enum, en.*.name.lexeme !, node.*.range !))
+            }
+
+        }
+
+        i = i + 1
+    }
+
+
+    return module
+}
+
+// index of the `Type` item named `name`, or `items.len()` when there is none
+make find_type_item (module: ref<hir::HirModule>, name: str) -> uint {
+    make i: uint = 0
+
+    while i < module.*.items.len() {
+        if module.*.items[i].kind == hir::HirItemKind.Type && module.*.items[i].name == name {
+            return i
+        }
+
+        i = i + 1
+    }
+
+    return module.*.items.len()
+}
+
+// lower the `Type` declaration at `program[ast_index]` into `module`.
+//
+// a plain type becomes a struct plus its attached functions. a generic one (`Type Name <A, B>`)
+// only records a template, unless `has_bindings`: then it is lowered as one concrete instance named
+// `owner`, every generic parameter being replaced by the type `bindings` binds it to.
+/// lowers a structure declaration with the supplied generic bindings.
+@pub
+make lower_struct (module: ref<hir::HirModule>, program: ref<owned<ast::AST_Head>[]>, ast_index: uint, os: str, diagnostics: ref<diag::Diagnostic>, owner: str, bindings: ref<hir::HirBindings>) -> void {
+    make has_bindings = bindings.*.names.len() > 0
+    @unsafe make node: ptr<ast::AST_Head> = program.*[ast_index].*.pin
+    @unsafe make t: ptr<ast::AST_Type> = node.*.type_node.unwrap()
+
+    // an instance may already have a stub item, made by a unit that only refers to it
+    make item_idx = module.*.items.len()
+
+    if has_bindings {
+        item_idx = find_type_item(module, owner.copy())
+    }
+
+    if item_idx >= module.*.items.len() {
+        module.*.items.push(named_item(hir::HirItemKind.Type, owner.copy(), node.*.range !))
+        item_idx = module.*.items.len() - 1
+    }
+
+    make hs = hir::HirStruct {}
+
+    hs.name = owner.copy()
+    hs.name_span = t.*.name.span.copy()
+    hs.declaration_name = t.*.name.lexeme.copy()
+    hs.range = node.*.range !
+    hs.item = item_idx
+    hs.ast_index = ast_index
+    hs.is_instance = has_bindings
+
+    if t.*.generics.len() > 0 && !has_bindings {
+        hs.is_template = true
+        make gi = 0
+
+        while gi < t.*.generics.len() {
+            hs.generics.push(t.*.generics[gi].lexeme !)
+            gi = gi + 1
+        }
+
+        module.*.structs.push(hs)
+        return
+    }
+
+    make fw = Lowerer.create(hs.body.pin, os.copy(), module.*.enums.pin, module.*.consts.pin, diagnostics, module.*.funcs.pin)
+    fw.cur_owner = owner.copy()
+
+    if has_bindings {
+        fw.bindings = bindings
+        fw.has_bindings = true
+    }
+
+    make si = 0
+
+    while si < t.*.statements.buffer.len() {
+        @unsafe make stmt: ptr<ast::AST_Head> = t.*.statements.buffer[si]
+
+        match stmt.*.kind {
+            ast::AST_Kind.Func {
+                @unsafe make mf: ptr<ast::AST_Func> = stmt.*.func.unwrap()
+
+                make body = hir::HirBody {}
+                make lw = Lowerer.create(body.pin, os.copy(), module.*.enums.pin, module.*.consts.pin, diagnostics, module.*.funcs.pin)
+                lw.cur_owner = owner.copy()
+                lw.cur_has_this = node_has_tag(stmt, "this")
+
+                if has_bindings {
+                    lw.bindings = bindings
+                    lw.has_bindings = true
+                }
+
+                make hf = lw.lower_func(mf, stmt)
+                hf.body = body
+
+                make fi = module.*.funcs.len()
+
+                make mi = hir::HirItem {}
+
+                mi.kind = hir::HirItemKind.Func
+                mi.name = hf.name !
+                mi.range = hf.range !
+                mi.func = fi
+                module.*.items.push(mi)
+                module.*.funcs.push(hf)
+
+                make m = hir::HirAttachedFunc {}
+
+                m.type_name = owner.copy()
+                m.name = mf.*.name.lexeme !
+                m.func = fi
+                module.*.attached_funcs.push(m)
+            }
+
+            ast::AST_Kind.Var {
+                @unsafe make fv: ptr<ast::AST_Var> = stmt.*.var.unwrap()
+
+                make field = hir::HirField {}
+
+                field.is_unsafe = node_has_tag(stmt, "unsafe")
+                field.name = fv.*.name.lexeme !
+                field.name_span = fv.*.name.span.copy()
+                field.range = stmt.*.range !
+
+                if fv.*.sig_type != none {
+                    @unsafe make fsig: ptr<ast::AST_TypeSig> = fv.*.sig_type.unwrap()
+                    field.ty = fw.lower_type(fsig)
+                    field.has_ty = true
+                }
+
+                if fv.*.val != none {
+                    @unsafe make fdef: ptr<ast::AST_Head> = fv.*.val.unwrap()
+                    field.default = fw.lower_expr(fdef)
+                    field.has_default = true
+
+                    // Nonliteral defaults need executable code, in the declaration's unit.
+                    if hs.body.exprs[field.default].kind != hir::HirExprKind.Literal {
+                        make init = hir::HirFunc {}
+
+                        init.name = mangle::attached_name(owner.copy(), "__quip_default_" + field.name.copy())
+                        init.is_attached = true
+                        init.range = stmt.*.range.copy()
+                        make lw = Lowerer.create(init.body.pin, os.copy(), module.*.enums.pin, module.*.consts.pin, diagnostics, module.*.funcs.pin)
+
+                        if has_bindings {
+                            lw.bindings = bindings
+                            lw.has_bindings = true
+                        }
+
+                        make ret = hir::HirStmt {}
+
+                        ret.is_unsafe = field.is_unsafe
+                        ret.kind = hir::HirStmtKind.Return
+                        ret.has_value = true
+                        ret.value = lw.lower_expr(fdef)
+                        ret.range = stmt.*.range.copy()
+                        make block = hir::HirBlock {}
+
+                        block.stmts.push(lw.push_stmt(ret))
+                        init.body.root = lw.push_block(block)
+
+                        if fv.*.sig_type != none {
+                            @unsafe make signature: ptr<ast::AST_TypeSig> = fv.*.sig_type.unwrap()
+                            init.ret_ty = lw.lower_type(signature)
+                        } else {
+                            init.ret_ty = lw.infer_return_type(init.body.root)
+                        }
+
+                        init.has_ret_ty = true
+                        field.default_init = init.name.copy()
+                        module.*.funcs.push(init)
+                    }
+                }
+
+                make ti = 0
+
+                while ti < stmt.*.tags.len() {
+                    @unsafe make tag: ptr<ast::AST_Tag> = stmt.*.tags[ti]
+
+                    if tag.*.name.lexeme == "pub" { field.is_pub = true }
+
+                    if tag.*.name.lexeme == "unsafe" { field.is_unsafe = true }
+
+                    ti = ti + 1
+                }
+
+                hs.fields.push(field)
+            }
+            _ {}
+        }
+
+        si = si + 1
+    }
+
+    module.*.structs.push(hs)
+}
+
+/// constructs a hir item with its kind, name, and source range.
+make named_item (kind: hir::HirItemKind, name: str, range: util::Range) -> hir::HirItem {
+    make item = hir::HirItem {}
+
+    item.kind = kind
+    item.name = name
+    item.range = range
+
+    return item
+}
+
+// aggregated shape of every `return` reachable from a function body, used to infer a return
+// type when none was written (or when `auto` was written explicitly)
+make type ReturnInfo {
+    make has_void: bool = false     // a bare `return` with no value
+    make has_none: bool = false     // `return none`
+    make has_error: bool = false    // `return error.Something`
+    make value_types: uint[] = []   // indices into HirBody.types, one per `return <expr>`
+}
+
+// the body is owned by the caller: a builder that owns arrays and hands them out would free them when it dies
+ /// builds indexed hir nodes while lowering a declaration body.
+ make type Lowerer {
+    make body: ref<hir::HirBody>
+    make functions: ref<hir::HirFunc[]>
+    make outer_names: str[] = []
+    make capture_names: str[] = []
+
+    // duplicate-declaration diagnostics are reported here while scopes are still visible
+    make diagref: ref<diag::Diagnostic>
+
+    // the operating-system name `@target` / `@weak` groups are resolved against
+    make target_os: str
+
+    // while lowering an attached function: the receiver type name (`@impl T` / enclosing `type T`)
+    // and whether an implicit `this` parameter must be prepended
+    make cur_owner: str = ""
+    make cur_has_this: bool = false
+
+    // the lowered receiver type for an `@impl T` owner, keeping type arguments (`ptr<char>`);
+    // `cur_has_owner_ty` is false for attached functions declared inside a `type` body
+    make cur_owner_ty: uint = 0
+    make cur_has_owner_ty: bool = false
+
+    // while lowering one instance of a generic type: the concrete types its generic parameters stand
+    // for. a type written as a bare parameter name is replaced by a copy of the bound type
+    make bindings: ref<hir::HirBindings>? = none
+    make has_bindings: bool = false
+
+    // lexical scopes: a flat stack of visible names, `scope_marks` remembers where each scope starts
+    make scope_names: str[] = []
+    make scope_locals: uint[] = []
+    make scope_marks: uint[] = []
+
+    // enum declarations visible to the function being lowered (for `Enum.Variant` values)
+    make enums: ref<hir::HirEnum[]>
+    // top-level literal constants visible to the function being lowered
+    make consts: ref<hir::HirConst[]>
+
+    @pub
+    make create (body: ref<hir::HirBody>, os: str, enums: ref<hir::HirEnum[]>, consts: ref<hir::HirConst[]>, diagnostics: ref<diag::Diagnostic>, functions: ref<hir::HirFunc[]>) -> Lowerer {
+        make lw = Lowerer {}
+
+        lw.body = body
+        lw.functions = functions
+        lw.diagref = diagnostics
+        lw.target_os = os
+        lw.enums = enums
+        lw.consts = consts
+
+        return lw
+    }
+
+
+    /// appends the expression.
+    @this
+    make push_expr (e: hir::HirExpr) -> uint {
+        make id = this.body.*.exprs.len()
+        this.body.*.exprs.push(e)
+        return id
+    }
+
+    /// appends the statement.
+    @this
+    make push_stmt (s: hir::HirStmt) -> uint {
+        make id = this.body.*.stmts.len()
+        this.body.*.stmts.push(s)
+        return id
+    }
+
+    /// appends the block.
+    @this
+    make push_block (b: hir::HirBlock) -> uint {
+        make id = this.body.*.blocks.len()
+        this.body.*.blocks.push(b)
+        return id
+    }
+
+    /// appends the case.
+    @this
+    make push_case (c: hir::HirCase) -> uint {
+        make id = this.body.*.cases.len()
+        this.body.*.cases.push(c)
+        return id
+    }
+
+    /// appends the type.
+    @this
+    make push_type (t: hir::HirType) -> uint {
+        make id = this.body.*.types.len()
+        this.body.*.types.push(t)
+        return id
+    }
+
+    /// adds a compiler-generated local to the hir body and returns its index.
+    @this
+    make hidden_local (name: str, range: util::Range) -> uint {
+        make local = hir::HirLocal {}
+
+        local.name = name
+        local.range = range
+        make id = this.body.*.locals.len()
+        this.body.*.locals.push(local)
+        return id
+    }
+
+    /// unwraps an empty `.iter()` call to recover the underlying iterable expression.
+    @this
+    make iterable_expr (id: uint) -> uint {
+        @unsafe make e: ptr<hir::HirExpr> = this.body.*.exprs[id].pin
+
+        if e.*.kind == hir::HirExprKind.Call && e.*.args.len() == 0 {
+            @unsafe make cal: ptr<hir::HirExpr> = this.body.*.exprs[e.*.lhs].pin
+
+            if cal.*.kind == hir::HirExprKind.Field && cal.*.name == "iter" {
+                return cal.*.lhs
+            }
+        }
+
+        return id
+    }
+
+    /// gets the local for the expression.
+    @this
+    make local_expr (local: uint, range: util::Range) -> uint {
+        make e = hir::HirExpr {}
+
+        e.kind = hir::HirExprKind.Local
+        e.local = local
+        e.range = range
+
+        return this.push_expr(e)
+    }
+
+    /// adds an integer literal expression to the hir body and returns its index.
+    @this
+    make int_expr (value: str, range: util::Range) -> uint {
+        make e = hir::HirExpr {}
+
+        e.kind = hir::HirExprKind.Literal
+        e.range = range
+
+        make tok = lexer::Token {}
+
+        tok.kind = lexer::TokenKind.LiteralNum
+        tok.lexeme = value
+        e.lit = tok
+
+        return this.push_expr(e)
+    }
+
+    /// adds a binary expression and its operator token to the hir body.
+    @this
+    make binary_expr (op: str, kind: lexer::TokenKind, lhs: uint, rhs: uint, range: util::Range) -> uint {
+        make e = hir::HirExpr {}
+
+        e.kind = hir::HirExprKind.Binary
+        e.range = range
+        e.lhs = lhs
+        e.rhs = rhs
+
+        make tok = lexer::Token {}
+
+        tok.kind = kind
+        tok.lexeme = op
+        e.lit = tok
+
+        return this.push_expr(e)
+    }
+
+    /// gets the index of the expression.
+    @this
+    make index_expr (base: uint, index: uint, range: util::Range) -> uint {
+        make e = hir::HirExpr {}
+
+        e.kind = hir::HirExprKind.Index
+        e.range = range
+        e.lhs = base
+        e.rhs = index
+
+        return this.push_expr(e)
+    }
+
+    /// gets the length of the expression.
+    @this
+    make len_expr (local: uint, range: util::Range) -> uint {
+        make base = this.local_expr(local, range.copy())
+
+        make field = hir::HirExpr {}
+
+        field.kind = hir::HirExprKind.Field
+        field.range = range.copy()
+        field.lhs = base
+        field.name = "len"
+        make field_id = this.push_expr(field)
+
+        make call = hir::HirExpr {}
+
+        call.kind = hir::HirExprKind.Call
+        call.range = range.copy()
+        call.lhs = field_id
+
+        return this.push_expr(call)
+    }
+
+    // the type of the implicit `this` receiver. Scalar primitives (`int`, `char`, …) are passed by
+    // value, so `this` is the owner itself; every other owner (heap/`str`/pointer/user type) is
+    // passed by reference, so `this` is a borrow of it.
+    @this
+    make receiver_type (range: util::Range) -> uint {
+        if this.cur_has_owner_ty {
+            return this.cur_owner_ty
+        }
+
+        return this.this_type(this.cur_owner, range)
+    }
+
+    // lower the `@impl Type` signature on `node` and record it as the receiver type, taking a
+    // reference to it unless the owner is a by-value scalar
+    @this
+    make owner_type_from_tag (node: ptr<ast::AST_Head>) {
+        make ti: uint = 0
+
+        while ti < node.*.tags.len() {
+            @unsafe make tag: ptr<ast::AST_Tag> = node.*.tags[ti]
+
+            if tag.*.name.lexeme == "impl" {
+                match tag.*.sig_type {
+                    some {
+                        @unsafe make sig: ptr<ast::AST_TypeSig> = some
+                        make id = this.lower_type(sig)
+
+                        if this.body.*.types[id].is_array {
+                            make wrapper = hir::HirType {}
+                            wrapper.name = "ref"
+                            wrapper.args.push(id)
+                            wrapper.range = sig.*.range.copy()
+                            id = this.push_type(wrapper)
+                        } elif !is_scalar_type_name(this.cur_owner) {
+                            this.body.*.types[id].is_ref = true
+                        }
+
+                        this.cur_owner_ty = id
+                        this.cur_has_owner_ty = true
+                    }
+                    _ {}
+                }
+            }
+
+            ti = ti + 1
+        }
+    }
+
+    /// adds the receiver type for an attached function to the hir body.
+    @this
+    make this_type (owner: str, range: util::Range) -> uint {
+        make t = hir::HirType {}
+
+        t.name = owner.copy()
+        t.is_ref = !is_scalar_type_name(owner)
+        t.range = range
+
+        return this.push_type(t)
+    }
+
+
+    /// enters a new local scope.
+    @this
+    make enter () -> void {
+        this.scope_marks.push(this.scope_names.len())
+    }
+
+    /// leaves the current local scope.
+    @this
+    make leave () -> void {
+        make mark = this.scope_marks.pop()
+
+        while this.scope_names.len() > mark {
+            this.scope_names.pop()
+            this.scope_locals.pop()
+        }
+    }
+
+    /// declares a local in the current scope and checks for duplicate names.
+    @this
+    make declare (local: hir::HirLocal) -> uint {
+        // a name may be declared only once per scope; shadowing an outer name is fine
+        make mark: uint = 0
+
+        if this.scope_marks.len() > 0 {
+            mark = this.scope_marks[this.scope_marks.len() - 1]
+        }
+
+        make di = mark
+
+        while di < this.scope_names.len() {
+            if this.scope_names[di] == local.name {
+                make d = diag::Diag.err(err::Err.DuplicateSymbol, local.range !, "duplicate symbol")
+                d.label("`" + (local.name !) + "` is declared more than once in this scope")
+                d.help("rename one of the declarations")
+                this.diagref.*.report(d)
+            }
+
+            di = di + 1
+        }
+
+        make id = this.body.*.locals.len()
+        this.scope_names.push(local.name !)
+        this.scope_locals.push(id)
+        this.body.*.locals.push(local)
+        return id
+    }
+
+    // returns the local id + 1, 0 means the name is not a local
+    @this
+    make lookup (name: str) -> uint {
+        make i = this.scope_names.len()
+
+        while i > 0 {
+            i = i - 1
+
+            if this.scope_names[i] == name {
+                return this.scope_locals[i] + 1
+            }
+        }
+
+        return 0
+    }
+
+    // index of the enum with this name, or `enums.len()` when there is none
+    @this
+    make find_enum (name: str) -> uint {
+        make i = 0
+
+        while i < this.enums.*.len() {
+            if this.enums.*[i].name == name {
+                return i
+            }
+
+            i = i + 1
+        }
+
+        return this.enums.*.len()
+    }
+
+    // index of the variant within the enum, or `variants.len()` when there is none
+    @this
+    make enum_variant_index (enm: uint, variant: str) -> uint {
+        make i = 0
+
+        while i < this.enums.*[enm].variants.len() {
+            if this.enums.*[enm].variants[i] == variant {
+                return i
+            }
+
+            i = i + 1
+        }
+
+        return this.enums.*[enm].variants.len()
+    }
+
+
+    /// lowers the function.
+    @this
+    make lower_func (f: ptr<ast::AST_Func>, h: ptr<ast::AST_Head>) -> hir::HirFunc {
+        make hf = hir::HirFunc {}
+
+        hf.name = f.*.name.lexeme !
+        hf.name_span = f.*.name.span.copy()
+        hf.range = h.*.range !
+
+        make ti = 0
+
+        while ti < h.*.tags.len() {
+            @unsafe make tag: ptr<ast::AST_Tag> = h.*.tags[ti]
+            make tag_name = tag.*.name.lexeme !
+            hf.tags.push(tag_name.copy())
+
+            if tag_name == "external" { hf.is_external = true }
+
+
+            if tag_name == "variadic" { hf.is_variadic = true }
+
+            if tag_name == "export" {
+                hf.export_name = tag.*.target.copy()
+
+                if hf.export_name.len() == 0 {
+                    make d = diag::Diag.err(err::Err.InvalidSyntax, h.*.range.copy(), "@export requires a native symbol name")
+                    this.diagref.*.report(d)
+                }
+            }
+
+            if tag_name == "intrinsic" {
+                hf.intrinsic_name = tag.*.target.copy()
+
+                if hf.intrinsic_name.len() == 0 {
+                    make d = diag::Diag.err(err::Err.InvalidSyntax, h.*.range.copy(), "@intrinsic requires an operation name")
+                    this.diagref.*.report(d)
+                }
+            }
+
+            ti = ti + 1
+        }
+
+        if hf.is_variadic && !hf.is_external {
+            make d = diag::Diag.err(err::Err.InvalidSyntax, h.*.range !, "@variadic requires @external")
+            this.diagref.*.report(d)
+        }
+
+        // attached functions carry an implicit `ref<Owner>` receiver before the written parameters
+        hf.has_this = this.cur_has_this
+
+        if this.cur_owner.len() > 0 {
+            hf.is_attached = true
+            hf.name = mangle::attached_name(this.cur_owner, hf.name !)
+        }
+
+        this.enter()
+
+        if hf.has_this {
+            make this_local = hir::HirLocal {}
+
+            this_local.name = "this"
+            this_local.range = h.*.range !
+            this_local.is_param = true
+            this_local.ty = this.receiver_type(h.*.range !)
+            this_local.has_ty = true
+            this.declare(this_local)
+        }
+
+        make pi = 0
+
+        while pi < f.*.params.len() {
+            make p = f.*.params[pi].pin
+
+            make local = hir::HirLocal {}
+
+            local.name = p.*.name.lexeme !
+            local.name_span = p.*.name.span.copy()
+            local.range = util::Range.of(p.*.name.span.start, p.*.name.span.end)
+            local.is_param = true
+
+            if p.*.sig_type != none {
+                @unsafe make sig: ptr<ast::AST_TypeSig> = p.*.sig_type.unwrap()
+                local.ty = this.lower_type(sig)
+                local.has_ty = true
+            }
+
+            this.declare(local)
+            pi = pi + 1
+        }
+
+        this.body.*.param_count = f.*.params.len()
+
+        if hf.has_this {
+            this.body.*.param_count = this.body.*.param_count + 1
+        }
+
+        for name : this.capture_names {
+            make capture = hir::HirLocal {}
+
+            capture.name = name !
+            capture.range = h.*.range !
+            hf.capture_locals.push(this.declare(capture))
+        }
+
+        this.body.*.root = this.lower_block(f.*.statements.pin)
+
+        // `auto` (explicit or implied by omitting the arrow) means the return type must be
+        // inferred from every `return` reachable in the body
+        make is_auto = true
+
+        if f.*.sig_type != none {
+            @unsafe make ret: ptr<ast::AST_TypeSig> = f.*.sig_type.unwrap()
+
+            if ret.*.name.lexeme == "auto" && ret.*.inner.len() == 0 && !ret.*.is_fallible && !ret.*.is_optional && !ret.*.is_array {
+                is_auto = true
+            } else {
+                is_auto = false
+                hf.ret_ty = this.lower_type(ret)
+                hf.has_ret_ty = true
+            }
+        }
+
+        if is_auto {
+            hf.has_ret_ty = true
+            // infer the return type from every `return` reachable in the body: a function with
+            // no value-returning `return` infers `void`, a `return <expr>` infers that type.
+            hf.ret_ty = this.infer_return_type(this.body.*.root)
+        }
+
+        this.leave()
+
+        return hf
+    }
+
+    // index into the bindings of the generic parameter called `name`, or the binding count
+    @this
+    make bound_index (name: str) -> uint {
+        make i: uint = 0
+        make bs: ref<hir::HirBindings> = this.bindings.unwrap()
+
+        while i < bs.*.names.len() {
+            if bs.*.names[i] == name {
+                return i
+            }
+
+            i = i + 1
+        }
+
+        return bs.*.names.len()
+    }
+
+    // append a copy of the type tree rooted at `idx` of `src` to this body, returning the new root
+    @this
+    make copy_type_from (src: ref<hir::HirBody>, idx: uint) -> uint {
+        make s = src.*.types[idx].pin
+        make c = hir::HirType {}
+
+        c.name = s.*.name !
+        c.range = s.*.range.copy()
+        c.is_fallible = s.*.is_fallible
+        c.is_optional = s.*.is_optional
+        c.is_array = s.*.is_array
+        c.is_ref = s.*.is_ref
+        c.is_ptr = s.*.is_ptr
+        c.is_namespace = s.*.is_namespace
+
+        make ai: uint = 0
+
+        while ai < s.*.args.len() {
+            c.args.push(this.copy_type_from(src, s.*.args[ai]))
+            ai = ai + 1
+        }
+
+        return this.push_type(c)
+    }
+
+    // the last segment of a namespaced type signature (`C` in `a::b::C<T>`)
+    @this
+    make namespace_last (sig: ptr<ast::AST_TypeSig>) -> ptr<ast::AST_TypeSig> {
+        if sig.*.is_namespace && sig.*.inner.len() == 2 {
+            @unsafe make right: ptr<ast::AST_TypeSig> = sig.*.inner[1]
+            return this.namespace_last(right)
+        }
+
+        return sig
+    }
+
+    @this
+    make lower_type (sig: ptr<ast::AST_TypeSig>) -> uint {
+        make t = hir::HirType {}
+
+        // a bare generic parameter of the instance being lowered stands for its bound type
+        if this.has_bindings && !sig.*.is_namespace && sig.*.inner.len() == 0 {
+            make bs: ref<hir::HirBindings> = this.bindings.unwrap()
+            make bi = this.bound_index(sig.*.name.lexeme !)
+
+            if bi < bs.*.names.len() {
+                make bound = this.copy_type_from(bs.*.arena.pin, bs.*.roots[bi])
+
+                if sig.*.is_fallible { this.body.*.types[bound].is_fallible = true }
+
+                if sig.*.is_optional { this.body.*.types[bound].is_optional = true }
+
+                if sig.*.is_array { this.body.*.types[bound].is_array = true }
+
+                this.body.*.types[bound].range = sig.*.range.copy()
+                return bound
+            }
+        }
+
+        if sig.*.is_namespace {
+            // `a::b::C`: `a` is the imported namespace and the remaining segments are members
+            // reached through it. Flatten so type checking sees the namespace as the leading
+            // name and can validate it against the module's declared items.
+            make segs: str[] = []
+            this.namespace_segments(sig, segs.pin)
+
+            t.name = segs[0] !
+            t.is_namespace = true
+            t.range = sig.*.range.copy()
+
+            @unsafe make last: ptr<ast::AST_TypeSig> = this.namespace_last(sig)
+
+            make si = 1
+
+            while si < segs.len() {
+                make member = hir::HirType {}
+
+                member.name = segs[si] !
+                member.range = sig.*.range.copy()
+
+                // the type arguments written after the last segment (`a::C<T>`) belong to it
+                if si + 1 == segs.len() && !last.*.is_namespace {
+                    for item : last.*.inner {
+                        @unsafe make targ: ptr<ast::AST_TypeSig> = item
+                        member.args.push(this.lower_type(targ))
+                    }
+                }
+
+                t.args.push(this.push_type(member))
+                si = si + 1
+            }
+
+            // for a generic application the modifiers written around it (`!a::C<T>`, `a::C<T>?`)
+            // apply to the instantiated type: `!` sits on the leftmost segment, `?` and `[]` on the last
+            if !last.*.is_namespace && sig.*.inner.len() == 2 {
+                @unsafe make first: ptr<ast::AST_TypeSig> = sig.*.inner[0]
+                t.is_fallible = first.*.is_fallible
+                t.is_optional = last.*.is_optional
+                t.is_array = last.*.is_array
+            }
+
+            return this.push_type(t)
+        }
+
+        t.name = sig.*.name.lexeme !
+        t.is_fallible = sig.*.is_fallible
+        t.is_optional = sig.*.is_optional
+        t.is_array = sig.*.is_array
+        t.range = sig.*.range.copy()
+
+        for item : sig.*.inner {
+            @unsafe make inner: ptr<ast::AST_TypeSig> = item
+            t.args.push(this.lower_type(inner))
+        }
+
+        return this.push_type(t)
+    }
+
+    // flatten `a::b::C` into its segment names ["a", "b", "C"]
+    @this
+    make namespace_segments (sig: ptr<ast::AST_TypeSig>, out: ref<str[]>) -> void {
+        if sig.*.is_namespace && sig.*.inner.len() == 2 {
+            @unsafe make left: ptr<ast::AST_TypeSig> = sig.*.inner[0]
+            @unsafe make right: ptr<ast::AST_TypeSig> = sig.*.inner[1]
+            out.*.push(left.*.name.lexeme !)
+            this.namespace_segments(right, out)
+        } else {
+            out.*.push(sig.*.name.lexeme !)
+        }
+    }
+
+
+    // walks every statement reachable from `block_id`, following `if`/`loop` bodies, and
+    // records the shape of each `return` it finds
+    @this
+    make collect_returns (block_id: uint, info: ref<ReturnInfo>) -> void {
+        @unsafe make block: ptr<hir::HirBlock> = this.body.*.blocks[block_id].pin
+
+        make si = 0
+
+        while si < block.*.stmts.len() {
+            make sid = block.*.stmts[si]
+            @unsafe make st: ptr<hir::HirStmt> = this.body.*.stmts[sid].pin
+
+            match st.*.kind {
+                hir::HirStmtKind.Return {
+                    this.classify_return(st, info)
+                }
+
+                hir::HirStmtKind.If {
+                    this.collect_returns(st.*.then_block, info)
+
+                    if st.*.has_else {
+                        this.collect_returns(st.*.else_block, info)
+                    }
+                }
+
+                hir::HirStmtKind.Loop {
+                    this.collect_returns(st.*.then_block, info)
+                }
+
+                hir::HirStmtKind.Block {
+                    this.collect_returns(st.*.then_block, info)
+                }
+
+                hir::HirStmtKind.Match {
+                    make ci = 0
+
+                    while ci < st.*.cases.len() {
+                        @unsafe make hc: ptr<hir::HirCase> = this.body.*.cases[st.*.cases[ci]].pin
+
+                        if hc.*.has_body {
+                            this.collect_returns(hc.*.body, info)
+                        }
+
+                        ci = ci + 1
+                    }
+                }
+
+                _ {}
+            }
+
+            si = si + 1
+        }
+    }
+
+    /// records the kind of value returned by a hir return statement.
+    @this
+    make classify_return (st: ptr<hir::HirStmt>, info: ref<ReturnInfo>) -> void {
+        if !st.*.has_value {
+            info.*.has_void = true
+            return
+        }
+
+        @unsafe make e: ptr<hir::HirExpr> = this.body.*.exprs[st.*.value].pin
+
+        if e.*.kind == hir::HirExprKind.Literal && e.*.lit.kind == lexer::TokenKind.KeyNone {
+            info.*.has_none = true
+            return
+        }
+
+        if this.is_error_value(e) {
+            info.*.has_error = true
+            return
+        }
+
+        info.*.value_types.push(this.infer_expr_type(st.*.value))
+    }
+
+    // `error.Something`: an Access whose left side is the bare `error` path
+    @this
+    make is_error_value (e: ptr<hir::HirExpr>) -> bool {
+        if e.*.kind != hir::HirExprKind.Field {
+            return false
+        }
+
+        @unsafe make lhs: ptr<hir::HirExpr> = this.body.*.exprs[e.*.lhs].pin
+        return lhs.*.kind == hir::HirExprKind.Path && lhs.*.name == "error"
+    }
+
+    // best-effort type of an expression, used where no explicit annotation was written
+    @this
+    make infer_expr_type (id: uint) -> uint {
+        @unsafe make e: ptr<hir::HirExpr> = this.body.*.exprs[id].pin
+
+        if e.*.kind == hir::HirExprKind.Literal {
+            make t = hir::HirType {}
+
+            match e.*.lit.kind {
+                lexer::TokenKind.LiteralNum { t.name = "int" }
+
+                lexer::TokenKind.LiteralString { t.name = "str" }
+
+                lexer::TokenKind.LiteralChar { t.name = "char" }
+
+                lexer::TokenKind.KeyTrue { t.name = "bool" }
+
+                lexer::TokenKind.KeyFalse { t.name = "bool" }
+                _ { t.name = "any" }
+            }
+
+            return this.push_type(t)
+        }
+
+        if e.*.kind == hir::HirExprKind.Local {
+            @unsafe make local: ptr<hir::HirLocal> = this.body.*.locals[e.*.local].pin
+
+            if local.*.has_ty {
+                return local.*.ty
+            }
+        }
+
+        make t = hir::HirType {}
+
+        t.name = "auto"
+
+        return this.push_type(t)
+    }
+
+    // drops later duplicates so `return 1` / `return 2` don't produce `variant<int, int>`
+    @this
+    make dedupe_types (ids: uint[]) -> uint[] {
+        make names: str[] = []
+        make uniq: uint[] = []
+
+        for id : ids {
+            make nm = this.body.*.types[id].name !
+
+            make dup = false
+            make i = 0
+
+            while i < names.len() {
+                if names[i] == nm {
+                    dup = true
+                }
+
+                i = i + 1
+            }
+
+            if !dup {
+                names.push(nm)
+                uniq.push(id)
+            }
+        }
+
+        return uniq
+    }
+
+    @this
+    make build_return_type (info: ref<ReturnInfo>) -> uint {
+        make values = this.dedupe_types(info.*.value_types)
+
+        make base_id: uint = 0
+        make has_base = false
+
+        if values.len() == 1 {
+            base_id = values[0]
+            has_base = true
+        } elif values.len() > 1 {
+            make v = hir::HirType {}
+
+            v.name = "variant"
+            v.args = values
+            base_id = this.push_type(v)
+            has_base = true
+        }
+
+        if !has_base {
+            make t = hir::HirType {}
+
+            t.name = "void"
+            t.is_optional = info.*.has_none
+            t.is_fallible = info.*.has_error
+
+            return this.push_type(t)
+        }
+
+        if info.*.has_void {
+            make voidt = hir::HirType {}
+
+            voidt.name = "void"
+            make voidid = this.push_type(voidt)
+
+            make v = hir::HirType {}
+
+            v.name = "variant"
+            v.args.push(base_id)
+            v.args.push(voidid)
+            base_id = this.push_type(v)
+        }
+
+        if info.*.has_none {
+            @unsafe make base: ptr<hir::HirType> = this.body.*.types[base_id].pin
+
+            make t = hir::HirType {}
+
+            t.name = base.*.name !
+            t.args = base.*.args !
+            t.is_fallible = base.*.is_fallible
+            t.is_array = base.*.is_array
+            t.is_optional = true
+
+            base_id = this.push_type(t)
+        }
+
+        if info.*.has_error {
+            @unsafe make base: ptr<hir::HirType> = this.body.*.types[base_id].pin
+
+            make t = hir::HirType {}
+
+            t.name = base.*.name !
+            t.args = base.*.args !
+            t.is_optional = base.*.is_optional
+            t.is_array = base.*.is_array
+            t.is_fallible = true
+
+            base_id = this.push_type(t)
+        }
+
+        return base_id
+    }
+
+    /// infers the return type.
+    @this
+    make infer_return_type (root: uint) -> uint {
+        make info = ReturnInfo {}
+
+        this.collect_returns(root, info.pin)
+        return this.build_return_type(info.pin)
+    }
+
+
+    @this
+    make lower_block (stmts: ref<ast::AST_Statements>) -> uint {
+        this.enter()
+
+        make ids: uint[] = []
+        make matched = false
+        make os = this.target_os
+        make si = 0
+
+        while si < stmts.*.buffer.len() {
+            @unsafe make node: ptr<ast::AST_Head> = stmts.*.buffer[si]
+
+            make info = scan_tags(node)
+            make keep = true
+
+            if info.is_target {
+                make tv = info.target
+
+                if tv == os || (tv == "darwin" && os == "macos") || (tv == "macos" && os == "darwin") {
+                    matched = true
+                } else {
+                    keep = false
+                }
+            } elif info.is_weak {
+                if !matched {
+                    matched = true
+                } else {
+                    keep = false
+                }
+            } else {
+                matched = false
+            }
+
+            if keep {
+                make sid = this.lower_stmt(node)
+
+                if info.is_unsafe {
+                    this.body.*.stmts[sid].is_unsafe = true
+                }
+
+                ids.push(sid)
+            }
+
+            si = si + 1
+        }
+
+        this.leave()
+
+        make block = hir::HirBlock {}
+
+        block.stmts = ids
+        block.end_span = stmts.*.end_span.copy()
+
+        return this.push_block(block)
+    }
+
+    /// lowers the match statement.
+    @this
+    make lower_match_stmt (m: ptr<ast::AST_Match>, h: ptr<ast::AST_Head>) -> uint {
+        make st = hir::HirStmt {}
+
+        st.kind = hir::HirStmtKind.Match
+        st.range = h.*.range !
+
+        if m.*.scrutinee != none {
+            @unsafe make sv: ptr<ast::AST_Head> = m.*.scrutinee.unwrap()
+            st.value = this.lower_expr(sv)
+            st.has_value = true
+        }
+
+        make ci = 0
+
+        while ci < m.*.cases.len() {
+            @unsafe make cnode: ptr<ast::AST_Head> = m.*.cases[ci].*.pin
+            match cnode.*.case_node {
+                some {
+                    @unsafe make cp: ptr<ast::AST_Case> = some
+                    st.cases.push(this.lower_case(cp, cnode))
+                }
+                none {}
+            }
+
+            ci = ci + 1
+        }
+
+        return this.push_stmt(st)
+    }
+
+    @this
+    make lower_case (c: ptr<ast::AST_Case>, h: ptr<ast::AST_Head>) -> uint {
+        make hc = hir::HirCase {}
+
+        hc.range = h.*.range !
+
+        this.enter()
+
+        if c.*.bind_name != none {
+            @unsafe make nm: ptr<ast::AST_Head> = c.*.bind_name.unwrap()
+
+            make local = hir::HirLocal {}
+
+            local.range = h.*.range !
+
+            match nm.*.expr {
+                none {}
+
+                name_expr: owned<ast::AST_Expr> {
+                    local.name = name_expr.*.literal.lexeme !
+                    local.name_span = name_expr.*.literal.span.copy()
+                    local.scope_body = true
+                }
+            }
+
+            if c.*.bind_type != none {
+                @unsafe make sig: ptr<ast::AST_TypeSig> = c.*.bind_type.unwrap()
+                local.ty = this.lower_type(sig)
+                local.has_ty = true
+            }
+
+            // `name: Type` on an optional is the Some arm (null-check + bind payload).
+            // A bare identifier without `: Type` is a type/enum pattern, not a binding.
+            hc.kind = hir::HirPatternKind.Some
+            hc.bind = this.declare(local)
+            hc.has_bind = true
+        } elif c.*.bind != none {
+            @unsafe make b: ptr<ast::AST_Head> = c.*.bind.unwrap()
+
+            make is_expr = false
+
+            match b.*.expr {
+                bind_expr: owned<ast::AST_Expr> {
+                    @unsafe make be: ptr<ast::AST_Expr> = bind_expr
+                    is_expr = true
+
+                    if be.*.kind == ast::ExprKind.Identifier {
+                        make nm = be.*.literal.lexeme !
+
+                        if nm == "_" {
+                            hc.kind = hir::HirPatternKind.Wildcard
+                        } elif nm == "some" {
+                            // bare `some` is a type pattern; optional payloads use `name: Type`
+                            make local = hir::HirLocal {}
+
+                            local.name = "some"
+                            local.name_span = be.*.literal.span.copy()
+                            local.scope_body = true
+                            local.range = h.*.range !
+                            hc.kind = hir::HirPatternKind.Some
+                            hc.bind = this.declare(local)
+                            hc.has_bind = true
+                        } else {
+                            make local = hir::HirLocal {}
+
+                            local.name = nm
+                            local.name_span = be.*.literal.span.copy()
+                            local.scope_body = true
+                            local.range = h.*.range !
+                            hc.kind = hir::HirPatternKind.Binding
+                            hc.bind = this.declare(local)
+                            hc.has_bind = true
+                        }
+                    } else {
+                        make bid = this.lower_expr(b)
+                        make bex = this.body.*.exprs[bid].pin
+
+                        if bex.*.kind == hir::HirExprKind.EnumVariant {
+                            hc.kind = hir::HirPatternKind.EnumVariant
+                            hc.enum_name = bex.*.name !
+                            hc.variant = bex.*.variant
+                        } elif bex.*.kind == hir::HirExprKind.Literal {
+                            if bex.*.lit.kind == lexer::TokenKind.KeyNone {
+                                hc.kind = hir::HirPatternKind.None
+                            } else {
+                                hc.kind = hir::HirPatternKind.Literal
+                                hc.lit = bex.*.lit !
+                            }
+                        } else {
+                            // Imported enum variants resolve during type checking.
+                            hc.pattern = bid
+                            hc.has_pattern = true
+                        }
+                    }
+                }
+                none {}
+            }
+
+            if !is_expr {
+                hc.kind = hir::HirPatternKind.Wildcard
+            }
+        } else {
+            hc.kind = hir::HirPatternKind.Wildcard
+        }
+
+        if c.*.statements.buffer.len() > 0 {
+            hc.body = this.lower_block(c.*.statements.pin)
+            hc.has_body = true
+        }
+
+        if c.*.result != none {
+            @unsafe make r: ptr<ast::AST_Head> = c.*.result.unwrap()
+            hc.result = this.lower_expr(r)
+            hc.has_result = true
+        }
+
+        this.leave()
+
+        return this.push_case(hc)
+    }
+
+    /// lowers the statement.
+    @this
+    make lower_stmt (node: ptr<ast::AST_Head>) -> uint {
+        match node.*.kind {
+            ast::AST_Kind.Var {
+                @unsafe make v: ptr<ast::AST_Var> = node.*.var.unwrap()
+                return this.lower_let(v, node)
+            }
+
+            ast::AST_Kind.If {
+                @unsafe make n: ptr<ast::AST_If> = node.*.if_node.unwrap()
+                return this.lower_if(n, node)
+            }
+
+            ast::AST_Kind.While {
+                @unsafe make w: ptr<ast::AST_While> = node.*.while_node.unwrap()
+                return this.lower_while(w, node)
+            }
+
+            ast::AST_Kind.Return {
+                @unsafe make r: ptr<ast::AST_Return> = node.*.return_node.unwrap()
+                return this.lower_return(r, node)
+            }
+
+            ast::AST_Kind.Expr {
+                return this.lower_expr_stmt(node)
+            }
+
+            ast::AST_Kind.For {
+                @unsafe make f: ptr<ast::AST_For> = node.*.for_node.unwrap()
+                return this.lower_for(f, node)
+            }
+
+            ast::AST_Kind.Match {
+                @unsafe make m: ptr<ast::AST_Match> = node.*.match_node.unwrap()
+                return this.lower_match_stmt(m, node)
+            }
+
+            _ {
+                return this.unsupported_stmt(node.*.range !, "nested declaration")
+            }
+        }
+
+        return this.unsupported_stmt(node.*.range !, "statement")
+    }
+
+    @this
+    make lower_let (v: ptr<ast::AST_Var>, h: ptr<ast::AST_Head>) -> uint {
+        make st = hir::HirStmt {}
+
+        st.kind = hir::HirStmtKind.Let
+        st.range = h.*.range !
+
+        // the initializer is lowered before the new name becomes visible: `make x = x + 1`
+        if v.*.val != none {
+            @unsafe make val: ptr<ast::AST_Head> = v.*.val.unwrap()
+            st.value = this.lower_expr(val)
+            st.has_value = true
+
+        }
+
+
+        make local = hir::HirLocal {}
+
+        local.name = v.*.name.lexeme !
+        local.name_span = v.*.name.span.copy()
+        local.range = h.*.range !
+
+        if v.*.sig_type != none {
+            @unsafe make sig: ptr<ast::AST_TypeSig> = v.*.sig_type.unwrap()
+            local.ty = this.lower_type(sig)
+            local.has_ty = true
+        } elif st.has_value {
+            local.hint_offset = v.*.name.span.end
+            // no annotation was written: infer the local's type from its initializer when the
+            // initializer's type is syntactically known. otherwise leave it untyped so the
+            // checker assigns a fresh inference variable instead of the shared `auto` variable.
+            make tid = this.infer_expr_type(st.value)
+
+            if this.body.*.types[tid].name != "auto" {
+                local.ty = tid
+                local.has_ty = true
+            }
+        }
+
+        st.local = this.declare(local)
+
+        return this.push_stmt(st)
+    }
+
+    // `elif` becomes an `if` nested inside the else block
+    @this
+    make lower_if (n: ptr<ast::AST_If>, h: ptr<ast::AST_Head>) -> uint {
+        make st = hir::HirStmt {}
+
+        st.kind = hir::HirStmtKind.If
+        st.range = h.*.range !
+
+        @unsafe make cond: ptr<ast::AST_Head> = n.*.val.unwrap()
+        st.value = this.lower_expr(cond)
+        st.has_value = true
+
+        st.then_block = this.lower_block(n.*.statements.pin)
+
+        if n.*.elif_block != none {
+            @unsafe make elif_head: ptr<ast::AST_Head> = n.*.elif_block.unwrap()
+
+            match elif_head.*.if_node {
+                some {
+                    @unsafe make elif_node: ptr<ast::AST_If> = some
+                    make nested = this.lower_if(elif_node, elif_head)
+
+                    make block = hir::HirBlock {}
+
+                    block.stmts.push(nested)
+
+                    st.else_block = this.push_block(block)
+                    st.has_else = true
+                }
+                none {}
+            }
+
+        } elif n.*.else_block.buffer.len() > 0 {
+            st.else_block = this.lower_block(n.*.else_block.pin)
+            st.has_else = true
+        }
+
+        return this.push_stmt(st)
+    }
+
+    @this
+    make lower_for (f: ptr<ast::AST_For>, h: ptr<ast::AST_Head>) -> uint {
+        make range = h.*.range.copy()
+
+        if f.*.cond == none {
+            return this.unsupported_stmt(range, "for")
+        }
+
+        @unsafe make iterable: ptr<ast::AST_Head> = f.*.cond.unwrap()
+        make iterable_id = this.lower_expr(iterable)
+        make source = this.iterable_expr(iterable_id)
+        // An explicit `.iter()` borrows a place; it must not move the array
+        // into the hidden loop local. Non-place iterables still need a local
+        // owner so that temporaries remain alive for the loop.
+        make borrow = false
+
+        if source != iterable_id {
+            make k = this.body.*.exprs[source].kind
+            borrow = k == hir::HirExprKind.Local || k == hir::HirExprKind.Field || k == hir::HirExprKind.Index || k == hir::HirExprKind.Deref
+        }
+
+        if borrow {
+            make pin_expr = hir::HirExpr {}
+            pin_expr.kind = hir::HirExprKind.Pin
+            pin_expr.range = range.copy()
+            pin_expr.lhs = source
+            source = this.push_expr(pin_expr)
+        }
+
+        make arr_local = this.hidden_local("$for.arr", range.copy())
+        make arr_let = hir::HirStmt {}
+
+        arr_let.kind = hir::HirStmtKind.Let
+        arr_let.range = range.copy()
+        arr_let.local = arr_local
+        arr_let.value = source
+        arr_let.has_value = true
+        make arr_let_id = this.push_stmt(arr_let)
+
+        make idx_local = this.hidden_local("$for.idx", range.copy())
+        make idx_let = hir::HirStmt {}
+
+        idx_let.kind = hir::HirStmtKind.Let
+        idx_let.range = range.copy()
+        idx_let.local = idx_local
+        idx_let.value = this.int_expr("0", range.copy())
+        idx_let.has_value = true
+        make idx_let_id = this.push_stmt(idx_let)
+
+        this.enter()
+
+        make bind = hir::HirLocal {}
+
+        bind.name = f.*.inc.lexeme !
+        bind.name_span = f.*.inc.span.copy()
+        bind.scope_body = true
+        bind.range = range.copy()
+        make bind_local = this.declare(bind)
+
+        make body_block = this.lower_block(f.*.statements.pin)
+
+        this.leave()
+
+        make wrapped = hir::HirBlock {}
+
+        make item_let = hir::HirStmt {}
+
+        item_let.kind = hir::HirStmtKind.Let
+        item_let.range = range.copy()
+        item_let.local = bind_local
+        make index_base = this.local_expr(arr_local, range.copy())
+
+        if borrow {
+            make deref = hir::HirExpr {}
+            deref.kind = hir::HirExprKind.Deref
+            deref.range = range.copy()
+            deref.lhs = index_base
+            index_base = this.push_expr(deref)
+        }
+
+        item_let.value = this.index_expr(index_base, this.local_expr(idx_local, range.copy()), range.copy())
+        item_let.has_value = true
+        wrapped.stmts.push(this.push_stmt(item_let))
+
+        make inc = hir::HirStmt {}
+
+        inc.kind = hir::HirStmtKind.Assign
+        inc.range = range.copy()
+        inc.op.kind = lexer::TokenKind.Equal
+        inc.op.lexeme = "="
+        inc.target = this.local_expr(idx_local, range.copy())
+        inc.value = this.binary_expr("+", lexer::TokenKind.Plus, this.local_expr(idx_local, range.copy()), this.int_expr("1", range.copy()), range.copy())
+        inc.has_value = true
+        wrapped.stmts.push(this.push_stmt(inc))
+
+        @unsafe make orig: ptr<hir::HirBlock> = this.body.*.blocks[body_block].pin
+        make bi = 0
+
+        while bi < orig.*.stmts.len() {
+            wrapped.stmts.push(orig.*.stmts[bi])
+            bi = bi + 1
+        }
+
+        make wrapped_id = this.push_block(wrapped)
+
+        make guard = hir::HirStmt {}
+
+        guard.kind = hir::HirStmtKind.If
+        guard.range = range.copy()
+        make length = this.len_expr(arr_local, range.copy())
+
+        if borrow {
+            make base = this.local_expr(arr_local, range.copy())
+            make deref = hir::HirExpr {}
+            deref.kind = hir::HirExprKind.Deref
+            deref.range = range.copy()
+            deref.lhs = base
+            make field = hir::HirExpr {}
+            field.kind = hir::HirExprKind.Field
+            field.range = range.copy()
+            field.lhs = this.push_expr(deref)
+            field.name = "len"
+            make call = hir::HirExpr {}
+            call.kind = hir::HirExprKind.Call
+            call.range = range.copy()
+            call.lhs = this.push_expr(field)
+            length = this.push_expr(call)
+        }
+
+        guard.value = this.binary_expr("<", lexer::TokenKind.Less, this.local_expr(idx_local, range.copy()), length, range.copy())
+        guard.has_value = true
+        guard.then_block = wrapped_id
+
+        make brk = hir::HirStmt {}
+
+        brk.kind = hir::HirStmtKind.Break
+        brk.range = range.copy()
+        make brk_id = this.push_stmt(brk)
+
+        make else_block = hir::HirBlock {}
+        else_block.stmts.push(brk_id)
+        guard.else_block = this.push_block(else_block)
+        guard.has_else = true
+
+        make guard_id = this.push_stmt(guard)
+        make loop_body = hir::HirBlock {}
+
+        loop_body.stmts.push(guard_id)
+
+        make lp = hir::HirStmt {}
+
+        lp.kind = hir::HirStmtKind.Loop
+        lp.range = range.copy()
+        lp.then_block = this.push_block(loop_body)
+        make lp_id = this.push_stmt(lp)
+
+        make outer = hir::HirBlock {}
+
+        outer.stmts.push(arr_let_id)
+        outer.stmts.push(idx_let_id)
+        outer.stmts.push(lp_id)
+
+        make block = hir::HirStmt {}
+
+        block.kind = hir::HirStmtKind.Block
+        block.range = range.copy()
+        block.then_block = this.push_block(outer)
+
+        return this.push_stmt(block)
+    }
+
+    // while cond { body }  =>  loop { if cond { body } else { break } }
+    @this
+    make lower_while (w: ptr<ast::AST_While>, h: ptr<ast::AST_Head>) -> uint {
+        @unsafe make cond: ptr<ast::AST_Head> = w.*.cond.unwrap()
+
+        make guard = hir::HirStmt {}
+
+        guard.kind = hir::HirStmtKind.If
+        guard.range = h.*.range !
+        guard.value = this.lower_expr(cond)
+        guard.has_value = true
+        guard.then_block = this.lower_block(w.*.statements.pin)
+
+        make brk = hir::HirStmt {}
+
+        brk.kind = hir::HirStmtKind.Break
+        brk.range = h.*.range !
+
+        make brk_id = this.push_stmt(brk)
+        make else_block = hir::HirBlock {}
+        else_block.stmts.push(brk_id)
+        guard.else_block = this.push_block(else_block)
+        guard.has_else = true
+
+        make guard_id = this.push_stmt(guard)
+        make body = hir::HirBlock {}
+
+        body.stmts.push(guard_id)
+
+        make lp = hir::HirStmt {}
+
+        lp.kind = hir::HirStmtKind.Loop
+        lp.range = h.*.range !
+        lp.then_block = this.push_block(body)
+
+        return this.push_stmt(lp)
+    }
+
+    @this
+    make lower_return (r: ptr<ast::AST_Return>, h: ptr<ast::AST_Head>) -> uint {
+        make st = hir::HirStmt {}
+
+        st.kind = hir::HirStmtKind.Return
+        st.range = h.*.range !
+
+        // the parser always attempts an expression after `return`, a bare `return` leaves an error node
+
+        match r.*.value {
+
+            some {
+                @unsafe make value: ptr<ast::AST_Head> = some
+
+                if value.*.status != ast::AST_Status.Error {
+                    st.value = this.lower_expr(value)
+                    st.has_value = true
+                }
+            }
+
+        }
+
+        return this.push_stmt(st)
+    }
+
+    // assignments are parsed as binary expressions, at statement level they become `Assign`
+    @this
+    make lower_expr_stmt (node: ptr<ast::AST_Head>) -> uint {
+        make st = hir::HirStmt {}
+
+        st.range = node.*.range !
+
+        make is_assign = false
+        make target: ptr<ast::AST_Head> = node
+        make value: ptr<ast::AST_Head> = node
+        make op = lexer::Token {}
+        make bare_control: str = ""
+
+        match node.*.expr {
+            none {}
+
+            ex: owned<ast::AST_Expr> {
+                if ex.*.kind == ast::ExprKind.Identifier {
+                    bare_control = ex.*.literal.lexeme !
+                }
+
+                if ex.*.kind == ast::ExprKind.Binary && ex.*.binary != none {
+                    @unsafe make bin: ptr<ast::ExprBinary> = ex.*.binary.unwrap()
+
+                    if bin.*.op.is_assign_op() {
+                        @unsafe make target2: ptr<ast::AST_Head> = bin.*.left.unwrap()
+                        @unsafe make value2: ptr<ast::AST_Head> = bin.*.right.unwrap()
+                        target = target2
+                        value = value2
+                        op = bin.*.op
+                        is_assign = true
+                    }
+                }
+            }
+        }
+
+        if is_assign {
+            st.kind = hir::HirStmtKind.Assign
+            st.op = op
+            st.target = this.lower_expr(target)
+            st.value = this.lower_expr(value)
+            st.has_value = true
+        } elif bare_control == "break" {
+            st.kind = hir::HirStmtKind.Break
+        } elif bare_control == "continue" {
+            st.kind = hir::HirStmtKind.Continue
+        } else {
+            st.kind = hir::HirStmtKind.Expr
+            st.value = this.lower_expr(node)
+            st.has_value = true
+        }
+
+        return this.push_stmt(st)
+    }
+
+    /// adds a placeholder hir statement for an unsupported construct.
+    @this
+    make unsupported_stmt (range: util::Range, what: str) -> uint {
+        make st = hir::HirStmt {}
+
+        st.kind = hir::HirStmtKind.Unsupported
+        st.range = range
+        st.name = what
+
+        return this.push_stmt(st)
+    }
+
+
+    /// lowers the expression.
+    @this
+    make lower_expr (node: ptr<ast::AST_Head>) -> uint {
+        make id: uint = 0
+        make got = false
+        make is_copy = false
+
+        match node.*.expr {
+            ex: owned<ast::AST_Expr> {
+                @unsafe make ep: ptr<ast::AST_Expr> = ex
+                id = this.lower_expr_kind(ep, node)
+                got = true
+                is_copy = ep.*.is_copy
+            }
+            none {}
+        }
+
+        if !got {
+            return this.unsupported_expr(node.*.range !, "non-expression node")
+        }
+
+        if is_copy {
+            make c = hir::HirExpr {}
+
+            c.kind = hir::HirExprKind.Copy
+            c.range = this.body.*.exprs[id].range !
+            c.lhs = id
+
+            return this.push_expr(c)
+        }
+
+        return id
+    }
+
+    // build a `Range` covering a single token's span
+    @this
+    make span_range (s: util::Span) -> util::Range {
+        make r = util::Range {}
+
+        r.start = s.copy()
+        r.end = s
+
+        return r
+    }
+
+    // the outer range covering both `a` (left) and `b` (right)
+    @this
+    make join_ranges (a: util::Range, b: util::Range) -> util::Range {
+        make r = util::Range {}
+
+        r.start = a.start
+        r.end = b.end
+
+        return r
+    }
+
+    /// lowers the expression kind.
+    @this
+    make lower_expr_kind (e: ptr<ast::AST_Expr>, h: ptr<ast::AST_Head>) -> uint {
+        make out = hir::HirExpr {}
+
+        out.range = h.*.range !
+
+        if h.*.status == ast::AST_Status.Error {
+            out.kind = hir::HirExprKind.Error
+
+            return this.push_expr(out)
+        }
+
+        match e.*.kind {
+            ast::ExprKind.Lambda {
+                if e.*.lambda == none { return this.unsupported_expr(out.range !, "lambda") }
+
+                @unsafe make f: ptr<ast::AST_Func> = e.*.lambda.unwrap()
+                make body = hir::HirBody {}
+                make nested = Lowerer.create(body.pin, this.target_os !, this.enums, this.consts, this.diagref, this.functions)
+                nested.bindings = this.bindings
+                nested.has_bindings = this.has_bindings
+
+                for name : this.outer_names { nested.outer_names.push(name !) }
+
+                for name : this.scope_names { nested.outer_names.push(name !) }
+
+                for capture : f.*.captures { nested.capture_names.push(capture.lexeme !) }
+
+                make function = nested.lower_func(f, h)
+                function.body = body
+                function.is_lambda = true
+                function.name = function.name + "_" + this.functions.*.len().to_str()
+                out.kind = hir::HirExprKind.Lambda
+                out.name = function.name.copy()
+                make ci: uint = 0
+
+                while ci < f.*.captures.len() {
+                    make name = f.*.captures[ci].lexeme !
+                    make found = this.lookup(name.copy())
+
+                    if found == 0 {
+                        make d = diag::Diag.err(err::Err.TypeMismatch, out.range !, "unknown lambda capture `" + name + "`")
+                        this.diagref.*.report(d)
+                    }
+
+                    make capture = hir::HirExpr {}
+
+                    capture.kind = hir::HirExprKind.Local
+
+                    if found > 0 { capture.local = found - 1 }
+
+                    capture.range = out.range !
+                    make value = this.push_expr(capture)
+
+                    if ci < f.*.capture_copies.len() && f.*.capture_copies[ci] {
+                        make copy = hir::HirExpr {}
+
+                        copy.kind = hir::HirExprKind.Copy
+                        copy.lhs = value
+                        copy.range = out.range !
+                        value = this.push_expr(copy)
+                    }
+
+                    out.args.push(value)
+                    ci = ci + 1
+                }
+
+                this.functions.*.push(function)
+            }
+
+            ast::ExprKind.Error {
+                make base = hir::HirExpr {}
+
+                base.kind = hir::HirExprKind.Path
+                base.name = "error"
+                base.range = out.range !
+                out.kind = hir::HirExprKind.Field
+                out.lhs = this.push_expr(base)
+                out.name = e.*.literal.lexeme.copy()
+                out.range = this.span_range(e.*.literal.span)
+            }
+
+            ast::ExprKind.Literal {
+                out.kind = hir::HirExprKind.Literal
+                out.lit = e.*.literal !
+                out.range = this.span_range(e.*.literal.span)
+            }
+
+            ast::ExprKind.Identifier {
+                make found = this.lookup(e.*.literal.lexeme !)
+
+                if found > 0 {
+                    out.kind = hir::HirExprKind.Local
+                    out.local = found - 1
+                } else {
+                    make ci = 0
+                    make const_found = false
+
+                    while ci < this.consts.*.len() {
+                        if this.consts.*[ci].has_lit && this.consts.*[ci].name == e.*.literal.lexeme {
+                            out.kind = hir::HirExprKind.Literal
+                            out.lit = this.consts.*[ci].lit !
+                            out.requires_unsafe = this.consts.*[ci].is_unsafe
+                            const_found = true
+                        }
+
+                        ci = ci + 1
+                    }
+
+                    if !const_found {
+
+                        for name : this.outer_names {
+                            if name == e.*.literal.lexeme {
+                                make d = diag::Diag.err(err::Err.TypeMismatch, out.range !, "lambda cannot capture outer local `" + name + "`")
+                                d.help("include the local in an explicit capture list: [" + name + "] (...) -> Type { ... }")
+                                this.diagref.*.report(d)
+                            }
+                        }
+
+                        out.kind = hir::HirExprKind.Path
+                        out.name = e.*.literal.lexeme !
+                    }
+                }
+
+                out.range = this.span_range(e.*.literal.span)
+            }
+
+            ast::ExprKind.Binary {
+                if e.*.binary == none {
+                    return this.unsupported_expr(out.range !, "binary")
+                }
+
+                @unsafe make bin: ptr<ast::ExprBinary> = e.*.binary.unwrap()
+
+                if bin.*.op.is_assign_op() {
+                    return this.unsupported_expr(out.range !, "assignment used as a value")
+                }
+
+                @unsafe make l: ptr<ast::AST_Head> = bin.*.left.unwrap()
+                @unsafe make r: ptr<ast::AST_Head> = bin.*.right.unwrap()
+
+                out.kind = hir::HirExprKind.Binary
+                out.lit = bin.*.op !
+                out.lhs = this.lower_expr(l)
+                out.rhs = this.lower_expr(r)
+                out.range = this.join_ranges(this.body.*.exprs[out.lhs].range !, this.body.*.exprs[out.rhs].range !)
+            }
+
+            ast::ExprKind.Unary {
+                if e.*.unary == none {
+                    return this.unsupported_expr(out.range !, "unary")
+                }
+
+                @unsafe make un: ptr<ast::ExprUnary> = e.*.unary.unwrap()
+                @unsafe make operand: ptr<ast::AST_Head> = un.*.operand.unwrap()
+                make uop = un.*.op.copy()
+
+                out.kind = hir::HirExprKind.Unary
+
+                if uop.kind == lexer::TokenKind.PlusPlus || uop.kind == lexer::TokenKind.MinusMinus {
+                    out.kind = hir::HirExprKind.Update
+                    out.postfix = un.*.postfix
+                }
+
+                out.lit = uop !
+                out.lhs = this.lower_expr(operand)
+                make orng = this.body.*.exprs[out.lhs].range !
+                make orr = util::Range {}
+
+                orr.start = un.*.op.span
+                orr.end = orng.end
+
+                if un.*.postfix {
+                    orr.start = orng.start
+                    orr.end = un.*.op.span
+                }
+
+                out.range = orr
+            }
+
+            ast::ExprKind.Call {
+                match e.*.call {
+                    none {
+                        return this.unsupported_expr(out.range !, "call")
+                    }
+
+                    expr_call: owned<ast::ExprCall> {
+                        @unsafe make call_payload: ptr<ast::ExprCall> = expr_call
+                        @unsafe make callee: ptr<ast::AST_Head> = call_payload.*.callee.unwrap()
+
+                        out.kind = hir::HirExprKind.Call
+                        out.has_catch = call_payload.*.catch_stmts != none
+                        out.lhs = this.lower_expr(callee)
+
+                        make ai = 0
+
+                        while ai < call_payload.*.args.len() {
+                            @unsafe make arg: ptr<ast::AST_Head> = call_payload.*.args[ai].val.unwrap()
+                            out.args.push(this.lower_expr(arg))
+                            ai = ai + 1
+                        }
+
+                        if out.has_catch {
+                            this.enter()
+                            match call_payload.*.catch_bind {
+                                none {}
+                                some {
+                                    make local = hir::HirLocal {}
+
+                                    local.name = some.lexeme.copy()
+                                    local.name_span = some.span.copy()
+                                    local.scope_body = true
+                                    local.range = out.range !
+                                    out.catch_bind = this.declare(local)
+                                    out.has_catch_bind = true
+                                }
+                            }
+
+                            match call_payload.*.catch_stmts {
+                                none {}
+                                some { out.catch_block = this.lower_block(some.pin) }
+                            }
+
+                            this.leave()
+                        }
+
+                        make call_end = out.range.end !
+                        make crng = this.body.*.exprs[out.lhs].range !
+                        out.range.start = crng.start
+
+                        if out.args.len() > 0 {
+                            make arg_last = this.body.*.exprs[out.args[out.args.len() - 1]].range !
+                            out.range.end = arg_last.end
+                        } else {
+                            out.range.end = crng.end
+                        }
+
+                        if call_end.end > out.range.end.end {
+                            out.range.end = call_end
+                        }
+                    }
+                }
+            }
+
+            ast::ExprKind.Access {
+                match e.*.access {
+                    none {
+                        return this.unsupported_expr(out.range !, "access")
+                    }
+
+                    expr_acc: owned<ast::ExprAccess> {
+                @unsafe make acc: ptr<ast::ExprAccess> = expr_acc
+                @unsafe make left: ptr<ast::AST_Head> = acc.*.left.unwrap()
+                @unsafe make member: ptr<ast::AST_Head> = acc.*.right.unwrap()
+
+                // `Enum.Variant`: a bare `Name.Member` where `Name` is an enum declaration
+                // and `Member` is one of its variants becomes a constant discriminant value
+                if !acc.*.is_array {
+                    match left.*.expr {
+                        none {}
+
+                        left_ex: owned<ast::AST_Expr> {
+                            match member.*.expr {
+                                none {}
+
+                                mem_ex: owned<ast::AST_Expr> {
+                                    if left_ex.*.kind == ast::ExprKind.Identifier && mem_ex.*.kind == ast::ExprKind.Identifier {
+                                        make ename = left_ex.*.literal.lexeme !
+
+                                        if this.lookup(ename !) == 0 {
+                                            make enm = this.find_enum(ename.copy())
+
+                                            if enm < this.enums.*.len() {
+                                                make vi = this.enum_variant_index(enm, mem_ex.*.literal.lexeme !)
+
+                                                if vi < this.enums.*[enm].variants.len() {
+                                                    out.kind = hir::HirExprKind.EnumVariant
+                                                    out.name = ename
+                                                    out.variant = vi
+                                                    out.range = this.join_ranges(this.span_range(left_ex.*.literal.span), this.span_range(mem_ex.*.literal.span))
+
+                                                    return this.push_expr(out)
+                                                }
+
+                                                make d = diag::Diag.err(err::Err.InvalidSyntax, this.span_range(mem_ex.*.literal.span), "no variant named `" + mem_ex.*.literal.lexeme + "` in enum `" + ename + "`")
+                                                this.diagref.*.report(d)
+                                                out.kind = hir::HirExprKind.Error
+
+                                                return this.push_expr(out)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                out.lhs = this.lower_expr(left)
+
+                make arng = this.body.*.exprs[out.lhs].range !
+                out.range.start = arng.start
+
+                if acc.*.is_array {
+                    @unsafe make index: ptr<ast::AST_Head> = acc.*.right.unwrap()
+                    out.kind = hir::HirExprKind.Index
+                    out.rhs = this.lower_expr(index)
+                    make ixrng = this.body.*.exprs[out.rhs].range !
+                    out.range.end = ixrng.end
+                } else {
+                    match member.*.expr {
+                        member2: owned<ast::AST_Expr> {
+                            // `this.deref` / `this.*` on a scalar receiver is the value itself: a scalar
+                            // `this` is already passed by value, so there is nothing to dereference
+                            make is_scalar_this = false
+
+                            if this.cur_has_this && is_scalar_type_name(this.cur_owner) {
+                                match left.*.expr {
+                                    this_ex: owned<ast::AST_Expr> {
+                                        if this_ex.*.kind == ast::ExprKind.Identifier && this_ex.*.literal.lexeme == "this" {
+                                            is_scalar_this = true
+                                        }
+                                    }
+                                    none {}
+                                }
+                            }
+
+                            if is_scalar_this
+                            && (member2.*.kind == ast::ExprKind.Deref || member2.*.literal.lexeme == "deref") {
+                                return out.lhs
+                            }
+
+                            if member2.*.kind == ast::ExprKind.Deref {
+                                out.kind = hir::HirExprKind.Deref
+                            } elif member2.*.literal.lexeme == "deref" {
+                                out.kind = hir::HirExprKind.Deref
+                            } elif member2.*.literal.lexeme == "pin" {
+                                out.kind = hir::HirExprKind.Pin
+                            } else {
+                                out.kind = hir::HirExprKind.Field
+                                out.name = member2.*.literal.lexeme !
+                                out.member_span = member2.*.literal.span !
+                                out.has_member_span = true
+                            }
+
+                            out.range.end = member2.*.literal.span
+                        }
+                        none {}
+                    }
+                }
+                    }
+                }
+            }
+
+            ast::ExprKind.Constructor {
+                out.kind = hir::HirExprKind.Constructor
+
+                match e.*.constructor {
+                    none {
+                        return this.unsupported_expr(out.range !, "constructor")
+                    }
+
+                    expr_ctor: owned<ast::ExprConstructor> {
+                        @unsafe make ctor: ptr<ast::ExprConstructor> = expr_ctor
+
+                        // `Type { ... }` names the struct. `.{ ... }` has no type; the checker
+                        // infers it from the place being initialized.
+                        match ctor.*.type_sig {
+                            none {}
+
+                            sig: owned<ast::AST_TypeSig> {
+                                @unsafe make tsig: ptr<ast::AST_TypeSig> = sig
+
+                                // for a namespaced type (`ns::Type` or `a::b::Type`) build the full dotted
+                                // name so the type checker can strip the prefix and find the struct
+                                if tsig.*.is_namespace {
+                                    make segs: str[] = []
+                                    this.namespace_segments(tsig, segs.pin)
+                                    make full: str = ""
+                                    make si = 0
+
+                                    while si < segs.len() {
+                                        if si > 0 {
+                                            full = full + "::"
+                                        }
+
+                                        full = full + segs[si] !
+                                        si = si + 1
+                                    }
+
+                                    out.name = full
+                                } else {
+                                    out.name = tsig.*.name.lexeme
+                                }
+
+                                // `Type<A, B> { ... }`: keep the written type arguments for instantiation
+                                @unsafe make ctor_last: ptr<ast::AST_TypeSig> = this.namespace_last(tsig)
+
+                                if ctor_last.*.inner.len() > 0 && !ctor_last.*.is_namespace {
+                                    out.ty = this.lower_type(tsig)
+                                    out.has_ty = true
+                                }
+
+                                out.range.start = tsig.*.range.start
+                                out.range.end = tsig.*.range.end
+                            }
+                        }
+
+                        make fi = 0
+
+                        while fi < ctor.*.fields.len() {
+                            @unsafe make field: ptr<ast::AST_Head> = ctor.*.fields[fi].*.pin
+
+                            make handled = false
+
+                            match field.*.expr {
+                                field_ex: owned<ast::AST_Expr> {
+                                    // a field written as `name = value` keeps its name; a bare value is positional
+                                    if field_ex.*.kind == ast::ExprKind.Binary && field_ex.*.binary != none {
+                                        @unsafe make fbin: ptr<ast::ExprBinary> = field_ex.*.binary.unwrap()
+
+                                        if fbin.*.op.is_assign_op() {
+                                            @unsafe make nm: ptr<ast::AST_Head> = fbin.*.left.unwrap()
+                                            @unsafe make vl: ptr<ast::AST_Head> = fbin.*.right.unwrap()
+                                            match nm.*.expr {
+                                                name_ex: owned<ast::AST_Expr> {
+                                                    out.field_names.push(name_ex.*.literal.lexeme !)
+                                                }
+                                                none {}
+                                            }
+
+                                            out.args.push(this.lower_expr(vl))
+                                            handled = true
+                                        }
+                                    }
+                                }
+                                none {}
+                            }
+
+                        if !handled {
+                            out.field_names.push("")
+                            out.args.push(this.lower_expr(field))
+                        }
+
+                        fi = fi + 1
+                    }
+
+                    if out.args.len() > 0 {
+                        make arg_last = this.body.*.exprs[out.args[out.args.len() - 1]].range !
+                        out.range.end = arg_last.end
+                    }
+                        }
+                    }
+                }
+
+            ast::ExprKind.ArrayLiteral {
+                out.kind = hir::HirExprKind.Array
+
+                match e.*.constructor {
+                    none {
+                        return this.unsupported_expr(out.range !, "array")
+                    }
+
+                    arr_ctor: owned<ast::ExprConstructor> {
+                @unsafe make ctor: ptr<ast::ExprConstructor> = arr_ctor
+                make ai = 0
+
+                while ai < ctor.*.fields.len() {
+                    @unsafe make elem: ptr<ast::AST_Head> = ctor.*.fields[ai].*.pin
+                    out.args.push(this.lower_expr(elem))
+                    ai = ai + 1
+                }
+
+                if out.args.len() > 0 {
+                    make arg_first = this.body.*.exprs[out.args[0]].range !
+                    make arg_last = this.body.*.exprs[out.args[out.args.len() - 1]].range !
+                    out.range = this.join_ranges(arg_first, arg_last)
+                }
+                    }
+                }
+            }
+
+            ast::ExprKind.TypeSig {
+                // a generic type written as an expression, e.g. the receiver of `Stack<int>.create()`.
+                // it stays a `Path` named after the type; `ty` keeps the written type with its
+                // arguments so instantiation can later rename it to the concrete instance
+                match e.*.type_sig {
+                    tsig_ex: owned<ast::AST_TypeSig> {
+                        @unsafe make q: ptr<ast::AST_TypeSig> = tsig_ex
+                        @unsafe make last: ptr<ast::AST_TypeSig> = this.namespace_last(q)
+
+                        if last.*.inner.len() == 0 || last.*.is_namespace {
+                            return this.unsupported_expr(out.range !, "expression")
+                        }
+
+                        out.kind = hir::HirExprKind.Path
+                        out.name = last.*.name.lexeme !
+                        out.ty = this.lower_type(q)
+                        out.has_ty = true
+                        out.range = q.*.range !
+                    }
+
+                    none {
+                        return this.unsupported_expr(out.range !, "expression")
+                    }
+                }
+            }
+
+            ast::ExprKind.TypeRef {
+                // `@sizeof T`: the queried type is asked for its size
+                match e.*.type_ref {
+                    tref: owned<ast::AST_TypeSig> {
+                        @unsafe make q: ptr<ast::AST_TypeSig> = tref
+                        out.kind = hir::HirExprKind.Sizeof
+                        out.ty = this.lower_type(q)
+                        out.range = q.*.range !
+                    }
+
+                    none {
+                        return this.unsupported_expr(out.range !, "sizeof")
+                    }
+                }
+            }
+
+            ast::ExprKind.Match {
+                match e.*.match_expr {
+                    none {
+                        return this.unsupported_expr(out.range !, "match")
+                    }
+
+                    expr_mex: owned<ast::ExprMatch> {
+                @unsafe make mex: ptr<ast::ExprMatch> = expr_mex
+
+                if mex.*.node == none {
+                    return this.unsupported_expr(out.range !, "match")
+                }
+
+                @unsafe make mh: ptr<ast::AST_Head> = mex.*.node.unwrap()
+
+                make done = false
+
+                match mh.*.match_node {
+                    match_payload: owned<ast::AST_Match> {
+                        out.kind = hir::HirExprKind.Match
+
+                        if match_payload.*.scrutinee != none {
+                            @unsafe make sv: ptr<ast::AST_Head> = match_payload.*.scrutinee.unwrap()
+                            out.lhs = this.lower_expr(sv)
+                        }
+
+                        make ci = 0
+
+                        while ci < match_payload.*.cases.len() {
+                            @unsafe make cnode: ptr<ast::AST_Head> = match_payload.*.cases[ci].*.pin
+                            match cnode.*.case_node {
+                                case_payload: owned<ast::AST_Case> {
+                                    @unsafe make cp: ptr<ast::AST_Case> = case_payload
+                                    out.cases.push(this.lower_case(cp, cnode))
+                                }
+                                none {}
+                            }
+
+                            ci = ci + 1
+                        }
+
+                        done = true
+                    }
+                    none {}
+                }
+
+                if !done {
+                    return this.unsupported_expr(out.range !, "match")
+                }
+                    }
+                }
+            }
+
+            _ {
+                return this.unsupported_expr(out.range !, "expression")
+            }
+        }
+
+        return this.push_expr(out)
+    }
+
+    /// adds a placeholder hir expression for an unsupported construct.
+    @this
+    make unsupported_expr (range: util::Range, what: str) -> uint {
+        make out = hir::HirExpr {}
+
+        out.kind = hir::HirExprKind.Unsupported
+        out.range = range
+        out.name = what
+
+        return this.push_expr(out)
+    }
+}

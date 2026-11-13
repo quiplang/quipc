@@ -1,0 +1,21 @@
+@impl int
+make to_uint () -> uint {
+
+    if this < 0 {
+        return 0
+    }
+
+    @unsafe return this
+}
+
+@impl char
+make to_uint () -> uint {
+
+    return 0
+}
+
+@impl char
+make to_u8 () -> u8 {
+
+    return 0
+}

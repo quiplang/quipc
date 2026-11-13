@@ -1,0 +1,105 @@
+@pure @const {
+    @target "macos" make os = @import "platform/macos.quip"
+    @target "linux" make os = @import "platform/linux.quip"
+}
+
+@pure @const {
+    make memory = @import "memory.quip"
+    make bytes = @import "bytes.quip"
+}
+
+make type Array {
+    make data: ptr<char>
+    make length: uint
+    make capacity: uint
+}
+
+@unsafe
+make array_allocate (count: uint, size: uint) -> ptr<char> {
+    if size == 0 || count > 9223372036854775807 / size { os::exit(70) }
+
+    @unsafe make data: ptr<char> = memory::memory_allocate(count * size)
+    @unsafe make null: ptr<char> = 0
+
+    if data == null { os::exit(70) }
+
+    return data
+}
+
+@pub @unsafe @export "__quip_array_concat"
+make array_concat (result: ptr<Array>, left: ptr<Array>, right: ptr<Array>, size: uint) -> void {
+    make left_length: uint = left.*.length
+    make right_length: uint = right.*.length
+
+    if left_length > 9223372036854775807 - right_length { os::exit(70) }
+
+    make count = left_length + right_length
+    @unsafe make null: ptr<char> = 0
+    @unsafe make data: ptr<char> = null
+
+    if count > 0 && size > 0 {
+        data = array_allocate(count, size)
+        bytes::copy(data, left.*.data, left_length * size)
+        bytes::copy(data + left_length * size, right.*.data, right_length * size)
+    }
+
+    result.*.data = data
+    result.*.length = count
+    result.*.capacity = count
+}
+
+@pub @unsafe @export "__quip_dynamic_list_push"
+make array_push (value: ptr<Array>, item: ptr<char>, size: uint) -> void {
+    make length: uint = value.*.length
+    make capacity: uint = value.*.capacity
+
+    if length >= capacity {
+        if length > 4611686018427387903 { os::exit(70) }
+
+        make next: uint = length * 2
+
+        if next < 8 { next = 8 }
+
+        make data = array_allocate(next, size)
+        @unsafe make old: ptr<char> = value.*.data
+        bytes::copy(data, old, length * size)
+        // Copy the item while the old buffer is still alive: it may alias it.
+        bytes::move(data + length * size, item, size)
+
+        if capacity > 0 { memory::memory_free(old) }
+
+        value.*.data = data
+        value.*.capacity = next
+    } else { bytes::move(value.*.data + length * size, item, size) }
+
+    value.*.length = length + 1
+}
+
+@pub @unsafe @export "__quip_dynamic_list_pop"
+make array_pop (value: ptr<Array>) -> void {
+    if value.*.length == 0 { os::exit(70) }
+
+    value.*.length = value.*.length - 1
+}
+
+@pub @unsafe @export "__quip_dynamic_list_remove"
+make array_remove (value: ptr<Array>, index: uint, output: ptr<char>, size: uint) -> void {
+    make length: uint = value.*.length
+
+    if index >= length { os::exit(70) }
+
+    @unsafe make data: ptr<char> = value.*.data
+    bytes::copy(output, data + index * size, size)
+    bytes::move(data + index * size, data + (index + 1) * size, (length - index - 1) * size)
+    value.*.length = length - 1
+}
+
+@pub @unsafe @export "__quip_dynamic_list_free"
+make array_free (value: ptr<Array>) -> void {
+    if value.*.capacity > 0 { memory::memory_free(value.*.data) }
+
+    @unsafe make null: ptr<char> = 0
+    value.*.data = null
+    value.*.length = 0
+    value.*.capacity = 0
+}

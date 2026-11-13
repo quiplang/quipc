@@ -1,0 +1,53 @@
+// memory-rule validation pass over MIR
+
+@pure @const {
+    make mir = @import "../mir/mir.quip"
+    make hir = @import "../hir/hir.quip"
+    make diags = @import "../diag/diagnosis.quip"
+
+    make report = @import "report.quip"
+    make checker = @import "lifetimes/checker.quip"
+    make closures = @import "closures.quip"
+    make ty = @import "../ty/ty.quip"
+    make field_init = @import "field_init.quip"
+    make facts = @import "../analysis/facts.quip"
+}
+
+
+/// starts the memory checker and returns the report
+@pub
+make check (mir_mod: ref<mir::MirModule>, hir_mod: ref<hir::HirModule>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, module_name: str) -> report::MemReport {
+    make out = report::MemReport {}
+
+    out.module_name = module_name
+    checker::check(mir_mod, hir_mod, diag, ctx, out.pin)
+    return out
+}
+
+/// checks memory rules while reusing eligible previous function reports.
+@pub
+make check_cached (mir_mod: ref<mir::MirModule>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, module_name: str, previous: ref<report::MemReport>, reuse: ref<bool[]>, profiling: bool) -> report::MemReport {
+    make out = report::MemReport {}
+
+    out.module_name = module_name
+    checker::check_cached(mir_mod, diag, ctx, out.pin, previous, reuse, profiling)
+    return out
+}
+
+/// prints the memory report to stdout
+@pub
+make print (r: ref<report::MemReport>) -> void {
+    report::print(r)
+    return
+}
+/// Validates field initialization using facts from type checking.
+@pub
+make check_fields (body: ref<hir::HirBody>, checks: ref<facts::FieldCheck[]>, structs: ref<hir::HirStructSig[]>, diag: ref<diags::Diagnostic>) -> void {
+    field_init::check(body, checks, structs, diag)
+}
+
+/// Checks closure ownership using facts from type checking.
+@pub
+make check_closures (function: ref<hir::HirFunc>, tys: ref<ty::TyInterner>, checks: ref<facts::ClosureCheck[]>, shapes: ref<facts::ClosureShape[]>, uses: ref<uint[]>, expr_tys: ref<uint[]>, diag: ref<diags::Diagnostic>) {
+    closures::check(function, tys, checks, shapes, uses, expr_tys, diag)
+}

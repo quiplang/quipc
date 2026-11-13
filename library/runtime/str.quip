@@ -1,0 +1,239 @@
+@pure @const {
+    make bytes = @import "bytes.quip"
+    @target "macos" make os = @import "platform/macos.quip"
+    @target "linux" make os = @import "platform/linux.quip"
+}
+
+// The built-in str ABI is three eight-byte fields: data, length, capacity.
+// A zero capacity marks borrowed storage. Only allocation and process exit
+// cross the native boundary; all descriptor and byte operations are Quip.
+@pure @const make methods = @import "str_methods.quip"
+@pure @const make memory = @import "memory.quip"
+@unsafe @external make quip_heap_alloc (bytes: uint) -> ptr<char>
+@unsafe @external make quip_heap_free (data: ptr<char>) -> void
+
+@unsafe
+make str_allocate (length: int) -> ptr<char> {
+    @unsafe {
+        if length < 0 || length == 9223372036854775807 { os::exit(70) }
+
+        make data = quip_heap_alloc(length + 1)
+        make null: ptr<char> = 0
+
+        if data == null { os::exit(70) }
+
+        return data
+    }
+}
+
+@unsafe
+make str_copy_bytes (dst: ptr<char>, src: ptr<char>, length: int) {
+    @unsafe {
+        if length <= 0 { return }
+
+        @unsafe make count: uint = length
+        bytes::copy(dst, src, count)
+    }
+}
+
+@pub @unsafe @export "__quip_str_free"
+make str_free (value: ptr<str>) {
+    @unsafe {
+        if value.*.capacity > 0 { quip_heap_free(value.*.data) }
+
+        @unsafe make empty: ptr<char> = 0
+        value.*.data = empty
+        value.*.length = 0
+        value.*.capacity = 0
+    }
+}
+
+@pub @unsafe @export "__quip_str_copy"
+make str_copy (dst: ptr<str>, src: ptr<str>) {
+    @unsafe {
+        make length: int = src.*.length
+        make source: ptr<char> = src.*.data
+        make capacity: int = src.*.capacity
+
+        if capacity <= length { capacity = length + 1 }
+
+        make data = str_allocate(capacity - 1)
+        str_copy_bytes(data, source, length)
+        data[length] = '\0'
+        dst.*.data = data
+        dst.*.length = length
+        dst.*.capacity = capacity
+    }
+}
+
+@pub @unsafe @export "__quip_str_from_static"
+make str_from_static (dst: ptr<str>, source: ptr<char>, length: int) {
+    @unsafe {
+        make data = str_allocate(length)
+        str_copy_bytes(data, source, length)
+        data[length] = '\0'
+        dst.*.data = data
+        dst.*.length = length
+        dst.*.capacity = length + 1
+    }
+}
+
+// Native helpers for standard-library code that handles borrowed OS strings.
+@pub @unsafe @export "quip_runtime_string_free"
+make str_native_free (value: ptr<str>) -> void { str_free(value) }
+
+@pub @unsafe @export "quip_runtime_string_from_static"
+make str_native_from_static (value: ptr<str>, data: ptr<char>, length: int) -> void {
+    str_from_static(value, data, length)
+}
+
+@pub @unsafe @export "__quip_str_assign"
+make str_assign (dst: ptr<str>, src: ptr<str>, owner: ptr<int>) {
+    @unsafe {
+        make null: ptr<int> = 0
+
+        if owner != null && owner.* != 0 {
+            dst.*.data = src.*.data
+            dst.*.length = src.*.length
+            dst.*.capacity = src.*.capacity
+            @unsafe make empty: ptr<char> = 0
+            src.*.data = empty
+            src.*.length = 0
+            src.*.capacity = 0
+            owner.* = 0
+        } else { str_copy(dst, src) }
+    }
+}
+
+@pub @unsafe @export "__quip_str_make_owned"
+make str_make_owned (value: ptr<str>, owner: ptr<int>) {
+    @unsafe {
+        if owner.* == 0 { str_copy(value, value) owner.* = 1 }
+    }
+}
+
+@pub @unsafe @export "__quip_str_drop"
+make str_drop (value: ptr<str>, owner: ptr<int>) {
+    @unsafe {
+        if owner.* != 0 { str_free(value) }
+
+        owner.* = 0
+    }
+}
+
+@unsafe
+make str_grow (value: ptr<str>, length: int) {
+    @unsafe {
+        if length < 0 || length == 9223372036854775807 { os::exit(70) }
+
+        make capacity: int = value.*.capacity
+
+        if capacity > length { return }
+
+        make new_capacity: int = length + 1
+
+        if capacity <= 4611686018427387903 && capacity * 2 > new_capacity { new_capacity = capacity * 2 }
+
+        if new_capacity < 16 { new_capacity = 16 }
+
+        make data = str_allocate(new_capacity - 1)
+        make old: ptr<char> = value.*.data
+        make old_length: int = value.*.length
+        str_copy_bytes(data, old, old_length)
+        data[old_length] = '\0'
+
+        if capacity > 0 { quip_heap_free(old) }
+
+        value.*.data = data
+        value.*.capacity = new_capacity
+    }
+}
+
+@pub @unsafe @export "__quip_str_push_char"
+make str_push_char (value: ptr<str>, c: char) {
+    @unsafe {
+        make length: int = value.*.length
+
+        if length >= 9223372036854775806 { os::exit(70) }
+
+        str_grow(value, length + 1)
+        make data: ptr<char> = value.*.data
+        data[length] = c
+        data[length + 1] = '\0'
+        value.*.length = length + 1
+    }
+}
+
+@pub @unsafe @export "__quip_str_append"
+make str_append (value: ptr<str>, source: ptr<str>) {
+    @unsafe {
+        make length: int = value.*.length
+        make count: int = source.*.length
+
+        if count == 0 { return }
+
+        if count < 0 || length > 9223372036854775806 - count { os::exit(70) }
+
+        make src: ptr<char> = source.*.data
+        make old: ptr<char> = value.*.data
+        make alias = src == old
+        str_grow(value, length + count)
+
+        if alias { src = value.*.data }
+
+        make data: ptr<char> = value.*.data
+        str_copy_bytes(data + length, src, count)
+        data[length + count] = '\0'
+        value.*.length = length + count
+    }
+}
+
+@pub @unsafe @export "__quip_str_add_char"
+make str_add_char (dst: ptr<str>, source: ptr<str>, c: char) {
+    @unsafe {
+        if dst == source { str_push_char(dst, c) return }
+
+        make length: int = source.*.length
+
+        if length >= 9223372036854775806 { os::exit(70) }
+
+        make data = str_allocate(length + 1)
+        str_copy_bytes(data, source.*.data, length)
+        data[length] = c
+        data[length + 1] = '\0'
+        dst.*.data = data
+        dst.*.length = length + 1
+        dst.*.capacity = length + 2
+    }
+}
+
+@pub @unsafe @export "__quip_str_concat"
+make str_concat (dst: ptr<str>, left: ptr<str>, right: ptr<int>) {
+    @unsafe {
+        // The native concat argument is { i32 tag, padding, descriptor pointer }.
+        // Both str and String have data and length in the same first two slots.
+        make tag: ptr<i32> = right
+
+        if tag.* != 0 && tag.* != 1 { os::exit(100) }
+
+        make raw: ptr<char> = right
+        make payload: ptr<ptr<str>> = raw + 8
+        make suffix: ptr<str> = payload.*
+
+        if dst == left { str_append(dst, suffix) return }
+
+        make left_length: int = left.*.length
+        make right_length: int = suffix.*.length
+
+        if right_length < 0 || left_length > 9223372036854775806 - right_length { os::exit(70) }
+
+        make length: int = left_length + right_length
+        make data = str_allocate(length)
+        str_copy_bytes(data, left.*.data, left_length)
+        str_copy_bytes(data + left_length, suffix.*.data, right_length)
+        data[length] = '\0'
+        dst.*.data = data
+        dst.*.length = length
+        dst.*.capacity = length + 1
+    }
+}

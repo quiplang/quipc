@@ -1,0 +1,582 @@
+@pure @const {
+    @target "macos" make os = @import "../os/macos.quip"
+    @target "linux" make os = @import "../os/linux.quip"
+}
+
+@pub
+make enum ValueKind {
+    Null,
+    Bool,
+    Int,
+    Float,
+    Text,
+    Array,
+    Object,
+}
+
+@pub @pure @const
+make ValueData: Type = variant<bool, int, float, str, Value[], Member[]>
+
+@pub
+make type Value {
+
+    @pub {
+        make kind: ValueKind = ValueKind.Null
+        make data: ValueData? = none
+    }
+
+    @pub @this
+    make is_null () -> bool { return this.kind == ValueKind.Null }
+
+    // Variant matches bind by value. Return an independent copy of the child.
+    @pub @this
+    make get (key: str) -> !Value {
+        if this.kind != ValueKind.Object { return error.ExpectedObject }
+
+        match this.data {
+            some {
+                match some {
+                    members: Member[] {
+                        make i: uint = 0
+                        while i < members.len() {
+                            if members[i].key == key { return members[i].value.copy() }
+
+                            i = i + 1
+                        }
+
+                        return error.KeyNotFound
+                    }
+                    _ {}
+                }
+            }
+            none {}
+        }
+        return error.InvalidValue
+    }
+
+    @pub @this
+    make at (index: uint) -> !Value {
+        if this.kind != ValueKind.Array { return error.ExpectedArray }
+
+        match this.data {
+            some {
+                match some {
+                    values: Value[] {
+                        if index >= values.len() { return error.IndexOutOfBounds }
+
+                        return values[index].copy()
+                    }
+                    _ {}
+                }
+            }
+            none {}
+        }
+        return error.InvalidValue
+    }
+
+    @pub @this
+    make len () -> !uint {
+        match this.data {
+            some {
+                match some {
+                    a: Value[] { @unsafe return a.len() }
+                    o: Member[] { @unsafe return o.len() }
+                    _ {}
+                }
+            }
+            none {}
+        }
+        return error.ExpectedContainer
+    }
+
+    @pub @this
+    make text () -> !str {
+        if this.kind != ValueKind.Text { return error.ExpectedText }
+
+        match this.data {
+            some { match some { t: str { return t.copy() } _ {} } }
+            none {}
+        }
+        return error.InvalidValue
+    }
+
+    @pub @this
+    make boolean () -> !bool {
+        if this.kind != ValueKind.Bool { return error.ExpectedBool }
+
+        match this.data {
+            some { match some { b: bool { return b } _ {} } }
+            none {}
+        }
+        return error.InvalidValue
+    }
+
+    @pub @this
+    make integer () -> !int {
+        if this.kind != ValueKind.Int { return error.ExpectedInt }
+
+        match this.data {
+            some { match some { n: int { return n } _ {} } }
+            none {}
+        }
+        return error.InvalidValue
+    }
+
+    @pub @this
+    make number () -> !float {
+        if this.kind != ValueKind.Float { return error.ExpectedFloat }
+
+        match this.data {
+            some { match some { n: float { return n } _ {} } }
+            none {}
+        }
+        return error.InvalidValue
+    }
+
+    @pub @this
+    make copy () -> Value {
+        make result = Value { kind = this.kind }
+        match this.data {
+            some {
+                make payload: ValueData = match some {
+                    b: bool => b
+                    n: int => n
+                    f: float => f
+                    t: str => t.copy()
+                    a: Value[] => copy_array(a)
+                    o: Member[] => copy_members(o)
+                }
+                result.data = payload
+            }
+            none {}
+        }
+        return result
+    }
+}
+
+@pub
+make type Member {
+    @pub {
+        make key: str
+        make value: Value
+    }
+}
+
+
+@pub
+make type Parser {
+
+    @pub {
+        make source: str
+        make pos: uint = 0
+        make depth: uint = 0
+        make max_depth: uint = 128
+    }
+
+
+    @pub
+    make create (source: str) -> Parser {
+        return Parser { source = source }
+    }
+
+    @this
+    make skip_whitespace () {
+        while this.pos < this.source.len() {
+            make c = this.source[this.pos]
+
+            if c != ' ' && c != '\t' && c != '\r' && c != '\n' { return }
+
+            this.pos = this.pos + 1
+        }
+    }
+
+    @this
+    make peek () -> char? {
+        if this.pos >= this.source.len() { return none }
+
+        return this.source[this.pos]
+    }
+
+    @this
+    make advance () -> !char {
+        if this.pos >= this.source.len() { return error.UnexpectedEnd }
+
+        make c = this.source[this.pos]
+        this.pos = this.pos + 1
+        return c
+    }
+
+    @this
+    make expect (expected: char) -> !void {
+        make c = this.advance() catch err { return err }
+
+        if c != expected { return error.UnexpectedCharacter }
+    }
+
+    @this
+    make expect_lit (expected: str) -> !void {
+        make i: uint = 0
+        while i < expected.len() {
+            this.expect(expected[i]) catch err { return err }
+            i = i + 1
+        }
+    }
+
+    // Reset for each parse. On failure pos identifies where parsing stopped.
+    @pub @this
+    make parse () -> !Value {
+        this.pos = 0
+        this.depth = 0
+        make value = this.parse_value() catch err { return err }
+        this.skip_whitespace()
+
+        if this.pos != this.source.len() { return error.TrailingInput }
+
+        return value
+    }
+
+    @this
+    make parse_value () -> !Value {
+        this.skip_whitespace()
+
+        if this.pos >= this.source.len() { return error.UnexpectedEnd }
+
+        make c = this.source[this.pos]
+
+        if c == 'n' {
+            this.expect_lit("null") catch err { return err }
+            return Value {}
+        }
+
+        if c == 't' || c == 'f' {
+            make b = c == 't'
+
+            if b { this.expect_lit("true") catch err { return err } }
+            else { this.expect_lit("false") catch err { return err } }
+
+            make payload: ValueData = b
+            return Value { kind = ValueKind.Bool, data = payload }
+        }
+
+        if c == '"' {
+            make text = this.parse_string() catch err { return err }
+            make payload: ValueData = text
+            return Value { kind = ValueKind.Text, data = payload }
+        }
+
+        if c == '[' || c == '{' {
+            if this.depth >= this.max_depth { return error.NestingTooDeep }
+
+            this.depth = this.depth + 1
+            make result = this.parse_container(c) catch err {
+                this.depth = this.depth - 1
+                return err
+            }
+            this.depth = this.depth - 1
+            return result
+        }
+
+        if c == '-' || (c >= '0' && c <= '9') { return this.parse_number() }
+
+        return error.UnexpectedCharacter
+    }
+
+    @this
+    make parse_container (open: char) -> !Value {
+        this.pos = this.pos + 1
+        make values: Value[] = []
+        make members: Member[] = []
+        make close: char = ']'
+
+        if open == '{' { close = '}' }
+
+        this.skip_whitespace()
+
+        if this.pos < this.source.len() && this.source[this.pos] == close {
+            this.pos = this.pos + 1
+        } else {
+            while true {
+                this.skip_whitespace()
+
+                if open == '{' {
+                    make key = this.parse_string() catch err { return err }
+                    // Reject duplicates rather than silently losing a member.
+                    make i: uint = 0
+                    while i < members.len() {
+                        if members[i].key == key { return error.DuplicateKey }
+
+                        i = i + 1
+                    }
+
+                    this.skip_whitespace()
+                    this.expect(':') catch err { return err }
+                    make child = this.parse_value() catch err { return err }
+                    members.push(Member { key = key, value = child })
+                } else {
+                    make child = this.parse_value() catch err { return err }
+                    values.push(child)
+                }
+
+                this.skip_whitespace()
+                make delimiter = this.advance() catch err { return err }
+
+                if delimiter == close { break }
+
+                if delimiter != ',' { return error.UnexpectedCharacter }
+            }
+        }
+
+        if open == '{' {
+            make payload: ValueData = members
+            return Value { kind = ValueKind.Object, data = payload }
+        }
+
+        make payload: ValueData = values
+            return Value { kind = ValueKind.Array, data = payload }
+    }
+
+    @this
+    make parse_hex4 () -> !uint {
+        make value: uint = 0
+        make i: uint = 0
+        while i < 4 {
+            make c = this.advance() catch err { return err }
+            @unsafe make digit: uint = c
+
+            if c >= '0' && c <= '9' { digit = digit - 48 }
+            elif c >= 'a' && c <= 'f' { digit = digit - 87 }
+            elif c >= 'A' && c <= 'F' { digit = digit - 55 }
+            else { return error.InvalidUnicodeEscape }
+
+            value = value * 16 + digit
+            i = i + 1
+        }
+
+        return value
+    }
+
+    @this
+    make parse_string () -> !str {
+        this.expect('"') catch err { return err }
+        make text: str = ""
+
+        while true {
+            make c = this.advance() catch err { return err }
+
+            if c == '"' { return text }
+
+            @unsafe make byte: uint = c
+
+            if byte < 32 { return error.InvalidString }
+
+            if c == '\\' {
+                make escape = this.advance() catch err { return err }
+
+                if escape == '"' || escape == '\\' || escape == '/' { text.push(escape) }
+                elif escape == 'b' { @unsafe make b: char = 8 text.push(b) }
+                elif escape == 'f' { @unsafe make b: char = 12 text.push(b) }
+                elif escape == 'n' { text.push('\n') }
+                elif escape == 'r' { text.push('\r') }
+                elif escape == 't' { text.push('\t') }
+                elif escape == 'u' {
+                    make code = this.parse_hex4() catch err { return err }
+
+                    if code >= 55296 && code <= 56319 {
+                        this.expect('\\') catch err { return err }
+                        this.expect('u') catch err { return err }
+                        make low = this.parse_hex4() catch err { return err }
+
+                        if low < 56320 || low > 57343 { return error.InvalidUnicodeEscape }
+
+                        code = 65536 + (code - 55296) * 1024 + low - 56320
+                    } elif code >= 56320 && code <= 57343 { return error.InvalidUnicodeEscape }
+
+                    append_utf8(text.pin, code)
+                } else { return error.InvalidEscape }
+            } elif byte < 128 { text.push(c) }
+            else {
+                // Validate and retain raw UTF-8, rejecting overlong sequences and surrogates.
+                make count: uint = 0
+                make code: uint = 0
+                make minimum: uint = 0
+
+                if byte >= 194 && byte <= 223 { count = 1 code = byte - 192 minimum = 128 }
+                elif byte >= 224 && byte <= 239 { count = 2 code = byte - 224 minimum = 2048 }
+                elif byte >= 240 && byte <= 244 { count = 3 code = byte - 240 minimum = 65536 }
+                else { return error.InvalidUtf8 }
+
+                text.push(c)
+                make i: uint = 0
+                while i < count {
+                    make next = this.advance() catch err { return err }
+                    @unsafe make part: uint = next
+
+                    if part < 128 || part > 191 { return error.InvalidUtf8 }
+
+                    code = code * 64 + part - 128
+                    text.push(next)
+                    i = i + 1
+                }
+
+                if code < minimum || code > 1114111 || (code >= 55296 && code <= 57343) {
+                    return error.InvalidUtf8
+                }
+            }
+        }
+    }
+
+    @this
+    make digits () -> bool {
+        if this.pos >= this.source.len() { return false }
+
+        make c = this.source[this.pos]
+        return c >= '0' && c <= '9'
+    }
+
+    @this
+    make parse_number () -> !Value {
+        make token: str = ""
+        make negative = false
+
+        if this.source[this.pos] == '-' {
+            negative = true
+            token.push('-')
+            this.pos = this.pos + 1
+        }
+
+        if !this.digits() { return error.InvalidNumber }
+
+        if this.source[this.pos] == '0' {
+            token.push('0')
+            this.pos = this.pos + 1
+
+            if this.digits() { return error.InvalidNumber }
+        } else {
+            while this.digits() { token.push(this.source[this.pos]) this.pos = this.pos + 1 }
+        }
+
+        make floating = false
+
+        if this.pos < this.source.len() && this.source[this.pos] == '.' {
+            floating = true
+            token.push('.')
+            this.pos = this.pos + 1
+
+            if !this.digits() { return error.InvalidNumber }
+
+            while this.digits() { token.push(this.source[this.pos]) this.pos = this.pos + 1 }
+        }
+
+        if this.pos < this.source.len() && (this.source[this.pos] == 'e' || this.source[this.pos] == 'E') {
+            floating = true
+            token.push(this.source[this.pos])
+            this.pos = this.pos + 1
+
+            if this.pos < this.source.len() && (this.source[this.pos] == '+' || this.source[this.pos] == '-') {
+                token.push(this.source[this.pos])
+                this.pos = this.pos + 1
+            }
+
+            if !this.digits() { return error.InvalidNumber }
+
+            while this.digits() { token.push(this.source[this.pos]) this.pos = this.pos + 1 }
+        }
+
+        if floating {
+            token.push('\0')
+            @unsafe make end: ptr<ptr<char>> = 0
+            @unsafe make number: float = os::strtod(token.data, end)
+
+            // NaN cannot occur with the validated grammar. Reject infinities.
+            if number != 0.0 && number + number == number {
+                return error.NumberOutOfRange
+            }
+
+            make payload: ValueData = number
+            return Value { kind = ValueKind.Float, data = payload }
+        }
+
+        // Accumulate negatively so the minimum signed integer is representable.
+        make number: int = 0
+        make i: uint = 0
+
+        if negative { i = 1 }
+
+        make last: int = 7
+
+        if negative { last = 8 }
+
+        while i < token.len() {
+            @unsafe make digit: int = token[i]
+            digit = digit - 48
+
+            if number < -922337203685477580 || (number == -922337203685477580 && digit > last) {
+                return error.NumberOutOfRange
+            }
+
+            number = number * 10 - digit
+            i = i + 1
+        }
+
+        if !negative { number = -number }
+
+        make payload: ValueData = number
+            return Value { kind = ValueKind.Int, data = payload }
+    }
+}
+
+make append_utf8 (text: ref<str>, code: uint) {
+    if code < 128 {
+        @unsafe make b: char = code
+        text.*.push(b)
+    } elif code < 2048 {
+        @unsafe make a: char = 192 + code / 64
+        @unsafe make b: char = 128 + code % 64
+        text.*.push(a)
+        text.*.push(b)
+    } elif code < 65536 {
+        @unsafe make a: char = 224 + code / 4096
+        @unsafe make b: char = 128 + (code / 64) % 64
+        @unsafe make c: char = 128 + code % 64
+        text.*.push(a)
+        text.*.push(b)
+        text.*.push(c)
+    } else {
+        @unsafe make a: char = 240 + code / 262144
+        @unsafe make b: char = 128 + (code / 4096) % 64
+        @unsafe make c: char = 128 + (code / 64) % 64
+        @unsafe make d: char = 128 + code % 64
+        text.*.push(a)
+        text.*.push(b)
+        text.*.push(c)
+        text.*.push(d)
+    }
+}
+
+@pub
+make parse (source: str) -> !Value {
+    make parser = Parser.create(source)
+    return parser.parse()
+}
+
+make copy_array (values: Value[]) -> Value[] {
+    make result: Value[] = []
+    make i: uint = 0
+    while i < values.len() {
+        result.push(values[i].copy())
+        i = i + 1
+    }
+
+    return result
+}
+
+make copy_members (members: Member[]) -> Member[] {
+    make result: Member[] = []
+    make i: uint = 0
+    while i < members.len() {
+        result.push(Member { key = members[i].key.copy(), value = members[i].value.copy() })
+        i = i + 1
+    }
+
+    return result
+}

@@ -1,0 +1,1096 @@
+// forward transfer function: walks one block and updates the liveness state,
+// reporting errors only when `emit` is set
+
+@pure @const {
+    make mir = @import "../../mir/mir.quip"
+    make util = @import "../../util/pkg.quip"
+    make diags = @import "../../diag/diagnosis.quip"
+
+    make lgraph = @import "graph.quip"
+    make state = @import "liveness.quip"
+    make errors = @import "errors.quip"
+    make report = @import "../report.quip"
+    make obls = @import "../obligations.quip"
+}
+
+make starts_with (s: str, prefix: str) -> bool {
+    if prefix.len() > s.len() { return false }
+
+    make i: uint = 0
+
+    while i < prefix.len() {
+        if s[i] != prefix[i] { return false }
+
+        i = i + 1
+    }
+
+    return true
+}
+
+make contains_text (s: str, needle: str) -> bool {
+    if needle.len() == 0 { return true }
+
+    if needle.len() > s.len() { return false }
+
+    make i = 0
+    while i + needle.len() <= s.len() {
+        make j = 0
+        while j < needle.len() && s[i + j] == needle[j] { j = j + 1 }
+
+        if j == needle.len() { return true }
+
+        i = i + 1
+    }
+
+    return false
+}
+
+/// copies a string up to the supplied end offset.
+make slice_to (s: str, end: uint) -> str {
+    make out: str = ""
+    make i: uint = 0
+
+    while i < end {
+        out = out + s[i]
+        i = i + 1
+    }
+
+    return out
+}
+
+// A path must contain at least one edge, including when start == target.
+make reachable (body: ref<mir::MirBody>, start: uint, target: uint) -> bool {
+    if start >= body.*.terms.len() || target >= body.*.terms.len() { return false }
+
+    make seen: uint[] = []
+    make queue: uint[] = []
+    make i = 0
+    while i < body.*.terms.len() { seen.push(0) i = i + 1 }
+
+    seen[start] = 1
+    queue.push(start)
+    i = 0
+
+    while i < queue.len() {
+        make term = body.*.terms[queue[i]].pin
+        make edges: uint[] = []
+
+        if term.*.kind == mir::MirTermKind.Goto || term.*.kind == mir::MirTermKind.Call { edges.push(term.*.target) }
+        elif term.*.kind == mir::MirTermKind.Branch { edges.push(term.*.target) edges.push(term.*.other) }
+
+        make j = 0
+        while j < edges.len() {
+            make next = edges[j]
+
+            if next == target { return true }
+
+            if next < seen.len() && seen[next] == 0 { seen[next] = 1 queue.push(next) }
+
+            j = j + 1
+        }
+
+        i = i + 1
+    }
+
+    return false
+}
+
+make site_block (body: ref<mir::MirBody>, site: uint) -> uint {
+    if site == 0 { return body.*.terms.len() }
+
+    make index = site / 2 - 1
+
+    if site % 2 != 0 { return index }
+
+    if index < body.*.stmts.len() { return body.*.stmts[index].block }
+
+    return body.*.terms.len()
+}
+
+/// applies lifetime and ownership transfer rules to mir control flow.
+@pub
+make type Infer {
+    make current_site: uint = 0
+    make body: ref<mir::MirBody>
+    make graph: ref<lgraph::LivenessGraph>
+    make diag: ref<diags::Diagnostic>
+    make ctx: ref<report::MemContext>
+    make fr: ref<report::MemFuncReport>
+    @pub make emit: bool = false
+    make structs: ref<mir::MirStruct[]>
+    make funcs: ref<mir::MirFunc[]>
+
+    @pub
+    make create (body: ref<mir::MirBody>, g: ref<lgraph::LivenessGraph>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, fr: ref<report::MemFuncReport>, structs: ref<mir::MirStruct[]>, funcs: ref<mir::MirFunc[]>) -> Infer {
+        make it = Infer { body = body, graph = g, diag = diag, ctx = ctx, fr = fr, structs = structs, funcs = funcs }
+
+        return it
+    }
+
+    /// reports a diagnostic during the reporting pass.
+    @this
+    make note (d: owned<diags::Diag>) -> void {
+        if !this.emit {
+            return
+        }
+
+        this.diag.*.report(d)
+        return
+    }
+
+    @this
+    make report_local (d: owned<diags::Diag>, local: uint, st: ref<state::LocalState>) {
+        if !this.emit { return }
+
+        if local < this.body.*.locals.len() {
+            d.attach(diags::Label.create(this.body.*.locals[local].range.copy(), "`" + errors::local_name(this.body, local) + "` declared here"))
+        }
+
+        if local < st.*.moved.len() && d.*.code == "E2003" {
+            d.attach(diags::Label.create(errors::move_event_range(this.body, st.*.move_site[local], local), "ownership was moved here"))
+            d.note("passing or assigning an owning value transfers ownership; an explicit copy must be supported by its type")
+        }
+
+        if local < st.*.dead.len() && d.*.code == "E2008" {
+            d.attach(diags::Label.create(errors::event_range(this.body, st.*.dead_site[local]), "this storage was left here"))
+        }
+
+        if d.*.code == "E2002" || d.*.code == "E2005" || d.*.code == "E2006" || d.*.code == "E2007" {
+            make i: uint = 0
+
+            while i < this.graph.*.pins.len() {
+                make pin = this.graph.*.pins[i].pin
+
+                if pin.*.src == local && pin.*.holder < this.graph.*.nlocals && (pin.*.index + 1) * 2 == st.*.pin_site[local] {
+                    make holder = pin.*.holder
+
+                    if st.*.alive[holder] != 0 || st.*.pinned[holder] != 0 {
+                        make name = errors::reference_carrier_name(this.body, this.graph, holder)
+
+                        if name.len() > 0 {
+                            d.attach(diags::Label.create(pin.*.range.copy(), "active pin created here; the reference is carried by `" + name.copy() + "`"))
+                            d.attach(diags::Label.create(errors::last_use_range(this.body, this.graph, holder), "reference remains active until after this last use of `" + name + "`"))
+                        } else {
+                            d.attach(diags::Label.create(pin.*.range.copy(), "active pin created here"))
+                            d.attach(diags::Label.create(errors::last_use_range(this.body, this.graph, holder), "reference remains active until after this use"))
+                        }
+
+                        break
+                    }
+                }
+
+                i = i + 1
+            }
+
+            d.note("a pin ends after its reference's last reachable use; the conflicting operation must happen after that use")
+        }
+
+        this.note(d)
+    }
+
+    // non-consuming read of a local
+    @this
+    make use_local (local: uint, st: ref<state::LocalState>, range: util::Range) -> void {
+        // the fixpoint pass only propagates state; diagnostics are emitted later.
+        if !this.emit { return }
+
+        if local >= this.graph.*.nlocals {
+            return
+        }
+
+        if st.*.moved[local] != 0 {
+            make move_range = errors::move_event_range(this.body, st.*.move_site[local], local)
+            make move_block = site_block(this.body, st.*.move_site[local])
+            make use_block = site_block(this.body, this.current_site)
+
+            if move_range.start.start >= range.start.start && reachable(this.body, move_block, use_block) && reachable(this.body, use_block, move_block) {
+                make d = errors::after_loop_move(this.body, range.copy(), local)
+                d.attach(diags::Label.create(this.body.*.locals[local].range.copy(), "value declared here is used across loop iterations"))
+                d.attach(diags::Label.create(move_range, "value is moved here; a later iteration may use it again"))
+                this.note(d)
+            } else {
+                this.report_local(errors::after_move(this.body, range.copy(), local), local, st)
+            }
+
+            return
+        }
+
+        if st.*.uninit[local] != 0 {
+            this.report_local(errors::uninitialized(this.body, range.copy(), local), local, st)
+            return
+        }
+
+        if st.*.alive[local] != 0 || st.*.pinned[local] != 0 { return }
+
+        if st.*.dead[local] != 0 {
+            this.report_local(errors::after_scope(this.body, range.copy(), local), local, st)
+            return
+        }
+
+        return
+    }
+
+    // pointers, references and scalars are copied on use; only owning values can be moved.
+    // an unknown type is treated as a copy so missing inference never invents a move.
+    @this
+    make is_copy_local (local: uint) -> bool {
+        if local >= this.body.*.locals.len() {
+            return true
+        }
+
+        if this.body.*.locals[local].is_copy {
+            return true
+        }
+
+        make t = this.body.*.locals[local].ty !
+
+        if t.len() == 0 { return true }
+
+        if t.len() > 0 && t[t.len() - 1] == '?' {
+            t = slice_to(t, t.len() - 1)
+        }
+
+        if starts_with(t !, "ptr<") || starts_with(t !, "ref<") || starts_with(t !, "pin<") {
+            return true
+        }
+
+        return t == "int" || t == "uint" || t == "bool" || t == "char" || t == "float"
+            || t == "i8" || t == "i16" || t == "i32" || t == "i64"
+            || t == "u8" || t == "u16" || t == "u32" || t == "u64"
+            || t == "f32" || t == "f64"
+    }
+
+    // release pins immediately after the holder's final use. this is the local,
+    // control-flow-safe form of the release table: the last use may be a statement
+    // in the middle of a block or an operand of the terminator, and temporary pin
+    // holders (for example `f(x.pin)`) often have no StorageDead at all.
+    @this
+    make release_pins_at (index: uint, block: uint, in_term: uint, st: ref<state::LocalState>) -> void {
+        make k = 0
+
+        while k < this.graph.*.pins.len() {
+            make pe = this.graph.*.pins[k].pin
+            make h = pe.*.holder
+
+            if !pe.*.scope_lifetime && h < this.graph.*.nlocals && this.graph.*.last[h] == index && this.graph.*.last_block[h] == block && this.graph.*.last_in_term[h] == in_term && pe.*.src < this.graph.*.nlocals {
+                st.*.active_pins[k] = 0
+                this.refresh_pin(pe.*.src, st)
+            }
+
+            k = k + 1
+        }
+
+        return
+    }
+
+    // a source is only pinned while at least one of its pin holders is still live;
+    // dataflow states are merged, so a stale bit must not outlive the holder's scope
+    @this
+    make pin_holder_live (src: uint, st: ref<state::LocalState>) -> bool {
+        make k = 0
+        while k < this.graph.*.pins.len() {
+            if this.graph.*.pins[k].src == src && st.*.active_pins[k] != 0 { return true }
+
+            k = k + 1
+        }
+
+        return false
+    }
+
+    @this
+    make refresh_pin (src: uint, st: ref<state::LocalState>) -> void {
+        if this.pin_holder_live(src, st) { st.*.pinned[src] = 1 }
+        else { st.*.pinned[src] = 0 st.*.pin_site[src] = 0 }
+    }
+
+    // Two places with a different field in the same struct are disjoint.
+    // Index projections remain conservative because indices can alias.
+    @this
+    make conflicts_with_pin (place: ref<mir::MirPlace>, st: ref<state::LocalState>) -> bool {
+        return this.conflicts_with_pin_depth(place, st, 0, this.graph.*.pins.len())
+    }
+
+    @this
+    make conflicts_with_pin_depth (place: ref<mir::MirPlace>, st: ref<state::LocalState>, depth: uint, origin_pin: uint) -> bool {
+        if depth >= this.graph.*.nlocals { return true }
+
+        make pi = 0
+        while pi < this.graph.*.pins.len() {
+            make pin = this.graph.*.pins[pi].pin
+
+            if pi != origin_pin && st.*.active_pins[pi] != 0 && pin.*.src == place.*.local {
+                make field = 0
+                make different = false
+                make pj = 0
+
+                while pj < place.*.projs.len() {
+                    if place.*.projs[pj].kind == mir::MirProjKind.Index { break }
+
+                    if place.*.projs[pj].kind == mir::MirProjKind.Field {
+                        if field < pin.*.field_path.len() && pin.*.field_path[field] != place.*.projs[pj].name { different = true break }
+
+                        field = field + 1
+                    }
+
+                    pj = pj + 1
+                }
+
+                if !different { return true }
+            }
+
+            pi = pi + 1
+        }
+
+        // A reference local may point at a pinned collection. Resolve every
+        // active origin, not just one, because branches can merge aliases.
+        pi = 0
+
+        while pi < this.graph.*.pins.len() {
+            make origin = this.graph.*.pins[pi].pin
+
+            if st.*.active_pins[pi] != 0 && origin.*.holder == place.*.local && origin.*.src != place.*.local {
+                make original = mir::MirPlace {}
+                original.local = origin.*.src
+                make j = 0
+                while j < origin.*.field_path.len() {
+                    make field = mir::MirProj {}
+                    field.kind = mir::MirProjKind.Field
+                    field.name = origin.*.field_path[j].copy()
+                    original.projs.push(field)
+                    j = j + 1
+                }
+
+                j = 0
+
+                while j < place.*.projs.len() {
+                    if place.*.projs[j].kind != mir::MirProjKind.Deref {
+                        make copy = mir::MirProj {}
+                        copy.kind = place.*.projs[j].kind
+                        copy.name = place.*.projs[j].name.copy()
+                        copy.index = place.*.projs[j].index
+                        original.projs.push(copy)
+                    }
+
+                    j = j + 1
+                }
+
+                if this.conflicts_with_pin_depth(original.pin, st, depth + 1, pi) { return true }
+            }
+
+            pi = pi + 1
+        }
+
+        return false
+    }
+
+    // Map a callee's access through a parameter onto the caller's place.
+    @this
+    make effect_place (base: ref<mir::MirPlace>, access: ref<mir::MirPlace>) -> mir::MirPlace {
+        make out = mir::MirPlace {}
+        out.local = base.*.local
+        make i = 0
+        while i < base.*.projs.len() {
+            make p = mir::MirProj {}
+            p.kind = base.*.projs[i].kind
+            p.name = base.*.projs[i].name.copy()
+            p.index = base.*.projs[i].index
+            out.projs.push(p)
+            i = i + 1
+        }
+
+        i = 0
+
+        while i < access.*.projs.len() {
+            if access.*.projs[i].kind != mir::MirProjKind.Deref {
+                make p = mir::MirProj {}
+                p.kind = access.*.projs[i].kind
+                p.name = access.*.projs[i].name.copy()
+                p.index = access.*.projs[i].index
+                out.projs.push(p)
+            }
+
+            i = i + 1
+        }
+
+        return out
+    }
+
+    @this
+    make alias_effect_place (base: ref<mir::MirPlace>, field: str, access: ref<mir::MirPlace>) -> mir::MirPlace {
+        make prefix = mir::MirPlace {}
+
+        if field.len() > 0 && field != "?" {
+            make p = mir::MirProj {}
+            p.kind = mir::MirProjKind.Field
+            p.name = field.copy()
+            prefix.projs.push(p)
+        }
+
+        make combined = this.effect_place(base, prefix.pin)
+
+        if field == "?" { return combined }
+
+        return this.effect_place(combined.pin, access)
+    }
+
+    // Infer writes through arguments for bodies in this MIR module. Read-only
+    // local bodies stay usable; cross-module effects need separate summaries.
+    @this
+    make call_mutates_pin (name: str, argument: uint, caller: ref<mir::MirPlace>, st: ref<state::LocalState>, depth: uint, trail: str) -> bool {
+        if name == "__quip_builtin.len" || name == "__quip_builtin.opt.unwrap" || name == "__quip_builtin.fal.unwrap" { return false }
+
+        if starts_with(name.copy(), "__quip_builtin.") { return true }
+
+        if depth >= 16 { return true }
+
+        make marker = "|" + name.copy() + "#" + argument.to_str()
+        make mpi = 0
+        while mpi < caller.*.projs.len() {
+            if caller.*.projs[mpi].kind == mir::MirProjKind.Field { marker = marker + "." + caller.*.projs[mpi].name.copy() }
+            elif caller.*.projs[mpi].kind == mir::MirProjKind.Index { marker = marker + "[]" }
+
+            mpi = mpi + 1
+        }
+
+        marker = marker + "|"
+
+        if contains_text(trail.copy(), marker.copy()) { return false }
+
+        trail = trail + marker
+        make fi = 0
+        while fi < this.funcs.*.len() && this.funcs.*[fi].name != name { fi = fi + 1 }
+
+        // Cross-module and external effects are not yet available here.
+        if fi >= this.funcs.*.len() || this.funcs.*[fi].is_external { return false }
+
+        make body = this.funcs.*[fi].body.pin
+        make formal = argument + 1
+
+        if formal >= body.*.locals.len() || argument >= body.*.param_count { return true }
+
+        make aliases: uint[] = []
+        make alias_fields: str[] = []
+        make i = 0
+        while i < body.*.locals.len() { aliases.push(0) alias_fields.push("") i = i + 1 }
+
+        aliases[formal] = 1
+        make changed = true
+
+        while changed {
+            changed = false
+            i = 0
+
+            while i < body.*.stmts.len() {
+                make stmt = body.*.stmts[i].pin
+
+                if stmt.*.kind == mir::MirStmtKind.Assign && stmt.*.place.projs.len() == 0 && stmt.*.place.local < aliases.len() && starts_with(body.*.locals[stmt.*.place.local].ty.copy(), "ref<") {
+                    make rv = stmt.*.rvalue.pin
+                    make src = aliases.len()
+                    make first: str = ""
+
+                    if rv.*.kind == mir::MirRvalueKind.Pin {
+                        src = rv.*.place.local
+                        make pj = 0
+
+                        while pj < rv.*.place.projs.len() {
+                            if rv.*.place.projs[pj].kind == mir::MirProjKind.Field { first = rv.*.place.projs[pj].name.copy() break }
+
+                            pj = pj + 1
+                        }
+                    } elif rv.*.kind == mir::MirRvalueKind.Use && (rv.*.a.kind == mir::MirOperandKind.Copy || rv.*.a.kind == mir::MirOperandKind.Move) { src = rv.*.a.place.local }
+
+                    if src < aliases.len() && aliases[src] != 0 {
+                        if alias_fields[src].len() > 0 { first = alias_fields[src].copy() }
+
+                        make dest = stmt.*.place.local
+
+                        if aliases[dest] == 0 { aliases[dest] = 1 alias_fields[dest] = first changed = true }
+                        elif alias_fields[dest] != first && alias_fields[dest] != "?" { alias_fields[dest] = "?" changed = true }
+                    }
+                }
+
+                i = i + 1
+            }
+
+            i = 0
+
+            while i < body.*.terms.len() {
+                make call = body.*.terms[i].pin
+
+                if call.*.kind == mir::MirTermKind.Call && starts_with(call.*.ret_ty.copy(), "ref<") && call.*.dest.local < aliases.len() && aliases[call.*.dest.local] == 0 {
+                    make ai = 0
+                    while ai < call.*.args.len() {
+                        make arg = call.*.args[ai].pin
+
+                        if (arg.*.kind == mir::MirOperandKind.Copy || arg.*.kind == mir::MirOperandKind.Move) && arg.*.place.local < aliases.len() && aliases[arg.*.place.local] != 0 {
+                            aliases[call.*.dest.local] = 1
+                            changed = true
+                        }
+
+                        ai = ai + 1
+                    }
+                }
+
+                i = i + 1
+            }
+        }
+
+        i = 0
+
+        while i < body.*.stmts.len() {
+            make stmt = body.*.stmts[i].pin
+
+            if stmt.*.kind == mir::MirStmtKind.Assign && stmt.*.place.projs.len() > 0 && stmt.*.place.local < aliases.len() && aliases[stmt.*.place.local] != 0 {
+                if stmt.*.place.local == formal {
+                    make place = this.effect_place(caller, stmt.*.place.pin)
+
+                    if this.conflicts_with_pin(place.pin, st) { return true }
+                } else {
+                    make place = this.alias_effect_place(caller, alias_fields[stmt.*.place.local].copy(), stmt.*.place.pin)
+
+                    if this.conflicts_with_pin(place.pin, st) { return true }
+                }
+            }
+
+            i = i + 1
+        }
+
+        i = 0
+
+        while i < body.*.terms.len() {
+            make call = body.*.terms[i].pin
+
+            if call.*.kind == mir::MirTermKind.Call {
+                make ai = 0
+                while ai < call.*.args.len() {
+                    make arg = call.*.args[ai].pin
+                    make by_ref = ai == 0 && call.*.has_receiver
+
+                    if ai < call.*.arg_tys.len() && starts_with(call.*.arg_tys[ai].copy(), "ref<") { by_ref = true }
+
+                    if by_ref && (arg.*.kind == mir::MirOperandKind.Copy || arg.*.kind == mir::MirOperandKind.Move) && arg.*.place.local < aliases.len() && aliases[arg.*.place.local] != 0 {
+                        if arg.*.place.local == formal {
+                            make place = this.effect_place(caller, arg.*.place.pin)
+
+                            if this.conflicts_with_pin(place.pin, st) && this.call_mutates_pin(call.*.name.copy(), ai, place.pin, st, depth + 1, trail.copy()) { return true }
+                        } else {
+                            make place = this.alias_effect_place(caller, alias_fields[arg.*.place.local].copy(), arg.*.place.pin)
+
+                            if this.conflicts_with_pin(place.pin, st) && this.call_mutates_pin(call.*.name.copy(), ai, place.pin, st, depth + 1, trail.copy()) { return true }
+                        }
+                    }
+
+                    ai = ai + 1
+                }
+            }
+
+            i = i + 1
+        }
+
+        return false
+    }
+
+    // consuming use; returns true when heap ownership was carried out
+    @this
+    make consume (local: uint, st: ref<state::LocalState>, range: util::Range) -> bool {
+        if local >= this.graph.*.nlocals {
+            return false
+        }
+
+        if this.is_copy_local(local) {
+            this.use_local(local, st, range.copy())
+            return false
+        }
+
+        if st.*.moved[local] != 0 && st.*.alive[local] != 0 {
+            this.use_local(local, st, range.copy())
+        }
+
+        if st.*.pinned[local] != 0 {
+            if this.pin_holder_live(local, st) {
+                if this.emit { this.report_local(errors::move_pinned(this.body, range.copy(), local), local, st) }
+
+                return false
+            }
+
+            st.*.pinned[local] = 0
+        }
+
+        if st.*.alive[local] == 0 {
+            this.use_local(local, st, range.copy())
+            return false
+        }
+
+        make had = st.*.owned[local] != 0
+        st.*.moved[local] = 1
+        st.*.move_site[local] = this.current_site
+        st.*.alive[local] = 0
+        st.*.uninit[local] = 0
+        st.*.owned[local] = 0
+        return had
+    }
+
+    /// applies a mir operand’s use or move to the local state.
+    @this
+    make operand (op: ref<mir::MirOperand>, st: ref<state::LocalState>, range: util::Range) -> void {
+        if op.*.range.start.end > op.*.range.start.start { range = op.*.range.copy() }
+
+        match op.*.kind {
+            mir::MirOperandKind.Copy { this.use_local(op.*.place.local, st, range.copy()) }
+
+            mir::MirOperandKind.Move {
+                if op.*.place.projs.len() > 0 {
+                    this.use_local(op.*.place.local, st, range.copy())
+                } else {
+                    this.consume(op.*.place.local, st, range.copy())
+                }
+            }
+            _ {}
+        }
+
+        return
+    }
+
+    // operands of operators, callees and other pure reads never move
+    @this
+    make operand_read (op: ref<mir::MirOperand>, st: ref<state::LocalState>, range: util::Range) -> void {
+        if op.*.range.start.end > op.*.range.start.start { range = op.*.range.copy() }
+
+        match op.*.kind {
+            mir::MirOperandKind.Copy { this.use_local(op.*.place.local, st, range.copy()) }
+
+            mir::MirOperandKind.Move { this.use_local(op.*.place.local, st, range.copy()) }
+            _ {}
+        }
+
+        return
+    }
+
+    @this
+    make write_place (place: ref<mir::MirPlace>, st: ref<state::LocalState>, range: util::Range) -> void {
+        make local = place.*.local
+
+        if local >= this.graph.*.nlocals {
+            return
+        }
+
+        if place.*.projs.len() > 0 {
+            this.use_local(local, st, range.copy())
+
+            if st.*.pinned[local] != 0 && this.conflicts_with_pin(place, st) {
+                if this.emit { this.report_local(errors::assign_pinned(this.body, range.copy(), local), local, st) }
+            }
+
+            return
+        }
+
+        if st.*.pinned[local] != 0 {
+            if this.emit { this.report_local(errors::assign_pinned(this.body, range.copy(), local), local, st) }
+        }
+
+        st.*.alive[local] = 1
+        st.*.uninit[local] = 0
+        st.*.moved[local] = 0
+        st.*.dead[local] = 0
+        st.*.owned[local] = 0
+        return
+    }
+
+    /// marks a local as newly live and uninitialized in the dataflow state.
+    @this
+    make storage_live (local: uint, st: ref<state::LocalState>) -> void {
+        if local >= this.graph.*.nlocals {
+            return
+        }
+
+        st.*.uninit[local] = 1
+        st.*.alive[local] = 0
+        st.*.moved[local] = 0
+        st.*.pinned[local] = 0
+        st.*.dead[local] = 0
+        st.*.owned[local] = 0
+        return
+    }
+
+    /// marks a local’s storage dead and updates the associated state.
+    @this
+    make storage_dead (local: uint, st: ref<state::LocalState>, range: util::Range) -> void {
+        if local >= this.graph.*.nlocals {
+            return
+        }
+
+        st.*.uninit[local] = 0
+        st.*.alive[local] = 0
+        st.*.moved[local] = 0
+        st.*.pinned[local] = 0
+        st.*.dead[local] = 1
+        st.*.dead_site[local] = this.current_site
+        st.*.owned[local] = 0
+
+        make k = 0
+
+        while k < this.graph.*.pins.len() {
+            make pe = this.graph.*.pins[k].pin
+
+            if pe.*.holder == local && pe.*.src < this.graph.*.nlocals {
+                st.*.active_pins[k] = 0
+                this.refresh_pin(pe.*.src, st)
+            }
+
+            k = k + 1
+        }
+
+        return
+    }
+
+    /// applies a mir assignment to the local state.
+    @this
+    make assign (s: ref<mir::MirStmt>, st: ref<state::LocalState>, index: uint) -> void {
+        make range: util::Range = s.*.range.copy()
+        make rv = s.*.rvalue.pin
+        make dest = s.*.place.local
+
+        if this.emit && s.*.place.projs.len() == 0 && dest < this.body.*.locals.len()
+            && starts_with(this.body.*.locals[dest].ty.copy(), "ptr<") {
+            if rv.*.kind != mir::MirRvalueKind.Use || rv.*.a.place.local != dest {
+                obls::forget_alias(this.fr.*.obligations.pin, dest, this.body.*.locals.len())
+            }
+        }
+
+        match rv.*.kind {
+            mir::MirRvalueKind.Use {
+                if rv.*.a.kind == mir::MirOperandKind.Move && rv.*.a.place.projs.len() == 0 {
+                    make src = rv.*.a.place.local
+                    make had = this.consume(src, st, range.copy())
+                    this.write_place(s.*.place.pin, st, range.copy())
+
+                    if had {
+                        st.*.owned[dest] = 1
+
+                        if this.emit {
+                            obls::transfer(this.fr.*.obligations.pin, src, dest, this.graph.*.nstmts)
+                        }
+                    }
+                } else {
+                    this.operand_read(rv.*.a.pin, st, range.copy())
+                    this.write_place(s.*.place.pin, st, range.copy())
+                }
+            }
+
+            mir::MirRvalueKind.Binary {
+                this.operand_read(rv.*.a.pin, st, range.copy())
+                this.operand_read(rv.*.b.pin, st, range.copy())
+                // A binary assignment evaluates both inputs before replacing
+                // the destination, so pins ending here cannot conflict with it.
+                this.release_pins_at(index, s.*.block, 0, st)
+                this.write_place(s.*.place.pin, st, range.copy())
+            }
+
+            mir::MirRvalueKind.OptionalPayload {
+                make source = rv.*.a.place.local
+                make owned = false
+
+                if rv.*.a.kind == mir::MirOperandKind.Move && rv.*.a.place.projs.len() == 0 {
+                    owned = this.consume(source, st, range.copy())
+
+                    if owned && this.emit {
+                        obls::transfer(this.fr.*.obligations.pin, source, dest, this.graph.*.nstmts)
+                    }
+                } else {
+                    this.operand_read(rv.*.a.pin, st, range.copy())
+                }
+
+                this.write_place(s.*.place.pin, st, range.copy())
+
+                if owned {
+                    st.*.owned[dest] = 1
+                }
+            }
+
+            mir::MirRvalueKind.Unary {
+                this.operand_read(rv.*.a.pin, st, range.copy())
+                this.write_place(s.*.place.pin, st, range.copy())
+            }
+
+            mir::MirRvalueKind.Aggregate {
+                make owned = false
+                make oi = 0
+
+                while oi < rv.*.ops.len() {
+                    make op = rv.*.ops[oi].pin
+
+                    if op.*.kind == mir::MirOperandKind.Move && op.*.place.projs.len() == 0 {
+                        make src = op.*.place.local
+                        make had = this.consume(src, st, range.copy())
+
+                        if had {
+                            owned = true
+
+                            if this.emit {
+                                obls::transfer(this.fr.*.obligations.pin, src, dest, this.graph.*.nstmts)
+                            }
+                        }
+                    } else {
+                        this.operand_read(op, st, range.copy())
+                    }
+
+                    oi = oi + 1
+                }
+
+                this.write_place(s.*.place.pin, st, range.copy())
+
+                if owned {
+                    st.*.owned[dest] = 1
+                }
+            }
+
+            mir::MirRvalueKind.Pin {
+                make src = rv.*.place.local
+                this.use_local(src, st, range.copy())
+
+                if src < this.graph.*.nlocals && (st.*.alive[src] != 0 || st.*.pinned[src] != 0) {
+                    if dest == 0 {
+                        if !this.body.*.locals[src].is_param && st.*.owned[src] == 0 {
+                            if this.emit { this.report_local(errors::return_stack_ref(this.body, range.copy(), src), src, st) }
+                        }
+                    } elif src != dest {
+                        // a borrow through an index/deref points into heap storage; moving the
+                        // base value (or assigning its other fields) does not invalidate it.
+                        make heap_backed = false
+                        make indexed = false
+                        make pj = 0
+
+                        while pj < rv.*.place.projs.len() {
+                            make pk = rv.*.place.projs[pj].kind
+
+                            if pk == mir::MirProjKind.Index || pk == mir::MirProjKind.Deref {
+                                heap_backed = true
+                            }
+
+                            if pk == mir::MirProjKind.Index { indexed = true }
+
+                            pj = pj + 1
+                        }
+
+                        // An array/string element points into relocatable storage.
+                        // Its owner must remain pinned until the reference's last
+                        // use. Raw pointer indexing remains an unsafe operation.
+                        if indexed && !starts_with(this.body.*.locals[src].ty.copy(), "ptr<") { heap_backed = false }
+
+                        if !heap_backed {
+                            if st.*.pinned[src] != 0 && rv.*.place.projs.len() == 0 && this.pin_holder_live(src, st) {
+                                if this.emit { this.report_local(errors::already_pinned(this.body, range.copy(), src), src, st) }
+                            }
+
+                            if st.*.pinned[src] == 0 || st.*.pin_site[src] == 0 { st.*.pin_site[src] = (index + 1) * 2 }
+
+                            st.*.pinned[src] = 1
+                            make pi = 0
+                            while pi < this.graph.*.pins.len() {
+                                if this.graph.*.pins[pi].index == index && this.graph.*.pins[pi].src == src && this.graph.*.pins[pi].holder == dest { st.*.active_pins[pi] = 1 }
+
+                                pi = pi + 1
+                            }
+                        }
+                    }
+                }
+
+                this.write_place(s.*.place.pin, st, range.copy())
+            }
+
+            mir::MirRvalueKind.Unsupported {
+                this.write_place(s.*.place.pin, st, range.copy())
+            }
+        }
+
+        if this.emit && rv.*.kind == mir::MirRvalueKind.Use
+            && (rv.*.a.kind == mir::MirOperandKind.Copy || rv.*.a.kind == mir::MirOperandKind.Move)
+            && rv.*.a.place.projs.len() == 0 && s.*.place.projs.len() == 0
+            && dest < this.body.*.locals.len() && starts_with(this.body.*.locals[dest].ty.copy(), "ptr<") {
+            obls::alias(this.fr.*.obligations.pin, rv.*.a.place.local, dest)
+        }
+        return
+    }
+
+    /// applies a mir call’s operand and allocation effects to the dataflow state.
+    @this
+    make call (t: ref<mir::MirTerm>, st: ref<state::LocalState>, index: uint) -> void {
+        make range = t.*.range.copy()
+        this.operand_read(t.*.func.pin, st, range.copy())
+
+        make seg = report::last_segment(t.*.name !)
+        make is_alloc = report::has_name(this.ctx.*.alloc_names.pin, seg !)
+        make is_free = report::has_name(this.ctx.*.free_names.pin, seg)
+
+        // These builtins may relocate, remove, or overwrite elements. Their
+        // receiver is a copied MIR operand, but the operation mutates it.
+        make invalidates = t.*.name == "__quip_builtin.arr.push" || t.*.name == "__quip_builtin.arr.pop"
+            || t.*.name == "__quip_builtin.arr.remove" || t.*.name == "__quip_builtin.str.push_char"
+            || t.*.name == "__quip_builtin.str.push_str"
+
+        if invalidates && t.*.has_receiver && t.*.args.len() > 0 {
+            make receiver = t.*.args[0].place.local
+
+            if receiver < this.graph.*.nlocals && this.conflicts_with_pin(t.*.args[0].place.pin, st) {
+                if this.emit { this.report_local(errors::mutate_pinned_collection(this.body, range.copy(), receiver), receiver, st) }
+            }
+        }
+
+        if !invalidates {
+            make ai = 0
+            while ai < t.*.args.len() {
+                make arg = t.*.args[ai].pin
+                make by_ref = ai == 0 && t.*.has_receiver
+
+                if by_ref && arg.*.place.local < this.body.*.locals.len() && starts_with(this.body.*.locals[arg.*.place.local].ty.copy(), "ref<") { by_ref = false }
+
+                if ai < t.*.arg_tys.len() && starts_with(t.*.arg_tys[ai].copy(), "ref<") {
+                    make arg_ty = t.*.arg_tys[ai].copy()
+
+                    // Collection references are directly relevant even for
+                    // free functions; struct receivers are handled above.
+                    if arg_ty == "ref<str>" || arg_ty == "ref<String>" || (arg_ty.len() >= 3 && arg_ty[arg_ty.len() - 3] == '[' && arg_ty[arg_ty.len() - 2] == ']' && arg_ty[arg_ty.len() - 1] == '>') { by_ref = true }
+                }
+
+                if by_ref && (arg.*.kind == mir::MirOperandKind.Copy || arg.*.kind == mir::MirOperandKind.Move) && arg.*.place.local < this.graph.*.nlocals
+                    && this.conflicts_with_pin(arg.*.place.pin, st) && this.call_mutates_pin(t.*.name.copy(), ai, arg.*.place.pin, st, 0, "") {
+                    if this.emit { this.report_local(errors::mutate_pinned_collection(this.body, range.copy(), arg.*.place.local), arg.*.place.local, st) }
+                }
+
+                    ai = ai + 1
+            }
+        }
+
+        make unwrap = t.*.name == "__quip_builtin.opt.unwrap" || t.*.name == "__quip_builtin.fal.unwrap"
+        make unwrap_owned = false
+        make ai = 0
+
+        while ai < t.*.args.len() {
+            make arg = t.*.args[ai].pin
+            make arg_range = range.copy()
+
+            if arg.*.range.start.end > arg.*.range.start.start { arg_range = arg.*.range.copy() }
+
+            if arg.*.kind == mir::MirOperandKind.Copy {
+                this.use_local(arg.*.place.local, st, arg_range.copy())
+                if is_free && !((ai == 0) && t.*.has_receiver) && this.emit {
+                    obls::satisfy(this.fr.*.obligations.pin, arg.*.place.local, index, this.graph.*.nstmts, true)
+                }
+                if unwrap && ai == 0 && arg.*.place.local < this.graph.*.nlocals {
+                    unwrap_owned = st.*.owned[arg.*.place.local] != 0
+                    if unwrap_owned && this.emit {
+                        obls::transfer(this.fr.*.obligations.pin, arg.*.place.local, t.*.dest.local, this.graph.*.nstmts)
+                    }
+                }
+            } elif arg.*.kind == mir::MirOperandKind.Move && arg.*.place.projs.len() > 0 {
+                this.use_local(arg.*.place.local, st, arg_range.copy())
+            } elif arg.*.kind == mir::MirOperandKind.Move {
+                make local = arg.*.place.local
+
+                if is_free {
+                    if local < this.graph.*.nlocals && st.*.pinned[local] != 0 {
+                        if this.emit { this.report_local(errors::free_active(this.body, arg_range.copy(), local), local, st) }
+
+                        this.use_local(local, st, arg_range.copy())
+                    } else {
+                        this.consume(local, st, arg_range.copy())
+
+                        if this.emit {
+                            obls::satisfy(this.fr.*.obligations.pin, local, index, this.graph.*.nstmts, true)
+                        }
+                    }
+                } else {
+                    make had = this.consume(local, st, arg_range.copy())
+
+                    if had && unwrap && ai == 0 {
+                        unwrap_owned = true
+                        if this.emit { obls::transfer(this.fr.*.obligations.pin, local, t.*.dest.local, this.graph.*.nstmts) }
+                    } elif had && this.emit {
+                        obls::satisfy(this.fr.*.obligations.pin, local, index, this.graph.*.nstmts, false)
+                    }
+                }
+            }
+
+            ai = ai + 1
+        }
+
+        this.write_place(t.*.dest.pin, st, range.copy())
+        if unwrap_owned && t.*.dest.local < this.graph.*.nlocals { st.*.owned[t.*.dest.local] = 1 }
+
+        if is_alloc {
+            make dest = t.*.dest.local
+
+            if dest < this.graph.*.nlocals {
+                st.*.owned[dest] = 1
+            }
+
+            if this.emit {
+                make name = errors::local_name(this.body, dest)
+                make size = report::HeapSize {}
+                make size_arg: uint = 0
+                if t.*.has_receiver { size_arg = 1 }
+                if size_arg < t.*.args.len() {
+                    size = report::allocation_size(t.*.args[size_arg].pin, this.body, this.structs, 0)
+                }
+                make automatic = contains_text(t.*.ret_ty.copy(), "owned<")
+                obls::open(this.fr.*.obligations.pin, dest, name, t.*.name !, index, this.graph.*.nstmts, size.bytes, size.known, automatic)
+            }
+        }
+
+        return
+    }
+
+    /// applies a mir terminator’s effects to the local state.
+    @this
+    make term (t: ref<mir::MirTerm>, st: ref<state::LocalState>, index: uint, block: uint) -> void {
+        this.current_site = (block + 1) * 2 + 1
+
+        match t.*.kind {
+            mir::MirTermKind.Branch { this.operand(t.*.cond.pin, st, t.*.range.copy()) }
+
+            mir::MirTermKind.Call { this.call(t, st, index) }
+            _ {}
+        }
+
+        this.release_pins_at(index, block, 1, st)
+        return
+    }
+
+    /// applies a block’s statements and terminator to the local state.
+    @pub @this
+    make block (b: uint, by_block: ref<lgraph::IdList[]>, st: ref<state::LocalState>) -> void {
+        make idxs = by_block.*[b].ids.pin
+        make i: uint = 0
+
+        while i < idxs.*.len() {
+            make index = idxs.*[i]
+            make s = this.body.*.stmts[index].pin
+            this.stmt(s, st, index)
+            i = i + 1
+        }
+
+        if b < this.body.*.terms.len() {
+            this.term(this.body.*.terms[b].pin, st, this.graph.*.term_index[b], b)
+        }
+
+        return
+    }
+
+    /// applies a mir statement’s effects to the local state.
+    @this
+    make stmt (s: ref<mir::MirStmt>, st: ref<state::LocalState>, index: uint) -> void {
+        this.current_site = (index + 1) * 2
+        match s.*.kind {
+            mir::MirStmtKind.StorageLive { this.storage_live(s.*.local, st) }
+
+            mir::MirStmtKind.StorageDead { this.storage_dead(s.*.local, st, s.*.range.copy()) }
+
+            mir::MirStmtKind.Assign { this.assign(s, st, index) }
+
+            mir::MirStmtKind.Unsupported {}
+        }
+
+        this.release_pins_at(index, s.*.block, 0, st)
+        return
+    }
+}

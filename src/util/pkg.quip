@@ -1,32 +1,70 @@
 @pure @const {
-make std = @import "../../library/std/pkg.quip"
-
-make um = @import "../core/unit_manager.quip"
+    make std = @import "std"
+    make um = @import "../core/unit_manager.quip"
 }
 
+/// stores the start and end offsets of a source span.
 @pub
 make type Span {
-    make start: uint
-    make end: uint
+    @pub {
+        make start: uint = 0
+        make end: uint = 0
+    }
+
+    @pub @this @copy
+    make copy () -> Span {
+        make c = Span {}
+
+        c.start = this.start !
+        c.end = this.end !
+
+        return c
+    }
 }
 
+/// stores the boundary spans of a source range.
 @pub
 make type Range {
-    make start: Span
-    make end: Span
+    @pub {
+        make start: Span = .{}
+        make end: Span = .{}
+    }
 
-    // not the best option to use ptr<>, but better than ref<ref<>>
-    make unit: ptr<um::Unit>
+    // range covering the byte offsets [start, end)
+    @pub
+    make of (start: uint, end: uint) -> Range {
+        make r = Range {}
+
+        r.start = Span { start = start, end = end }
+
+        r.end = Span { start = start, end = end }
+
+        return r
+    }
+
+    @pub @this @copy
+    make copy () -> Range {
+        make c = Range {}
+
+        c.start = this.start !
+        c.end = this.end !
+
+        return c
+    }
 }
 
+/// associates an identifier name with its source span.
 @pub
 make type Identifier {
     make name: str
     make span: Span
 }
 
+/// stores a resolved source line and column.
 @pub
 make type Location {
-    make line: u32
-    make col: u32
+    @pub {
+        make line: uint
+        make col: uint
+    }
 }

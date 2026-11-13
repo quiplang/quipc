@@ -1,29 +1,382 @@
 @pure @const {
-make std = @import "./library/std/pkg.quip"
+    make std = @import "./library/std/pkg.quip"
+    make progress = @import "./library/std/progress/pkg.quip"
 }
 
 @pub @entry
-make main () {
+make main (argc: int, argv: ptr<char>[]) -> int {
+    make b = std::Build.from_args(argv) catch {
+        std::progress::fail("invalid build arguments")
+        std::progress::finish(false)
+        return 1
+    }
 
-    std::io::println("building Quip compiler")
+    progress::begin("Build script", b.progress_enabled, b.options.show_quipc_debug)
+    progress::phase("Configure", 0, 1, "Quip compiler")
 
-    make b = std::Build.default()
+    b.options.hide_warnings = true
 
     make exe = std::Executable.default()
-
-    // test of package alias, not working yet
-    // make pkg = std::Package.create("std", "./library/std/pkg.quip")
-    // exe.add_package(pkg)
-
-    make path = std::io::Path.create("bootstrap/")
-    exe.path_build = path
     exe.name = "quipc"
+    exe.add_import("std", "library/std/pkg.quip")
 
-    b.executables.push(exe)
+    if !add_link_inputs(exe.pin, b.script_args !) {
+        progress::finish(false)
+        return 1
+    }
+
+    if version_bump(b.pin) == 1 { return 1 }
+
+    // Retry a failed build without consuming another version number.
+    if b.selected_step == "rebuild" { b.selected_step = "" }
+    elif b.selected_step == "reinstall" { b.selected_step = "install" }
+
+    b.add_executable(exe)
+
+    make profile: str = "debug"
+    if b.mode == std::Mode.Release { profile = "release" }
+
+    b.add_step("install", [profile] () -> !void {
+        if !install_user(profile !) { return error.InstallFailed }
+        return
+    })
 
     b.proceed() catch {
-        std::io::println("unable to build the compiler")
+        progress::fail("unable to build the compiler")
+        progress::finish(false)
+        return 1
+    }
+
+    progress::finish(true)
+    return 0
+}
+
+make add_link_inputs (exe: ref<std::Executable>, args: str[]) -> bool {
+    make i: uint = 0
+    while i < args.len() {
+        if args[i] != "--link" || i + 1 >= args.len() {
+            progress::fail("expected --link followed by a linker input")
+            return false
+        }
+        exe.*.native_libraries.push(args[i + 1].copy())
+        i += 2
+    }
+
+    if exe.*.native_libraries.len() > 0 { return true }
+
+    @target "macos" {
+        make inputs = macos_llvm_inputs() catch {
+            progress::fail("unable to find LLVM 22 static libraries, zstd, and the macOS SDK; install them or pass explicit --link arguments")
+            return false
+        }
+        exe.*.native_libraries = inputs
+        return true
+    }
+
+    @weak {
+        std::panic("unsupported platform", @file, @line)
+    }
+
+    progress::fail("pass the LLVM 22 archives and dependencies as repeated --link arguments on this platform")
+    return false
+}
+
+make macos_llvm_inputs () -> !str[] {
+
+    // the default path to LLVM pointing to homebrew,
+    // but the compiler shouldn't stop if it can't find it there,
+    // it should later try to resolve LLVM from the system path
+    // eventually ask the developer to update path in the build script
+    make prefix = command_output("brew", ["--prefix"]) catch err { return err }
+    make llvm = prefix.copy() + "/opt/llvm@22/bin/llvm-config"
+    if std::os::syscall::access(llvm.copy(), 1) != 0 { llvm = prefix.copy() + "/opt/llvm/bin/llvm-config" }
+
+    make version = command_output(llvm.copy(), ["--version"]) catch err { return err }
+    if version.len() < 3 || version[0] != '2' || version[1] != '2' || version[2] != '.' {
+        return error.ExpectedLlvm22
+    }
+
+    make libdir = command_output(llvm.copy(), ["--libdir"]) catch err { return err }
+    make names = command_output(llvm, ["--link-static", "--libnames", "core", "passes", "nativecodegen", "aarch64", "x86"]) catch err { return err }
+    make sdk = command_output("xcrun", ["--sdk", "macosx", "--show-sdk-path"]) catch err { return err }
+
+    make inputs: str[] = []
+    for archive : std::collections::split(names, ' ') {
+        inputs.push(libdir.copy() + "/" + archive)
+    }
+
+    inputs.push(prefix + "/opt/zstd/lib/libzstd.a")
+    inputs.push(sdk.copy() + "/usr/lib/libc++.tbd")
+    inputs.push(sdk.copy() + "/usr/lib/libz.tbd")
+    inputs.push(sdk + "/usr/lib/libxml2.tbd")
+
+    for path : inputs.iter() {
+        if std::os::syscall::access(path.copy(), 4) != 0 {
+            progress::fail("missing linker input " + path)
+            return error.MissingLinkInput
+        }
+    }
+
+    return inputs
+}
+
+make command_output (name: str, args: str[]) -> !str {
+    make storage: uint = 0
+    @unsafe make fds: ptr<i32> = storage.pin
+    @unsafe if std::os::platform::pipe(fds) != 0 { return error.PipeFailed }
+    @unsafe make input: int = fds[0]
+    @unsafe make output_fd: int = fds[1]
+
+    make command = std::process::Command.create(name, args)
+    command.fd_out = output_fd
+    make process = std::process::Process.spawn(command) catch err {
+        @unsafe {
+            std::os::platform::close(fds[0])
+            std::os::platform::close(fds[1])
+        }
+        return err
+    }
+    @unsafe std::os::platform::close(fds[1])
+
+    make file = std::io::File { fd = input }
+    file.read() catch err {
+        file.close()
+        process.wait()
+        return err
+    }
+    file.close()
+    process.wait()
+    if process.state != std::process::ProcessState.Exited || process.exit_code != 0 {
+        return error.CommandFailed
+    }
+
+    make output = file.content
+    if output.len() > 0 && output[output.len() - 1] == '\n' {
+        @unsafe output.set_length(output.length - 1) catch err { return err }
+    }
+    if output.len() == 0 { return error.EmptyCommandOutput }
+    return output
+}
+
+make install_user (profile: str) -> bool {
+    make root = std::io::Path.create("~/.quip").get()
+    make binary = "target/" + profile + "/quipc"
+    make lock = root.copy() + "/.install-lock"
+    progress::phase("Install", 0, 1, "install versioned compiler and library")
+    if !install_command("mkdir", ["-p", root.copy() + "/bin"]) { return false }
+    if !install_command("mkdir", [lock.copy()]) { return false }
+
+    make installed = install_locked(root, lock.copy(), binary)
+    make cleaned = install_command("rm", ["-rf", lock])
+    return installed && cleaned
+}
+
+make install_locked (root: str, lock: str, binary: str) -> bool {
+    make version = installed_version(binary.copy(), lock.copy() + "/version.txt") catch {
+        progress::fail("unable to determine the version of " + binary)
+        return false
+    }
+
+    make current = root.copy() + "/current"
+    make launcher = root.copy() + "/bin/quipc"
+    make library = root.copy() + "/lib"
+    if install_exists(current.copy()) && !install_symlink(current.copy()) {
+        progress::fail(current + " already exists and is not a symlink")
+        return false
+    }
+    if install_exists(library.copy()) && !install_symlink(library.copy()) {
+        progress::fail(library + " already exists and is not a symlink")
+        return false
+    }
+
+    make create_launcher = true
+    if install_exists(launcher.copy()) && !install_symlink(launcher.copy()) {
+        // The release installer may have created a launcher script.
+        if progress::run("grep", ["-q", "^# Quip version launcher$", launcher.copy()]) != 0 {
+            progress::fail(launcher + " already exists and is not a Quip launcher")
+            return false
+        }
+        create_launcher = false
+    }
+
+    make stage = lock.copy() + "/version"
+    if !install_command("mkdir", ["-p", stage.copy() + "/bin", stage.copy() + "/lib"]) { return false }
+    if !install_command("cp", [binary, stage.copy() + "/bin/quipc"]) { return false }
+    if !install_command("cp", ["-R", "library/.", stage.copy() + "/lib"]) { return false }
+
+    make dest = root + "/" + version.copy()
+    if install_exists(dest.copy()) {
+        if install_symlink(dest.copy())
+            || progress::run("cmp", ["-s", stage.copy() + "/bin/quipc", dest.copy() + "/bin/quipc"]) != 0
+            || progress::run("diff", ["-qr", stage.copy() + "/lib", dest.copy() + "/lib"]) != 0 {
+            progress::fail(dest + " already contains a different installation")
+            return false
+        }
+    } elif !install_rename(stage, dest.copy()) { return false }
+
+    if create_launcher && !install_link(lock.copy() + "/launcher", "../current/bin/quipc", launcher) { return false }
+    if !install_link(lock.copy() + "/lib", "current/lib", library) { return false }
+    if !install_link(lock + "/current", version.copy(), current) { return false }
+    progress::note("Installed Quip " + version + " at " + dest)
+    return true
+}
+
+make installed_version (binary: str, output: str) -> !str {
+    make path = std::io::Path.create(output)
+    make file = std::io::File.create(path.copy(), 384) catch err { return err }
+    make command = std::process::Command.create("./" + binary, ["--version"])
+    command.fd_out = file.fd
+    make code = std::process::Process.run(command)
+    file.close()
+    if code != 0 { return error.InvalidInstallVersion }
+
+    make text = std::io::File.orc(path) catch err { return err }
+    make prefix: str = "Quip "
+    if text.len() <= prefix.len() + 1 || text[text.len() - 1] != '\n' { return error.InvalidInstallVersion }
+
+    make i: uint = 0
+    while i < prefix.len() {
+        if text[i] != prefix[i] { return error.InvalidInstallVersion }
+        i++
+    }
+
+    if text[i] < '0' || text[i] > '9' { return error.InvalidInstallVersion }
+    make version = ""
+    while i + 1 < text.len() {
+        make c = text[i]
+        if c != '.' && (c < '0' || c > '9') { return error.InvalidInstallVersion }
+        version.push(c)
+        i++
+    }
+    return version
+}
+
+make install_exists (path: str) -> bool {
+    return progress::run("test", ["-e", path.copy()]) == 0 || install_symlink(path)
+}
+
+make install_symlink (path: str) -> bool {
+    return progress::run("test", ["-L", path]) == 0
+}
+
+make install_link (stage: str, target: str, dest: str) -> bool {
+    if !install_command("ln", ["-s", target, stage.copy()]) { return false }
+    return install_rename(stage, dest)
+}
+
+make install_rename (source: str, destination: str) -> bool {
+    @unsafe {
+        if std::os::platform::rename(source.data, destination.data) == 0 { return true }
+    }
+    progress::fail("unable to publish " + destination)
+    return false
+}
+
+make install_command(name: str, args: str[]) -> bool {
+    make label = name.copy()
+    make code = progress::run(name, args)
+    if code != 0 { progress::fail(label + " failed with status " + code.to_str()) }
+    return code == 0
+}
+
+
+make version_bump (br: ref<std::Build>) -> int {
+
+    make bump_t: str = ""
+    make install = br.*.selected_step == "install"
+
+    if br.*.selected_step == "bump-major" || br.*.selected_step == "bump-major-install" { bump_t = "major" }
+    elif br.*.selected_step == "bump-minor" || br.*.selected_step == "bump-minor-install" { bump_t = "minor" }
+    elif br.*.selected_step == "" || br.*.selected_step == "install" || br.*.selected_step == "bump-build" || br.*.selected_step == "bump-build-install" { bump_t = "build" }
+
+    if br.*.selected_step == "bump-major-install" || br.*.selected_step == "bump-minor-install" || br.*.selected_step == "bump-build-install" { install = true }
+
+    if bump_t.len() > 0 {
+        make next = bump(bump_t) catch {
+            progress::fail("unable to increment src/version.quip")
+            progress::finish(false)
+            return 1
+        }
+
+        progress::note("Quip " + next)
+        br.*.selected_step = ""
+        if install { br.*.selected_step = "install" }
     }
 
     return 0
+}
+
+
+make increment (value: str, part: str) -> !str {
+
+    if part != "major" && part != "minor" && part != "build" { return error.InvalidVersionPart }
+
+    make numbers: uint[3] = [0, 0, 0]
+    make component: uint = 0
+    make digits: uint = 0
+
+    for c : value.iter() {
+
+        if c == '.' {
+            if digits == 0 || component == 2 { return error.InvalidFormat }
+            component++
+            digits = 0
+        } else {
+            if c < '0' || c > '9' { return error.InvalidFormat }
+            @unsafe make digit: uint = c
+            digit -= 48
+
+            if numbers[component] > (u32.max() - digit) / 10 { return error.VersionOverflow }
+            numbers[component] = numbers[component] * 10 + digit
+            digits++
+        }
+
+    }
+
+    if component != 2 || digits == 0 { return error.InvalidVersion }
+
+    make index: uint = 2
+
+    if part == "major" { index = 0 }
+    elif part == "minor" { index = 1 }
+
+    if numbers[index] == u32.max() { return error.VersionOverflow }
+
+    numbers[index]++
+
+    if index < 2 { numbers[2] = 0 }
+    if index == 0 { numbers[1] = 0 }
+
+    return numbers[0].to_str() + "." + numbers[1].to_str() + "." + numbers[2].to_str()
+}
+
+make read_version () -> !str {
+    make source = std::io::File.orc(std::io::Path.create("src/version.quip")) catch { return error.ReadVersionFailed }
+
+    make value = ""
+    make quoted = false
+
+    for c : source.iter() {
+        if c == '"' {
+            if quoted { break }
+            quoted = true
+        } elif quoted { value.push(c) }
+    }
+
+    return value
+}
+
+make bump (part: str) -> !str {
+    make value = read_version() catch err { return err }
+    make next = increment(value, part) catch err { return err }
+    make text = "// Updated by build.quip's bump-major, bump-minor and bump-build options.\n@pub @const\nmake current: str = \"" + next.copy() + "\"\n"
+
+    make file = std::io::File.create(std::io::Path.create("src/version.quip.tmp"), 420) catch { return error.WriteVersionFailed }
+    file.write(text) catch { file.close() return error.WriteVersionFailed }
+    file.close()
+
+    make command = std::process::Command.create("mv", ["src/version.quip.tmp", "src/version.quip"])
+    if std::process::Process.run(command) != 0 { return error.WriteVersionFailed }
+
+    return next
 }

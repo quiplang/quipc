@@ -1,0 +1,34 @@
+@pure @const {
+    make p: unit = @import "path.quip"
+
+    @target "macos" make os: unit = @import "../os/macos.quip"
+}
+
+
+@pub
+make type Dir {
+
+    @pub
+    make mkdir (path: ref<p::Path>, mode: int) -> !void {
+        @target "macos" {
+            @unsafe
+            if os::access(path.*.get().data, 0) == 0 { return }
+
+            @unsafe
+            if os::mkdir(path.*.get().data, mode) < 0 { return error.DirCreationFailed }
+        }
+
+        @target "linux" {}
+
+        @target "windows" {}
+    }
+
+    @pub
+    make rmdir (path: ref<p::Path>) -> !void {
+        @target "macos" {
+            @unsafe
+            if os::rmdir(path.*.get().data) < 0 { return error.DirRemovalFailed }
+        }
+    }
+
+}

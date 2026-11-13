@@ -1,0 +1,1 @@
+@pure @const make runtime_methods = @import "../../runtime/str_methods.quip"

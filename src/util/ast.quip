@@ -1,0 +1,1052 @@
+@pure @const {
+    make util = @import "./pkg.quip"
+    make lexer = @import "../core/token.quip"
+
+    make std = @import "std"
+}
+
+//
+// The AST is a tree of `AST_Head` wrappers. Each head carries shared data (range, status,
+// tags, kind) plus exactly one optional owned payload (`func`, `expr`, …). Payloads are
+// always heap-allocated by us — never stored as a large by-value `variant` — so they stay
+// valid after the constructing frame returns (avoids C-ref stack-payload boxing bugs).
+
+@pub
+make enum AST_Status {
+    Ok,
+    Error,
+    None,
+}
+
+@pub
+make enum AST_Kind {
+    Tag,
+    Func,
+    Var,
+    Expr,
+    Type,
+    Enum,
+    If,
+    For,
+    While,
+    Match,
+    Case,
+    Catch,
+    Assign,
+    Return,
+    None,
+}
+
+@pub
+make type FuncCtx {
+    make is_returning: bool = false
+    make is_return_locked: bool = false
+}
+
+@pub
+make enum Visibility {
+    Public,
+    Private,
+}
+
+@pub
+make enum ExprKind {
+    Unknown,
+    Literal,
+    Identifier,
+    Binary,
+    Unary,
+    Call,
+    Access,
+    Constructor,
+    Deref,
+    ArrayLiteral,
+    Match,
+    Variant,        // contextual .variant,
+    Error,          // error.variant
+    TypeRef,
+    TypeSig,        // a type signature used in expression position, e.g. `make T: Type = variant<int, str>`
+    Lambda,
+}
+
+/// wraps a syntax node with its kind, source range, and parser status.
+@pub
+make type AST_Head {
+    @pub {
+        make range: util::Range = .{}
+        make kind: AST_Kind = AST_Kind.None
+        make status: AST_Status = AST_Status.None
+        make tags: owned<AST_Tag>[] = []
+
+        // exactly one of these is set, matching `kind`
+        make func: owned<AST_Func>? = none
+        make var: owned<AST_Var>? = none
+        make expr: owned<AST_Expr>? = none
+        make type_node: owned<AST_Type>? = none
+        make enum_node: owned<AST_Enum>? = none
+        make if_node: owned<AST_If>? = none
+        make for_node: owned<AST_For>? = none
+        make while_node: owned<AST_While>? = none
+        make match_node: owned<AST_Match>? = none
+        make case_node: owned<AST_Case>? = none
+        make assign: owned<AST_Assign>? = none
+        make return_node: owned<AST_Return>? = none
+    }
+
+    @pub @this
+    make copy () -> owned<AST_Head> {
+        make c: owned<AST_Head> = std::mem::debug.alloc(@sizeof AST_Head).unwrap()
+        c.* = AST_Head {}
+
+        c.*.range = this.range
+        c.*.kind = this.kind
+        c.*.status = this.status
+        c.*.tags = []
+
+        for tag : this.tags.iter() {
+            c.*.tags.push(tag.copy())
+        }
+
+        match this.kind {
+            AST_Kind.Func {
+                make p: owned<AST_Func> = std::mem::debug.alloc(@sizeof AST_Func).unwrap()
+                p.* = this.func.unwrap().*.copy()
+                c.*.func = p
+            }
+
+            AST_Kind.Var {
+                make p: owned<AST_Var> = std::mem::debug.alloc(@sizeof AST_Var).unwrap()
+                p.* = this.var.unwrap().*.copy()
+                c.*.var = p
+            }
+
+            AST_Kind.Expr {
+                make p: owned<AST_Expr> = std::mem::debug.alloc(@sizeof AST_Expr).unwrap()
+                p.* = this.expr.unwrap().*.copy()
+                c.*.expr = p
+            }
+
+            AST_Kind.Type {
+                make p: owned<AST_Type> = std::mem::debug.alloc(@sizeof AST_Type).unwrap()
+                p.* = this.type_node.unwrap().*.copy()
+                c.*.type_node = p
+            }
+
+            AST_Kind.Enum {
+                make p: owned<AST_Enum> = std::mem::debug.alloc(@sizeof AST_Enum).unwrap()
+                p.* = this.enum_node.unwrap().*.copy()
+                c.*.enum_node = p
+            }
+
+            AST_Kind.If {
+                make p: owned<AST_If> = std::mem::debug.alloc(@sizeof AST_If).unwrap()
+                p.* = this.if_node.unwrap().*.copy()
+                c.*.if_node = p
+            }
+
+            AST_Kind.For {
+                make p: owned<AST_For> = std::mem::debug.alloc(@sizeof AST_For).unwrap()
+                p.* = this.for_node.unwrap().*.copy()
+                c.*.for_node = p
+            }
+
+            AST_Kind.While {
+                make p: owned<AST_While> = std::mem::debug.alloc(@sizeof AST_While).unwrap()
+                p.* = this.while_node.unwrap().*.copy()
+                c.*.while_node = p
+            }
+
+            AST_Kind.Match {
+                make p: owned<AST_Match> = std::mem::debug.alloc(@sizeof AST_Match).unwrap()
+                p.* = this.match_node.unwrap().*.copy()
+                c.*.match_node = p
+            }
+
+            AST_Kind.Case {
+                make p: owned<AST_Case> = std::mem::debug.alloc(@sizeof AST_Case).unwrap()
+                p.* = this.case_node.unwrap().*.copy()
+                c.*.case_node = p
+            }
+
+            AST_Kind.Assign {
+                make p: owned<AST_Assign> = std::mem::debug.alloc(@sizeof AST_Assign).unwrap()
+                p.* = this.assign.unwrap().*.copy()
+                c.*.assign = p
+            }
+
+            AST_Kind.Return {
+                make p: owned<AST_Return> = std::mem::debug.alloc(@sizeof AST_Return).unwrap()
+                p.* = this.return_node.unwrap().*.copy()
+                c.*.return_node = p
+            }
+            _ {}
+        }
+
+        return c
+    }
+}
+
+/// prints a short debug description of an ast node.
+@pub
+make probe (where: str, h: ref<AST_Head>) -> void {
+    std::io::println(where)
+
+    if h.*.kind == AST_Kind.Func {
+        std::io::println("   func")
+    } elif h.*.kind == AST_Kind.Var {
+        std::io::println("   var")
+    } elif h.*.kind == AST_Kind.Type {
+        std::io::println("   type")
+    } elif h.*.kind == AST_Kind.Enum {
+        std::io::println("   enum")
+    } elif h.*.kind == AST_Kind.None {
+        std::io::println("   NOTHING")
+    } else {
+        std::io::println("   other")
+    }
+}
+
+// AST nodes
+
+@pub
+make type AST_Tag {
+
+    @pub {
+        make name: lexer::Token = .{}
+        // the string carried by `@target "..."` (empty for tags without data)
+        make target: str = ""
+        make sig_type: owned<AST_TypeSig>? = none
+    }
+
+    @pub @this
+    make copy () -> owned<AST_Tag> {
+        make c: owned<AST_Tag> = std::mem::debug.alloc(@sizeof AST_Tag).unwrap()
+        c.*.name = this.name.copy()
+        c.*.target = this.target
+
+        match this.sig_type {
+            none { c.*.sig_type = none }
+            some {
+                make oc: owned<AST_TypeSig> = std::mem::debug.alloc(@sizeof AST_TypeSig).unwrap()
+                oc.* = some.*.copy()
+                c.*.sig_type = oc
+            }
+        }
+
+        return c
+    }
+}
+
+@pub
+make type AST_TypeSig {
+
+    @pub {
+        make range: util::Range = .{}
+        make name: lexer::Token = .{}
+        make inner: owned<AST_TypeSig>[] = []
+        make array_size: owned<AST_Head>? = none
+
+        make is_fallible: bool = false
+        make is_optional: bool = false
+        make is_generic: bool = false
+        make is_array: bool = false
+        make is_namespace: bool = false
+    }
+
+    @pub @this
+    make copy () -> AST_TypeSig {
+        make c = AST_TypeSig {}
+
+        c.range = this.range
+        c.name = this.name
+
+        for item : this.inner {
+            make oc: owned<AST_TypeSig> = std::mem::debug.alloc(@sizeof AST_TypeSig).unwrap()
+            oc.* = item.*.copy()
+            c.inner.push(oc)
+        }
+
+        match this.array_size {
+            none { c.array_size = none }
+            some { c.array_size = some.copy() }
+        }
+
+        c.is_fallible = this.is_fallible
+        c.is_optional = this.is_optional
+        c.is_generic = this.is_generic
+        c.is_array = this.is_array
+        c.is_namespace = this.is_namespace
+
+        return c
+    }
+}
+
+@pub
+make type AST_Func {
+
+    @pub {
+        make name: lexer::Token = .{}
+        make sig_type: owned<AST_TypeSig>? = none
+        make generics: lexer::Token[] = []
+        make statements: AST_Statements = AST_Statements {}
+        make params: AST_Param[] = []
+        make captures: lexer::Token[] = []
+        make capture_copies: bool[] = []
+        // size of bytes allocated on stack
+        make local_size: uint = 0
+        make mangled_name: str = ""
+        make visibility: Visibility = Visibility.Private
+        make fctx: FuncCtx = FuncCtx {}
+    }
+
+    @pub @this
+    make copy () -> AST_Func {
+        make c = AST_Func {}
+
+        c.name = this.name
+
+        c.sig_type = copy_typesig_field(this.sig_type)
+
+        c.generics = this.generics
+        c.captures = this.captures
+        c.capture_copies = this.capture_copies
+        c.statements = this.statements.copy()
+
+        for param : this.params {
+            c.params.push(param.copy())
+        }
+
+        c.local_size = this.local_size
+        c.mangled_name = this.mangled_name
+        c.visibility = this.visibility
+        c.fctx = this.fctx
+
+        return c
+    }
+}
+
+@pub
+make type AST_Type {
+    @pub make name: lexer::Token = .{}
+    @pub make generics: lexer::Token[] = []
+
+    @pub make statements: AST_Statements = AST_Statements {}
+
+    @pub @this
+    make copy () -> AST_Type {
+        make c = AST_Type {}
+
+        c.name = this.name
+        c.generics = this.generics
+        c.statements = this.statements.copy()
+
+        return c
+    }
+}
+
+@pub
+make type AST_Enum {
+    @pub make name: lexer::Token = .{}
+
+    @pub make variants: lexer::Token[] = []
+
+    @pub @this
+    make copy () -> AST_Enum {
+        make c = AST_Enum {}
+
+        c.name = this.name
+        c.variants = this.variants
+
+        return c
+    }
+}
+
+@pub
+make type AST_If {
+    @pub make val: owned<AST_Head>? = none
+    @pub make statements: AST_Statements = AST_Statements {}
+    @pub make elif_block: owned<AST_Head>? = none
+    @pub make else_block: AST_Statements = AST_Statements {}
+
+    @pub @this
+    make copy () -> AST_If {
+        make c = AST_If {}
+
+        c.val = copy_head_field(this.val)
+        c.statements = this.statements.copy()
+        c.elif_block = copy_head_field(this.elif_block)
+        c.else_block = this.else_block.copy()
+
+        return c
+    }
+}
+
+@pub
+make type AST_For {
+    @pub make inc: lexer::Token = .{}
+    @pub make cond: owned<AST_Head>? = none
+
+    @pub make statements: AST_Statements = AST_Statements {}
+
+    @pub @this
+    make copy () -> AST_For {
+        make c = AST_For {}
+
+        c.inc = this.inc
+        c.cond = copy_head_field(this.cond)
+        c.statements = this.statements.copy()
+
+        return c
+    }
+}
+
+@pub
+make type AST_While {
+    @pub make cond: owned<AST_Head>? = none
+
+    @pub make statements: AST_Statements = AST_Statements {}
+
+    @pub @this
+    make copy () -> AST_While {
+        make c = AST_While {}
+
+        c.cond = copy_head_field(this.cond)
+        c.statements = this.statements.copy()
+
+        return c
+    }
+}
+
+@pub
+make type AST_Arg {
+
+    @pub make name: lexer::Token? = none
+    @pub make val: owned<AST_Head>? = none
+
+    @pub @this
+    make copy () -> AST_Arg {
+        make c = AST_Arg {}
+
+        c.name = this.name
+        c.val = copy_head_field(this.val)
+
+        return c
+    }
+}
+
+@pub
+make type AST_Param {
+
+    @pub make name: lexer::Token = .{}
+    @pub make sig_type: owned<AST_TypeSig>? = none
+    @pub make def_val: owned<AST_Head>? = none
+
+    @pub @this
+    make copy () -> AST_Param {
+        make c = AST_Param {}
+
+        c.name = this.name
+
+        c.sig_type = copy_typesig_field(this.sig_type)
+        c.def_val = copy_head_field(this.def_val)
+
+        return c
+    }
+}
+
+@pub
+make type AST_Var {
+    @pub make name: lexer::Token = .{}
+    @pub make generics: lexer::Token[] = []
+    @pub make sig_type: owned<AST_TypeSig>? = none
+
+    @pub make val: owned<AST_Head>? = none
+
+    @pub @this
+    make copy () -> AST_Var {
+        make c = AST_Var {}
+
+        c.name = this.name
+        c.generics = this.generics
+
+        c.sig_type = copy_typesig_field(this.sig_type)
+        c.val = copy_head_field(this.val)
+
+        return c
+    }
+}
+
+@pub
+make type AST_Match {
+    @pub make scrutinee: owned<AST_Head>? = none
+
+    @pub make cases: owned<AST_Head>[] = []
+
+    @pub @this
+    make copy () -> AST_Match {
+        make c = AST_Match {}
+
+        c.scrutinee = copy_head_field(this.scrutinee)
+
+        for cse : this.cases {
+            c.cases.push(cse.copy())
+        }
+
+        return c
+    }
+}
+
+@pub
+make type AST_Case {
+    @pub make bind: owned<AST_Head>? = none
+    @pub make bind_name: owned<AST_Head>? = none
+    @pub make bind_type: owned<AST_TypeSig>? = none
+
+    @pub make statements: AST_Statements = AST_Statements {}
+    @pub make result: owned<AST_Head>? = none
+
+    @pub @this
+    make copy () -> AST_Case {
+        make c = AST_Case {}
+
+        c.bind = copy_head_field(this.bind)
+        c.bind_name = copy_head_field(this.bind_name)
+        c.bind_type = copy_typesig_field(this.bind_type)
+        c.statements = this.statements.copy()
+        c.result = copy_head_field(this.result)
+
+        return c
+    }
+}
+
+@pub
+make type AST_Statements {
+    @pub make end_span: util::Span = .{}
+
+    @pub make buffer: owned<AST_Head>[] = []
+
+    @pub @this
+    make copy () -> AST_Statements {
+        make c = AST_Statements {}
+
+        c.end_span = this.end_span.copy()
+
+        for stmt : this.buffer {
+            c.buffer.push(stmt.copy())
+        }
+
+        return c
+    }
+}
+
+// Expression payload: only the active kind's optional field is set.
+// Payloads that contain `owned` pointers are themselves `owned<...>?` (not
+// by-value `T?`) so assigning them moves the heap box instead of shallow-copying
+// the struct and double-freeing on drop of the source local.
+@pub
+make type AST_Expr {
+    @pub make kind: ExprKind = ExprKind.Unknown
+
+    @pub make binary: owned<ExprBinary>? = none
+    @pub make constructor: owned<ExprConstructor>? = none
+    @pub make access: owned<ExprAccess>? = none
+    @pub make unary: owned<ExprUnary>? = none
+    @pub make call: owned<ExprCall>? = none
+    @pub make match_expr: owned<ExprMatch>? = none
+    @pub make lambda: owned<AST_Func>? = none
+
+    @pub make literal: lexer::Token = .{}
+
+    @pub make type_ref: owned<AST_TypeSig>? = none
+    @pub make type_sig: owned<AST_TypeSig>? = none
+
+    @pub make is_copy: bool = false
+
+    @pub @this
+    make copy () -> AST_Expr {
+        make c = AST_Expr {}
+
+        c.kind = this.kind
+
+        c.binary = copy_owned_expr_binary(this.binary)
+        c.constructor = copy_owned_expr_constructor(this.constructor)
+        c.access = copy_owned_expr_access(this.access)
+        c.unary = copy_owned_expr_unary(this.unary)
+        c.call = copy_owned_expr_call(this.call)
+        c.match_expr = copy_owned_expr_match(this.match_expr)
+
+        match this.lambda {
+            none {}
+            some {
+                make f: owned<AST_Func> = std::mem::debug.alloc(@sizeof AST_Func).unwrap()
+                f.* = some.*.copy()
+                c.lambda = f
+            }
+        }
+
+        c.type_ref = copy_typesig_field(this.type_ref)
+        c.type_sig = copy_typesig_field(this.type_sig)
+
+        c.literal = this.literal
+        c.is_copy = this.is_copy
+
+        return c
+    }
+}
+
+// Expression helpers
+
+@pub
+make type ExprBinary {
+    @pub make left: owned<AST_Head>? = none
+    @pub make op: lexer::Token = .{}
+    @pub make right: owned<AST_Head>? = none
+
+    @pub @this
+    make copy () -> ExprBinary {
+        make c = ExprBinary {}
+
+        c.left = copy_head_field(this.left)
+        c.op = this.op
+        c.right = copy_head_field(this.right)
+
+        return c
+    }
+}
+
+@pub
+make type ExprConstructor {
+    @pub make type_sig: owned<AST_TypeSig>? = none
+    @pub make fields: owned<AST_Head>[] = []
+
+    @pub @this
+    make copy () -> ExprConstructor {
+        make c = ExprConstructor {}
+
+        c.type_sig = copy_typesig_field(this.type_sig)
+
+        for field : this.fields {
+            c.fields.push(field.copy())
+        }
+
+        return c
+    }
+}
+
+@pub
+make type ExprAccess {
+    @pub make left: owned<AST_Head>? = none
+    @pub make right: owned<AST_Head>? = none
+
+    @pub make is_array: bool = false
+
+    @pub @this
+    make copy () -> ExprAccess {
+        make c = ExprAccess {}
+
+        c.left = copy_head_field(this.left)
+        c.right = copy_head_field(this.right)
+        c.is_array = this.is_array
+
+        return c
+    }
+}
+
+@pub
+make type ExprCall {
+    @pub make callee: owned<AST_Head>? = none
+    @pub make args: AST_Arg[] = []
+
+    @pub make catch_stmts: AST_Statements? = none
+    @pub make catch_bind: lexer::Token? = none
+
+    @pub @this
+    make copy () -> ExprCall {
+        make c = ExprCall {}
+
+        c.callee = copy_head_field(this.callee)
+
+        for arg : this.args {
+            c.args.push(arg.copy())
+        }
+
+        c.catch_stmts = copy_statements_field(this.catch_stmts)
+        c.catch_bind = this.catch_bind
+
+        return c
+    }
+}
+
+@pub
+make type AST_Assign {
+    make target: owned<AST_Head>? = none
+    make value: owned<AST_Head>? = none
+
+    @pub @this
+    make copy () -> AST_Assign {
+        make c = AST_Assign {}
+
+        c.target = copy_head_field(this.target)
+        c.value = copy_head_field(this.value)
+
+        return c
+    }
+}
+
+@pub
+make type AST_Return {
+    @pub make value: owned<AST_Head>? = none
+
+    @pub @this
+    make copy () -> AST_Return {
+        make c = AST_Return {}
+
+        c.value = copy_head_field(this.value)
+
+        return c
+    }
+}
+
+@pub
+make type ExprUnary {
+    @pub make postfix: bool = false
+    @pub make op: lexer::Token = .{}
+    @pub make operand: owned<AST_Head>? = none
+
+    @pub @this
+    make copy () -> ExprUnary {
+        make c = ExprUnary {}
+
+        c.postfix = this.postfix
+        c.op = this.op
+        c.operand = copy_head_field(this.operand)
+
+        return c
+    }
+}
+
+@pub
+make type ExprMatch {
+    @pub make node: owned<AST_Head>? = none
+}
+
+
+// One bare `some` per helper (host E1117). Match/copy optional payloads.
+make copy_head_field (v: owned<AST_Head>?) -> owned<AST_Head>? {
+    match v {
+        none { return none }
+        some { return some.copy() }
+    }
+}
+
+/// copies the typesig field.
+make copy_typesig_field (v: owned<AST_TypeSig>?) -> owned<AST_TypeSig>? {
+    match v {
+        none { return none }
+        some {
+            make t: owned<AST_TypeSig> = std::mem::debug.alloc(@sizeof AST_TypeSig).unwrap()
+            t.* = some.*.copy()
+            return t
+        }
+    }
+}
+
+/// copies the owned expression binary.
+make copy_owned_expr_binary (v: owned<ExprBinary>?) -> owned<ExprBinary>? {
+    match v {
+        none { return none }
+        some {
+            make p: owned<ExprBinary> = std::mem::debug.alloc(@sizeof ExprBinary).unwrap()
+            p.* = some.*.copy()
+            return p
+        }
+    }
+}
+
+/// copies the owned expression constructor.
+make copy_owned_expr_constructor (v: owned<ExprConstructor>?) -> owned<ExprConstructor>? {
+    match v {
+        none { return none }
+        some {
+            make p: owned<ExprConstructor> = std::mem::debug.alloc(@sizeof ExprConstructor).unwrap()
+            p.* = some.*.copy()
+            return p
+        }
+    }
+}
+
+/// copies the owned expression access.
+make copy_owned_expr_access (v: owned<ExprAccess>?) -> owned<ExprAccess>? {
+    match v {
+        none { return none }
+        some {
+            make p: owned<ExprAccess> = std::mem::debug.alloc(@sizeof ExprAccess).unwrap()
+            p.* = some.*.copy()
+            return p
+        }
+    }
+}
+
+/// copies the owned expression unary.
+make copy_owned_expr_unary (v: owned<ExprUnary>?) -> owned<ExprUnary>? {
+    match v {
+        none { return none }
+        some {
+            make p: owned<ExprUnary> = std::mem::debug.alloc(@sizeof ExprUnary).unwrap()
+            p.* = some.*.copy()
+            return p
+        }
+    }
+}
+
+/// copies the owned expression call.
+make copy_owned_expr_call (v: owned<ExprCall>?) -> owned<ExprCall>? {
+    match v {
+        none { return none }
+        some {
+            make p: owned<ExprCall> = std::mem::debug.alloc(@sizeof ExprCall).unwrap()
+            p.* = some.*.copy()
+            return p
+        }
+    }
+}
+
+/// copies the owned expression match.
+make copy_owned_expr_match (v: owned<ExprMatch>?) -> owned<ExprMatch>? {
+    match v {
+        none { return none }
+        some {
+            make p: owned<ExprMatch> = std::mem::debug.alloc(@sizeof ExprMatch).unwrap()
+            p.* = ExprMatch {}
+
+            p.*.node = copy_head_field(some.*.node)
+            return p
+        }
+    }
+}
+
+// empty heap boxes — fill fields in place so owned children are never
+// shallow-copied through a by-value parameter
+@pub
+make fresh_binary () -> owned<ExprBinary> {
+    make p: owned<ExprBinary> = std::mem::debug.alloc(@sizeof ExprBinary).unwrap()
+    p.* = ExprBinary {}
+
+    return p
+}
+
+@pub
+make fresh_constructor () -> owned<ExprConstructor> {
+    make p: owned<ExprConstructor> = std::mem::debug.alloc(@sizeof ExprConstructor).unwrap()
+    p.* = ExprConstructor {}
+
+    return p
+}
+
+@pub
+make fresh_access () -> owned<ExprAccess> {
+    make p: owned<ExprAccess> = std::mem::debug.alloc(@sizeof ExprAccess).unwrap()
+    p.* = ExprAccess {}
+
+    return p
+}
+
+@pub
+make fresh_unary () -> owned<ExprUnary> {
+    make p: owned<ExprUnary> = std::mem::debug.alloc(@sizeof ExprUnary).unwrap()
+    p.* = ExprUnary {}
+
+    return p
+}
+
+@pub
+make fresh_call () -> owned<ExprCall> {
+    make p: owned<ExprCall> = std::mem::debug.alloc(@sizeof ExprCall).unwrap()
+    p.* = ExprCall {}
+
+    return p
+}
+
+/// creates a fresh match expression.
+@pub
+make fresh_match_expr () -> owned<ExprMatch> {
+    make p: owned<ExprMatch> = std::mem::debug.alloc(@sizeof ExprMatch).unwrap()
+    p.* = ExprMatch {}
+
+    return p
+}
+
+/// copies the statements field.
+make copy_statements_field (v: AST_Statements?) -> AST_Statements? {
+    match v {
+        none { return none }
+        some { return some.copy() }
+    }
+}
+
+// constructors (after payload types are defined)
+make fresh_head () -> owned<AST_Head> {
+    make h: owned<AST_Head> = std::mem::debug.alloc(@sizeof AST_Head).unwrap()
+    h.* = AST_Head {}
+
+    return h
+}
+
+/// creates a fresh function.
+@pub
+make fresh_func () -> owned<AST_Func> {
+    make p: owned<AST_Func> = std::mem::debug.alloc(@sizeof AST_Func).unwrap()
+    p.* = AST_Func {}
+
+    return p
+}
+
+/// creates the function.
+@pub
+make new_func (node: owned<AST_Func>) -> owned<AST_Head> {
+    make h = fresh_head()
+    h.*.kind = AST_Kind.Func
+    h.*.func = node
+    return h
+}
+
+/// creates a fresh variable.
+@pub
+make fresh_var () -> owned<AST_Var> {
+    make p: owned<AST_Var> = std::mem::debug.alloc(@sizeof AST_Var).unwrap()
+    p.* = AST_Var {}
+
+    return p
+}
+
+/// creates the variable.
+@pub
+make new_var (node: owned<AST_Var>) -> owned<AST_Head> {
+    make h = fresh_head()
+    h.*.kind = AST_Kind.Var
+    h.*.var = node
+    return h
+}
+
+/// creates a fresh expression.
+@pub
+make fresh_expr () -> owned<AST_Expr> {
+    make p: owned<AST_Expr> = std::mem::debug.alloc(@sizeof AST_Expr).unwrap()
+    p.* = AST_Expr {}
+
+    return p
+}
+
+// takes an already-heap `owned<AST_Expr>` so nested owned payloads are not
+// shallow-copied through a by-value `AST_Expr` parameter
+@pub
+make new_expr (node: owned<AST_Expr>) -> owned<AST_Head> {
+    make h = fresh_head()
+    h.*.kind = AST_Kind.Expr
+    h.*.expr = node
+    return h
+}
+
+/// creates the type.
+@pub
+make new_type (node: AST_Type) -> owned<AST_Head> {
+    make h = fresh_head()
+    make p: owned<AST_Type> = std::mem::debug.alloc(@sizeof AST_Type).unwrap()
+    p.* = node
+    h.*.kind = AST_Kind.Type
+    h.*.type_node = p
+    return h
+}
+
+/// creates the enum.
+@pub
+make new_enum (node: AST_Enum) -> owned<AST_Head> {
+    make h = fresh_head()
+    make p: owned<AST_Enum> = std::mem::debug.alloc(@sizeof AST_Enum).unwrap()
+    p.* = node
+    h.*.kind = AST_Kind.Enum
+    h.*.enum_node = p
+    return h
+}
+
+/// creates the if.
+@pub
+make new_if (node: AST_If) -> owned<AST_Head> {
+    make h = fresh_head()
+    make p: owned<AST_If> = std::mem::debug.alloc(@sizeof AST_If).unwrap()
+    p.* = node
+    h.*.kind = AST_Kind.If
+    h.*.if_node = p
+    return h
+}
+
+@pub
+make new_for (node: AST_For) -> owned<AST_Head> {
+    make h = fresh_head()
+    make p: owned<AST_For> = std::mem::debug.alloc(@sizeof AST_For).unwrap()
+    p.* = node
+    h.*.kind = AST_Kind.For
+    h.*.for_node = p
+    return h
+}
+
+/// creates the while.
+@pub
+make new_while (node: AST_While) -> owned<AST_Head> {
+    make h = fresh_head()
+    make p: owned<AST_While> = std::mem::debug.alloc(@sizeof AST_While).unwrap()
+    p.* = node
+    h.*.kind = AST_Kind.While
+    h.*.while_node = p
+    return h
+}
+
+/// creates the match.
+@pub
+make new_match (node: AST_Match) -> owned<AST_Head> {
+    make h = fresh_head()
+    make p: owned<AST_Match> = std::mem::debug.alloc(@sizeof AST_Match).unwrap()
+    p.* = node
+    h.*.kind = AST_Kind.Match
+    h.*.match_node = p
+    return h
+}
+
+/// creates the case.
+@pub
+make new_case (node: AST_Case) -> owned<AST_Head> {
+    make h = fresh_head()
+    make p: owned<AST_Case> = std::mem::debug.alloc(@sizeof AST_Case).unwrap()
+    p.* = node
+    h.*.kind = AST_Kind.Case
+    h.*.case_node = p
+    return h
+}
+
+/// creates the assign.
+@pub
+make new_assign (node: AST_Assign) -> owned<AST_Head> {
+    make h = fresh_head()
+    make p: owned<AST_Assign> = std::mem::debug.alloc(@sizeof AST_Assign).unwrap()
+    p.* = node
+    h.*.kind = AST_Kind.Assign
+    h.*.assign = p
+    return h
+}
+
+/// creates the return.
+@pub
+make new_return (node: AST_Return) -> owned<AST_Head> {
+    make h = fresh_head()
+    make p: owned<AST_Return> = std::mem::debug.alloc(@sizeof AST_Return).unwrap()
+    p.* = node
+    h.*.kind = AST_Kind.Return
+    h.*.return_node = p
+    return h
+}
+
+// whether a head wraps an expression payload
+@pub
+make is_expr_head (h: ptr<AST_Head>) -> bool {
+    return h.*.kind == AST_Kind.Expr
+}

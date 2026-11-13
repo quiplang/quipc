@@ -1,0 +1,98 @@
+@pure @const {
+    make api = @import "bindings.quip"
+}
+
+@const {
+    make PrivateLinkage: i32 = 9
+    make GlobalUnnamedAddress: i32 = 2
+    make IntEqual: i32 = 32
+}
+
+@pub @unsafe
+make literal_bytes (context: ptr<any>, module: ptr<any>, text: str) -> ptr<any> {
+    make bytes = api::LLVMConstStringInContext2(context, text.data, text.len(), 0)
+    make name: str = ".str"
+    make global = api::LLVMAddGlobal(module, api::LLVMTypeOf(bytes), name.data)
+    api::LLVMSetInitializer(global, bytes)
+    api::LLVMSetGlobalConstant(global, 1)
+    api::LLVMSetLinkage(global, PrivateLinkage)
+    api::LLVMSetUnnamedAddress(global, GlobalUnnamedAddress)
+    return global
+}
+
+@pub @unsafe
+make literal_header (context: ptr<any>, module: ptr<any>, bytes: ptr<any>, length: uint) -> ptr<any> {
+    make word = api::LLVMInt64TypeInContext(context)
+    make fields: ptr<any>[3] = [bytes, api::LLVMConstInt(word, length, 0), api::LLVMConstInt(word, 0, 0)]
+    @unsafe make first: ptr<ptr<any>> = fields[0].pin
+    make header = api::LLVMConstStructInContext(context, first, 3, 0)
+    make name: str = ".str.header"
+    make global = api::LLVMAddGlobal(module, api::LLVMTypeOf(header), name.data)
+    api::LLVMSetInitializer(global, header)
+    api::LLVMSetGlobalConstant(global, 1)
+    api::LLVMSetLinkage(global, PrivateLinkage)
+    return global
+}
+
+@unsafe
+make load_length (builder: ptr<any>, byte: ptr<any>, word: ptr<any>, header: ptr<any>, unnamed: ptr<char>) -> ptr<any> {
+    make offset = api::LLVMConstInt(word, 8, 0)
+    @unsafe make indices: ptr<ptr<any>> = offset.pin
+    make address = api::LLVMBuildGEP2(builder, byte, header, indices, 1, unnamed)
+    make length = api::LLVMBuildLoad2(builder, word, address, unnamed)
+    api::LLVMSetAlignment(length, 8)
+    return length
+}
+
+/// Compares Quip string headers and then their bytes when lengths agree.
+@pub @unsafe
+make build (context: ptr<any>, module: ptr<any>) {
+    make name: str = "__quip_string_equal"
+    make memcmp_name: str = "memcmp"
+    make unnamed: str = ""
+    make function = api::LLVMGetNamedFunction(module, name.data)
+    make memcmp = api::LLVMGetNamedFunction(module, memcmp_name.data)
+    api::LLVMSetLinkage(function, PrivateLinkage)
+
+    make block_names: str[5] = ["entry", "length_equal", "bytes", "equal", "unequal"]
+    make blocks: ptr<any>[] = []
+    for label : block_names {
+        blocks.push(api::LLVMAppendBasicBlockInContext(context, function, label.data))
+    }
+
+    make builder = api::LLVMCreateBuilderInContext(context)
+    make byte = api::LLVMInt8TypeInContext(context)
+    make word = api::LLVMInt64TypeInContext(context)
+    make pointer = api::LLVMPointerTypeInContext(context, 0)
+    make c_int = api::LLVMInt32TypeInContext(context)
+    make zero = api::LLVMConstInt(word, 0, 0)
+    make left = api::LLVMGetParam(function, 0)
+    make right = api::LLVMGetParam(function, 1)
+
+    api::LLVMPositionBuilderAtEnd(builder, blocks[0])
+    make left_length = load_length(builder, byte, word, left, unnamed.data)
+    make right_length = load_length(builder, byte, word, right, unnamed.data)
+    make lengths_equal = api::LLVMBuildICmp(builder, IntEqual, left_length, right_length, unnamed.data)
+    api::LLVMBuildCondBr(builder, lengths_equal, blocks[1], blocks[4])
+
+    api::LLVMPositionBuilderAtEnd(builder, blocks[1])
+    make empty = api::LLVMBuildICmp(builder, IntEqual, left_length, zero, unnamed.data)
+    api::LLVMBuildCondBr(builder, empty, blocks[3], blocks[2])
+
+    api::LLVMPositionBuilderAtEnd(builder, blocks[2])
+    make left_data = api::LLVMBuildLoad2(builder, pointer, left, unnamed.data)
+    make right_data = api::LLVMBuildLoad2(builder, pointer, right, unnamed.data)
+    api::LLVMSetAlignment(left_data, 8)
+    api::LLVMSetAlignment(right_data, 8)
+    make args: ptr<any>[3] = [left_data, right_data, left_length]
+    @unsafe make arg_ptr: ptr<ptr<any>> = args[0].pin
+    make comparison = api::LLVMBuildCall2(builder, api::LLVMGlobalGetValueType(memcmp), memcmp, arg_ptr, 3, unnamed.data)
+    make same_bytes = api::LLVMBuildICmp(builder, IntEqual, comparison, api::LLVMConstInt(c_int, 0, 0), unnamed.data)
+    api::LLVMBuildRet(builder, api::LLVMBuildZExt(builder, same_bytes, word, unnamed.data))
+
+    api::LLVMPositionBuilderAtEnd(builder, blocks[3])
+    api::LLVMBuildRet(builder, api::LLVMConstInt(word, 1, 0))
+    api::LLVMPositionBuilderAtEnd(builder, blocks[4])
+    api::LLVMBuildRet(builder, zero)
+    api::LLVMDisposeBuilder(builder)
+}

@@ -1,34 +1,217 @@
 @pure @const {
-make block: unit = @import "block.quip"
+    make block: unit = @import "block.quip"
+    make syscall: unit = @import "../os/syscall.quip"
 
-make syscall: unit = @import "../os/syscall.quip"
+    make io: unit = @import "../io/pkg.quip"
 }
 
+// the head of one free list
+make type Bin {
+    make head: ptr<block::Block>? = none
+}
+
+// Mapping metadata lives outside allocatable blocks, so arena release never
+// destroys the bookkeeping needed to walk the remaining mappings.
+make type Chunk {
+    make next: ptr<Chunk>? = none
+    make first: ptr<block::Block>
+    make size: int = 0
+}
+
+// The heap keeps free blocks on size-segregated lists, so allocation looks at blocks that
+// are actually free (and mostly at blocks of about the right size) instead of walking every block
+// ever handed out. blocks are split on allocation and merged with a free neighbour on release.
 @pub
 make type Heap {
-    make head: ptr<block::Block>
-    make size: int = 1048576
+    // List heads are stored at the start of the first mapped chunk.
+    make bins: ptr<Bin>? = none
+    make chunks: ptr<Chunk>? = none
+    // how many bytes one growth step maps from the OS
+    make chunk_size: int = 1048576
+    // every byte the heap has mapped so far
+    make mapped: int = 0
+
+    make alloc_count: int = 0
+    make free_count: int = 0
+    make arena_releases: int = 0
+    make live_bytes: int = 0
+    make peak_live_bytes: int = 0
+
+    // which free list holds blocks of this size
+    @pub
+    make bin_of (size: int) -> int {
+        if size < 1024 { return size / 16 }
+
+        make base: int = 1024
+        make index: int = 64
+        while size / base >= 2 && base <= 4611686018427387903 {
+            base = base * 2
+            index = index + 4
+        }
+
+        return index + (size - base) / (base / 4)
+    }
 
     @pub
     make init () -> Heap {
 
         make h = Heap {
-            head = null
+            bins = none
         }
 
         @unsafe {
-            // Map anonymous memory
-            make raw_mem: ptr<any> = syscall::quip_map_anon(1048576)
-            make block_ptr: ptr<block::Block> = raw_mem
+            // map anonymous memory
+            make raw_mem: ptr<any> = syscall::quip_map_anon(h.chunk_size !)
 
-            block_ptr.*.free = true
-            block_ptr.*.size = 1048576 - (@sizeof block::Block)
-            block_ptr.*.next = null
+            // the list heads live at the start of the chunk
+            make chunk: ptr<Chunk> = raw_mem
+            chunk.*.next = none
+            chunk.*.size = h.chunk_size
+            make bytes: ptr<char> = raw_mem
+            make after_header: ptr<char> = bytes + (@sizeof Chunk)
+            make table: ptr<Bin> = after_header
+            h.chunks = chunk
+            make i: int = 0
+            while i < 320 {
+                make slot: ptr<Bin> = table + i
+                slot.*.head = none
+                i = i + 1
+            }
 
-            h.head = block_ptr
+            h.bins = table
+
+            // the rest of the chunk is one big free block
+            make table_bytes: int = 320 * (@sizeof Bin)
+            make after_table: ptr<char> = after_header + table_bytes
+            make block_ptr: ptr<block::Block> = after_table
+
+            chunk.*.first = block_ptr
+            block_ptr.*.size = h.chunk_size - (@sizeof Chunk) - table_bytes - (@sizeof block::Block)
+            block_ptr.*.next = none
+            h.insert_free(block_ptr)
+
+            h.mapped = h.chunk_size
         }
 
         return h
+    }
+
+    // puts a block at the front of the free list for its size
+    @this
+    make insert_free (b: ptr<block::Block>) {
+        @unsafe {
+            make table: ptr<Bin> = this.bins.unwrap()
+            make bin: ptr<Bin> = table + Heap.bin_of(b.*.size)
+
+            b.*.free = true
+            b.*.fprev = none
+            b.*.fnext = bin.*.head
+
+            if bin.*.head != none {
+                make first = bin.*.head.unwrap()
+                first.*.fprev = b
+            }
+
+            bin.*.head = b
+        }
+    }
+
+    // takes a block off its free list. the size must be the one it had when it was inserted.
+    @this
+    make remove_free (b: ptr<block::Block>) {
+        @unsafe {
+            make table: ptr<Bin> = this.bins.unwrap()
+            make bin: ptr<Bin> = table + Heap.bin_of(b.*.size)
+
+            if b.*.fprev != none {
+                make before_opt: ptr<block::Block>? = b.*.fprev
+                make before: ptr<block::Block> = before_opt.unwrap()
+                before.*.fnext = b.*.fnext
+            } else {
+                bin.*.head = b.*.fnext
+            }
+
+            if b.*.fnext != none {
+                make after_opt: ptr<block::Block>? = b.*.fnext
+                make after: ptr<block::Block> = after_opt.unwrap()
+                after.*.fprev = b.*.fprev
+            }
+
+            b.*.free = false
+        }
+    }
+
+    // a free block of at least `req` bytes, if there is one: a fit from the request's own list,
+    // otherwise the first block of any larger list (all of those are big enough)
+    @this
+    make find (req: int) -> ptr<block::Block>? {
+        @unsafe {
+            make table: ptr<Bin> = this.bins.unwrap()
+            make cls: int = Heap.bin_of(req)
+
+            make own: ptr<Bin> = table + cls
+            make curr: ptr<block::Block>? = own.*.head
+
+            while curr != none {
+                make some = curr.unwrap()
+
+                if some.*.size >= req {
+                    return some
+                }
+
+                curr = some.*.fnext
+            }
+
+            make c: int = cls + 1
+
+            while c < 320 {
+                make bigger: ptr<Bin> = table + c
+
+                if bigger.*.head != none {
+                    return bigger.*.head
+                }
+
+                c = c + 1
+            }
+        }
+
+        return none
+    }
+
+    // maps a fresh chunk and puts it on a free list, so the next
+    // search has new memory to hand out. `req_size` is the request that just
+    // failed, the chunk is always big enough to satisfy it.
+    @pub @this
+    make grow (req_size: int) {
+        @unsafe {
+            make page: int = syscall::quip_page_size()
+
+            make want: int = this.chunk_size
+            make needed: int = req_size + (@sizeof block::Block) * 2 + (@sizeof Chunk)
+
+            if needed > want {
+                want = needed
+            }
+
+            // whole pages only
+            want = ((want + page - 1) / page) * page
+
+            make raw_mem: ptr<any> = syscall::quip_map_anon(want)
+            make chunk: ptr<Chunk> = raw_mem
+            chunk.*.next = this.chunks
+            chunk.*.size = want
+            make bytes: ptr<char> = raw_mem
+            make after_header: ptr<char> = bytes + (@sizeof Chunk)
+            make block_ptr: ptr<block::Block> = after_header
+            chunk.*.first = block_ptr
+            this.chunks = chunk
+
+            block_ptr.*.size = want - (@sizeof Chunk) - (@sizeof block::Block)
+            block_ptr.*.next = none
+            this.insert_free(block_ptr)
+
+            this.mapped = this.mapped + want
+        }
     }
 
     @pub @this @allocator
@@ -37,31 +220,87 @@ make type Heap {
             return error.ZeroAllocation
         }
 
+        // keep block sizes (and so list membership) coarse
+        make req: int = ((req_size + 15) / 16) * 16
+
         @unsafe {
-            make curr: ptr<block::Block> = this.head
+            // two passes: the first looks at the memory we already have,
+            // the second one runs after `grow` mapped a new chunk
+            make pass: int = 0
 
-            while curr != null {
-                if curr.*.free {
-                    make has_space: bool = curr.*.size > req_size + (@sizeof block::Block)
-                    if has_space {
-                        curr.*.split(req_size + 0)
-                        curr.*.free = false
-                        @unsafe make ptr_res_space: ptr<block::Block> = curr + 1
-                        @unsafe return ptr_res_space
+            while pass < 2 {
+
+                make found = this.find(req)
+
+                if found != none {
+                    make some = found.unwrap()
+                    this.remove_free(some)
+
+                    // give the unused tail back as a block of its own when it can hold one
+                    make some_size: int = some.*.size
+                    make spare: int = some_size - req - (@sizeof block::Block)
+
+                    if spare >= 16 {
+                        some.*.split(req)
+                        make rest_opt: ptr<block::Block>? = some.*.next
+                        make rest: ptr<block::Block> = rest_opt.unwrap()
+                        this.insert_free(rest)
                     }
 
-                    make fits: bool = curr.*.size >= req_size
-                    if fits {
-                        curr.*.free = false
-                        @unsafe make ptr_res_exact: ptr<block::Block> = curr + 1
-                        @unsafe return ptr_res_exact
-                    }
+                    this.alloc_count = this.alloc_count + 1
+                    some.*.generation = this.alloc_count
+
+                    // Runtime buffers retain their own lifetime and accounting,
+                    // even when the runtime is routed through this allocator.
+                    if syscall::quip_runtime_allocation_active() != 0 { some.*.generation = 0 }
+
+                    this.live_bytes = this.live_bytes + some.*.size
+
+                    if this.live_bytes > this.peak_live_bytes { this.peak_live_bytes = this.live_bytes }
+
+                    @unsafe make ptr_res: ptr<block::Block> = some + 1
+                    @unsafe return ptr_res
                 }
-                curr = curr.*.next
+
+                pass = pass + 1
+
+                if pass == 1 {
+                    this.grow(req)
+                }
             }
         }
 
         return error.OutOfMemory
+    }
+
+    // merges `b` with the blocks right after it in memory while those are free
+    @this
+    make merge_forward (b: ptr<block::Block>) {
+        @unsafe {
+            while b.*.next != none {
+                make some_opt: ptr<block::Block>? = b.*.next
+                make some: ptr<block::Block> = some_opt.unwrap()
+
+                // the list can span several mapped chunks, so the next
+                // block may live in another mapping - it is only a real
+                // neighbour when it starts exactly where this one ends
+                make data: ptr<block::Block> = b + 1
+                make end: ptr<char> = data
+                make b_size: int = b.*.size
+                end = end + b_size
+                make start: ptr<char> = some
+
+                if some.*.free && start == end {
+                    this.remove_free(some)
+                    make some_size: int = some.*.size
+                    b.*.size = b_size + some_size + (@sizeof block::Block)
+                    make some_next: ptr<block::Block>? = some.*.next
+                    b.*.next = some_next
+                } else {
+                    return
+                }
+            }
+        }
     }
 
     @pub @this @deallocator
@@ -69,8 +308,72 @@ make type Heap {
         @unsafe {
             make block_ptr: ptr<block::Block> = raw_ptr
             make header: ptr<block::Block> = block_ptr - 1
-            header.*.free = true
-            header.*.join()
+
+            // a block that is already free was released twice: linking it again would turn the
+            // free list into a cycle, so the second release is ignored
+            if header.*.free {
+                return
+            }
+
+            this.free_count = this.free_count + 1
+            this.live_bytes = this.live_bytes - header.*.size
+            this.merge_forward(header)
+            this.insert_free(header)
         }
+    }
+
+    // Explicit arena lifetime: callers must discard every reference created
+    // since the checkpoint before releasing it. Existing allocations survive.
+    @pub @this
+    make checkpoint () -> uint { return this.alloc_count }
+
+    @pub @this
+    make outstanding_allocations () -> int { return this.alloc_count - this.free_count }
+
+    @pub @this
+    make release_since (mark: uint) -> void {
+        @unsafe {
+            make mapping = this.chunks
+
+            while mapping != none {
+                make chunk = mapping.unwrap()
+                make current: ptr<block::Block>? = chunk.*.first
+
+                while current != none {
+                    make b = current.unwrap()
+
+                    if !b.*.free && b.*.generation > mark {
+                        make data: ptr<block::Block> = b + 1
+                        make owned_data: owned<any> = data
+                        this.free(owned_data)
+                        this.arena_releases = this.arena_releases + 1
+                    }
+
+                    // free may merge its following free blocks; continue from
+                    // the surviving header rather than a removed neighbour.
+                    current = b.*.next
+                }
+
+                mapping = chunk.*.next
+            }
+        }
+    }
+
+    @pub @this
+    make dump () {
+        // Snapshot before formatting: reporting must not change its own totals.
+        make allocated = this.alloc_count
+        make freed = this.free_count
+        make releases = this.arena_releases
+        make live = this.live_bytes
+        make peak = this.peak_live_bytes
+        make mapped = this.mapped
+        io::println("Debug allocations: " + allocated.to_str())
+        io::println("Debug frees: " + freed.to_str())
+        io::println("Debug outstanding allocations: " + (allocated - freed).to_str())
+        io::println("Debug arena releases: " + releases.to_str())
+        io::println("Debug live bytes: " + live.to_str())
+        io::println("Debug peak live bytes: " + peak.to_str())
+        io::println("Debug mapped: " + mapped.to_str())
     }
 }

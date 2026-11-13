@@ -12,6 +12,9 @@ make to_str () -> str {
     }
 
     make value: int = this
+
+    if value == 0 - 9223372036854775807 - 1 { return "-9223372036854775808" }
+
     make negative: bool = false
 
     if value < 0 {
@@ -55,6 +58,9 @@ make to_str () -> str {
 
 @impl uint
 make to_str () -> str {
+    if this == 0 { return "0" }
+
+
     make digits: str = ""
     make result: str = ""
 
@@ -64,6 +70,7 @@ make to_str () -> str {
     }
 
     make value: uint = this
+
     while value > 0 {
         make d: uint = value - (value / 10) * 10
 
@@ -83,18 +90,26 @@ make to_str () -> str {
         value = value / 10
     }
 
-    make i: uint = digits.len() - 1
+    make i: uint = digits.len()
 
-    while i >= 0 {
-        result = result + digits[i]
+    while i > 0 {
         i = i - 1
+        result = result + digits[i]
     }
 
     return result
 }
 
+@impl u32
+make to_str () -> str {
+
+
+
+    return ""
+}
+
 @impl String
-make to_str() -> str {
+make to_str () -> str {
 
     make result: str = ""
 
@@ -109,9 +124,34 @@ make to_str() -> str {
 }
 
 @impl char
-make to_str() -> str {
+make to_str () -> str {
     make result: str = ""
     result.push(this)
 
     return result
+}
+
+@impl bool
+make to_str () -> str {
+    if this {
+        return "true"
+    } else {
+        return "false"
+    }
+}
+
+//
+@impl f32
+make to_str () -> str {
+    return "0.0"
+}
+
+@impl f64
+make to_str () -> str {
+    return "0.0"
+}
+
+@impl float
+make to_str () -> str {
+    return "0.0"
 }

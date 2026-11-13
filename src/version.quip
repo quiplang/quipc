@@ -1,0 +1,3 @@
+// Updated by build.quip's bump-major, bump-minor and bump-build options.
+@pub @const
+make current: str = "0.1.1320"

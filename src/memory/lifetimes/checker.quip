@@ -1,0 +1,342 @@
+// driving the memory pass over a module: dataflow fixpoint, dangling-ref
+// checks and the stack slot / obligation reports
+
+@pure @const {
+    make mir = @import "../../mir/mir.quip"
+    make hir = @import "../../hir/hir.quip"
+    make diags = @import "../../diag/diagnosis.quip"
+    make util = @import "../../util/pkg.quip"
+
+    make graph = @import "graph.quip"
+    make state = @import "liveness.quip"
+    make infer = @import "inference.quip"
+    make errors = @import "errors.quip"
+    make report = @import "../report.quip"
+    make plan = @import "../plan.quip"
+    make obligations = @import "../obligations.quip"
+    make profile = @import "../../core/analysis_profile.quip"
+}
+
+/// checks each mir function and appends its memory report.
+@pub
+make check (mir_mod: ref<mir::MirModule>, hir_mod: ref<hir::HirModule>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, out: ref<report::MemReport>) -> void {
+    make i = 0
+
+    while i < mir_mod.*.funcs.len() {
+        if diag.*.is_aborting() { return }
+
+        check_func(mir_mod.*.funcs[i].pin, diag, ctx, out, mir_mod.*.structs.pin, mir_mod.*.funcs.pin, false)
+        i = i + 1
+    }
+
+    return
+}
+
+/// reuses eligible function reports and checks the remaining mir functions.
+@pub
+make check_cached (mir_mod: ref<mir::MirModule>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, out: ref<report::MemReport>, previous: ref<report::MemReport>, reuse: ref<bool[]>, profiling: bool) -> void {
+    make i: uint = 0
+
+    while i < mir_mod.*.funcs.len() {
+        if diag.*.is_aborting() { return }
+
+        // Callee effects can change even when this function's MIR is reused.
+        // Recheck callers with pins until effect summaries are cache keys.
+        if i < reuse.*.len() && reuse.*[i] && i < previous.*.funcs.len() && !has_pin_and_call(mir_mod.*.funcs[i].body.pin) {
+            out.*.funcs.push(previous.*.funcs[i])
+            out.*.reused_functions = out.*.reused_functions + 1
+        } else { check_func(mir_mod.*.funcs[i].pin, diag, ctx, out, mir_mod.*.structs.pin, mir_mod.*.funcs.pin, profiling) }
+
+        i = i + 1
+    }
+}
+
+make has_pin_and_call (body: ref<mir::MirBody>) -> bool {
+    make has_pin = false
+    make i = 0
+    while i < body.*.stmts.len() {
+        if body.*.stmts[i].kind == mir::MirStmtKind.Assign && body.*.stmts[i].rvalue.kind == mir::MirRvalueKind.Pin { has_pin = true }
+
+        i = i + 1
+    }
+
+    if !has_pin { return false }
+
+    i = 0
+
+    while i < body.*.terms.len() {
+        if body.*.terms[i].kind == mir::MirTermKind.Call { return true }
+
+        i = i + 1
+    }
+
+    return false
+}
+
+/// returns the successor block ids of a mir terminator.
+make successors (t: ref<mir::MirTerm>) -> uint[] {
+    make out: uint[] = []
+
+    match t.*.kind {
+        mir::MirTermKind.Goto { out.push(t.*.target) }
+
+        mir::MirTermKind.Branch {
+            out.push(t.*.target)
+            out.push(t.*.other)
+        }
+
+        mir::MirTermKind.Call { out.push(t.*.target) }
+        _ {}
+    }
+
+    return out
+}
+
+/// checks the function.
+make check_func (f: ref<mir::MirFunc>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, out: ref<report::MemReport>, structs: ref<mir::MirStruct[]>, funcs: ref<mir::MirFunc[]>, profiling: bool) -> void {
+    make fr = report::MemFuncReport {}
+
+    fr.name = f.*.name !
+    fr.is_external = f.*.is_external
+
+    make body = f.*.body.pin
+
+    if body.*.terms.len() > 0 && body.*.locals.len() > 0 {
+        run(body, diag, ctx, fr.pin, structs, funcs, profiling)
+    }
+
+    fr.managed_heap_sites = report::count_managed_sites(body)
+    report::compute_summary(fr.pin)
+
+    out.*.funcs.push(fr)
+    return
+}
+
+make run (body: ref<mir::MirBody>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, fr: ref<report::MemFuncReport>, structs: ref<mir::MirStruct[]>, funcs: ref<mir::MirFunc[]>, profiling: bool) -> void {
+    make started: uint = 0
+
+    if profiling { started = profile::now() }
+
+    make g = graph::build(body)
+
+    if profiling { profile::record(true, started, "mem_graph", fr.*.name.copy()) started = profile::now() }
+
+    make nblocks = body.*.terms.len()
+    make nlocals = body.*.locals.len()
+
+    // statements bucketed by their block, in program order
+    make by_block: graph::IdList[] = []
+
+    make bi = 0
+
+    while bi < nblocks {
+        by_block.push(graph::IdList {})
+        bi = bi + 1
+    }
+
+    make si = 0
+
+    while si < body.*.stmts.len() {
+        make b = body.*.stmts[si].block
+
+        if b < nblocks {
+            by_block[b].ids.push(si)
+        }
+
+        si = si + 1
+    }
+
+    // predecessors, used to recompute block entry states from scratch. the entry
+    // state must reflect the *current* out-states of every predecessor: a pin can
+    // be released on an edge, and an incremental union would keep the stale
+    // `pinned` bit forever once a predecessor had set it.
+    make preds: graph::IdList[] = []
+    bi = 0
+
+    while bi < nblocks {
+        preds.push(graph::IdList {})
+        bi = bi + 1
+    }
+
+    // the control-flow edges do not change between dataflow sweeps.
+    // retain them here instead of allocating successor arrays on every visit.
+    make succs_by_block: graph::IdList[] = []
+    bi = 0
+
+    while bi < nblocks {
+        make edges = graph::IdList {}
+        edges.ids = successors(body.*.terms[bi].pin)
+        make pk = 0
+
+        while pk < edges.ids.len() {
+            make sb = edges.ids[pk]
+
+            if sb < nblocks {
+                preds[sb].ids.push(bi)
+            }
+
+            pk = pk + 1
+        }
+
+        succs_by_block.push(edges)
+        bi = bi + 1
+    }
+
+    make ins: state::LocalState[] = []
+    bi = 0
+
+    while bi < nblocks {
+        ins.push(state::create(nlocals, g.pins.len()))
+        bi = bi + 1
+    }
+
+    state::init_entry(ins[0].pin, body.*.param_count, body.*.capture_locals.pin)
+
+    make outs: state::LocalState[] = []
+    bi = 0
+
+    while bi < nblocks {
+        outs.push(state::create(nlocals, g.pins.len()))
+        bi = bi + 1
+    }
+
+    make reached: uint[] = []
+    make processed: uint[] = []
+    bi = 0
+
+    while bi < nblocks {
+        reached.push(0)
+        processed.push(0)
+        bi = bi + 1
+    }
+
+    reached[0] = 1
+
+    make it = infer::Infer.create(body, g.pin, diag, ctx, fr, structs, funcs)
+
+    make zero = state::create(nlocals, g.pins.len())
+    make merged_in = state::create(nlocals, g.pins.len())
+
+    // silent fixpoint. entry states are rebuilt from the current predecessor
+    // out-states on every sweep (rather than accumulated with a union) so kills
+    // such as pin releases can shrink a state again.
+    make changed = true
+    make guard = 0
+
+    while changed && guard < 512 {
+        if diag.*.is_aborting() { return }
+
+        changed = false
+        guard = guard + 1
+        bi = 0
+
+        while bi < nblocks {
+            if reached[bi] != 0 {
+                state::reset_to(merged_in.pin, zero.pin)
+
+                if bi == 0 {
+                    state::init_entry(merged_in.pin, body.*.param_count, body.*.capture_locals.pin)
+                } else {
+                    make pk = 0
+
+                    while pk < preds[bi].ids.len() {
+                        make pb = preds[bi].ids[pk]
+
+                        if reached[pb] != 0 {
+                            state::merge_into(merged_in.pin, outs[pb].pin)
+                        }
+
+                        pk = pk + 1
+                    }
+                }
+
+                // a transfer with the same complete input produces the same output.
+                // include diagnostic sites in the comparison so labels stay stable.
+                make same = state::equal(ins[bi].pin, merged_in.pin)
+
+                if !same {
+                    if state::assign_changed(ins[bi].pin, merged_in.pin) { changed = true }
+                }
+
+                if processed[bi] == 0 || !same {
+                    processed[bi] = 1
+                    state::reset_to(outs[bi].pin, ins[bi].pin)
+                    it.emit = false
+                    it.block(bi, by_block.pin, outs[bi].pin)
+
+                    make k = 0
+                    while k < succs_by_block[bi].ids.len() {
+                        make sb = succs_by_block[bi].ids[k]
+
+                        if sb < nblocks && reached[sb] == 0 {
+                            reached[sb] = 1
+                            changed = true
+                        }
+
+                        k = k + 1
+                    }
+                }
+            }
+
+            bi = bi + 1
+        }
+    }
+
+    if profiling { profile::record(true, started, "mem_flow", fr.*.name.copy()) started = profile::now() }
+
+    // reporting pass
+    it.emit = true
+    bi = 0
+
+    while bi < nblocks {
+        if reached[bi] != 0 {
+            state::reset_to(outs[bi].pin, ins[bi].pin)
+            it.block(bi, by_block.pin, outs[bi].pin)
+        }
+
+        bi = bi + 1
+    }
+
+    // dangling references are decided purely by kill lines
+    make pi = 0
+
+    while pi < g.pins.len() {
+        make src = g.pins[pi].src
+        make holder = g.pins[pi].holder
+        make source_ty = body.*.locals[src].ty.copy()
+        make owned = source_ty.len() >= 6 && source_ty[0] == 'o' && source_ty[1] == 'w' && source_ty[2] == 'n' && source_ty[3] == 'e' && source_ty[4] == 'd' && source_ty[5] == '<'
+
+        if pi < g.return_pins.len() && g.return_pins[pi] != 0 && !body.*.locals[src].is_param && !g.pins[pi].indirect && !owned {
+            make d = errors::return_stack_ref(body, g.pins[pi].range.copy(), src)
+            d.attach(diags::Label.create(body.*.locals[src].range.copy(), "source storage declared here"))
+            diag.*.report(d)
+        }
+
+        if g.has_dead[src] != 0 {
+            make holder_kill = graph::kill_line(g.pin, holder)
+
+            if holder_kill > g.dead[src] {
+                make d = errors::ref_outlives(body, g.pins[pi].range.copy(), holder, src, holder_kill, g.dead[src])
+                d.attach(diags::Label.create(body.*.locals[src].range.copy(), "source storage declared here"))
+
+                if g.dead[src] < body.*.stmts.len() { d.attach(diags::Label.create(body.*.stmts[g.dead[src]].range.copy(), "source storage ends here")) }
+
+                d.attach(diags::Label.create(errors::last_use_range(body, g.pin, holder), "reference is still used here"))
+                diag.*.report(d)
+            }
+        }
+
+        pi = pi + 1
+    }
+
+    // obligations still open auto-release at the owner's kill line
+    obligations::finalize(fr.*.obligations.pin, g.pin, g.nstmts)
+
+    if profiling { profile::record(true, started, "mem_report", fr.*.name.copy()) started = profile::now() }
+
+    fr.*.slots = plan::build(g.pin, body, structs)
+
+    if profiling { profile::record(true, started, "mem_plan", fr.*.name.copy()) }
+
+    return
+}

@@ -1,242 +1,113 @@
 @pure @const {
-make fmt: unit = @import "../fmt/pkg.quip"
 
-make os: unit = @import "../os/pkg.quip"
-make ffi: unit = @import "../ffi/cffi.quip"
+    make mem: unit = @import "../mem/pkg.quip"
+    make ffi: unit = @import "../ffi/c.quip"
 
-}
-
-
-// ====
-
-@pub @const {
-make STDIN: int = 0
-make STDOUT: int = 1
-make STDERR: int = 2
-}
-
-// alias
-// make PrintTypes: Type = variant<String, str, ptr<char>, int, uint, i8, i16, i32, i64, u8, u16, u32, u64, float, f32, f64>
-
-// ====
-
-@pub
-make println (fmt: variant<String, str, ptr<char>>) -> void {
-
-    make nl: String = "\n"
-    make bad_fmt: String = "unsupported format Type\n"
-
-    match fmt {
-
-        a: String {
-            os::syscall::write(STDOUT, a.data, a.length)
-        }
-
-        b: str {
-            os::syscall::write(STDOUT, b.data, b.len())
-        }
-
-        c: ptr<char> {
-            make len = ffi::strlen(c.pin)
-            os::syscall::write(STDOUT, c, len)
-        }
-
-        _ {
-            os::syscall::write(STDOUT, bad_fmt.data, bad_fmt.length)
-            return
-        }
-    }
-
-    os::syscall::write(STDOUT, nl.data, 1)
-}
-
-
-@pub
-make print (fmt: variant<String, str, ptr<char>>) -> void {
-    make bad_fmt: String = "unsupported format Type\n"
-
-    match fmt {
-
-        a: String {
-            os::syscall::write(STDOUT, a.data, a.length)
-        }
-
-        b: str {
-            os::syscall::write(STDOUT, b.data, b.len())
-        }
-
-        c: ptr<char> {
-            make len = ffi::strlen(c.pin)
-            os::syscall::write(STDOUT, c, len)
-        }
-
-        _ {
-            os::syscall::write(STDOUT, bad_fmt.data, bad_fmt.length)
-            return
-        }
-    }
-}
-
-@pub
-make split (buffer: variant<String, str, ptr<char>>, c: char) -> str[] {
-    make s: str = match buffer {
-
-        x: str => x
-        y: String => y.to_str()
-        z: ptr<char> => z.to_str()
-        _ {
-            println("unsupported format Type")
-        } => ""
-
-    }
-
-    make result: str[] = []
-    make current: str = ""
-    make i: int = 0
-
-    while i < s.len() {
-        if s[i] == c {
-            if current.len() > 0 {
-                result.push(current + "")
-                current = ""
-            }
-        } else {
-            current = current + s[i]
-        }
-        i = i + 1
-    }
-
-    if current.len() > 0 {
-        result.push(current + "")
-    }
-
-    return result
-}
-
-
-// ====
-
-@pub
-make type Path {
-
-    make content: str[]
-
-    make is_absolute: bool
-
-    @weak
-    make delimeter: char = '/'
+    make file: unit = @import "./file.quip"
+    make path: unit = @import "./path.quip"
+    make dir: unit = @import "./dir.quip"
 
     @target "macos" {
-        @const make delimeter: char = '/'
+        make os: unit = @import "../os/macos.quip"
     }
 
-    @pub
-    make create (buffer: variant<String, str, ptr<char>>) -> Path {
-        make path = Path {}
-
-        match buffer {
-            a: String {
-                path.is_absolute = a.len() > 0 && a[0] == path.delimeter
-            }
-
-            b: str {
-                path.is_absolute = b.len() > 0 && b[0] == path.delimeter
-            }
-
-            c: ptr<char> {
-                make t = c.to_str()
-                path.is_absolute = t.len() > 0 && t[0] == path.delimeter
-            }
-        }
-
-        path.content = split(buffer, path.delimeter)
-        return path
-    }
-
-    @pub @this
-    make get () -> str {
-        make path: str = ""
-        if this.is_absolute {
-            path = path + this.delimeter
-        }
-        make i: int = 0
-        while i < this.content.len() {
-            path = path + this.content[i]
-            if i < this.content.len() - 1 {
-                path = path + this.delimeter
-            }
-            i = i + 1
-        }
-
-        return path
-    }
-
-    @pub @this
-    make absolute () -> Path {
-        if this.is_absolute {
-            return Path {
-                content = this.content,
-                is_absolute = true,
-            }
-        }
-
-        make t = os::getcwd()
-        make cwd = Path.create(t)
-        make result = Path {}
-
-        for i : cwd.content.iter() {
-            result.content.push(i)
-        }
-
-        for j : this.content.iter() {
-            result.content.push(j)
-        }
-
-        return result
+    @target "linux" {
+        make os: unit = @import "../os/linux.quip"
     }
 }
 
-@impl String
-make to_path () -> Path {
-    // println(this)
-    return Path.create(this.deref)
+@pub @const @nomangle {
+    make STDIN: int = 0
+    make STDOUT: int = 1
+    make STDERR: int = 2
+}
+
+@pub @pure @const {
+    make MODE_FILE: int = 420           // rw-r--r-- 0o644
+    make MODE_FILE_PRIVATE: int = 384   // rw------- 0o600
+
+    make MODE_DIRECTORY: int = 493 // rwxr-xr-x 0o755
+    make MODE_DIRECTORY_PRIVATE: int = 448 // rwx------ 0o700
+
+    make MODE_EVERYONE: int = 511         // rwxrwxrwx 0o777
+}
+
+@pub @pure @const {
+    make File: Type = file::File
+    make Path: Type = path::Path
+    make Dir: Type = dir::Dir
 }
 
 
-// ====
+/// prints text followed by a newline to standard output
+@pub
+make println (fmt: variant<String, str, ref<str>>) -> void {
+    print(fmt)
+
+    make new_line: String = "\n"
+    @unsafe os::write(os::STDOUT_FILENO, new_line.data, 1)
+}
+
+/// prints text to standard output
+@pub
+make print (fmt: variant<String, str, ref<str>>) -> void {
+
+    make bad_fmt = "unsupported format Type\n"
+
+    match fmt {
+
+        a: String {
+            @unsafe os::write(os::STDOUT_FILENO, a.data, a.length)
+        }
+
+        b: str {
+            @unsafe os::write(os::STDOUT_FILENO, b.data, b.len())
+        }
+
+        c: ref<str> {
+            @unsafe os::write(os::STDOUT_FILENO, c.*.data, c.*.len())
+        }
+
+        _ {
+            @unsafe os::write(os::STDOUT_FILENO, bad_fmt.data, bad_fmt.len())
+            return
+        }
+    }
+
+}
+
+/// read a line of input from the user in stdin
+@pub
+make input () -> !str {
+    return error.Unimplemented
+}
 
 @pub
-make type File {
+make test () -> !void {
 
-    @pub make path_abs: Path
-    @pub make fd: int
-    @pub make content: str
+    make path = Path.create("pkg.quip")
 
-    @pub
-    make open (path: Path) -> !File {
-        make file: File = File {}
-
-        // println(path.get())
-
-        file.fd = os::syscall::open(path.get())
-        // file.path_abs = path.absolute()
-
-        if file.fd < 0 {
-            return error.IOError
-        }
-
-        return file
+    // run the whole pipeline Open->Read->Close
+    File.orc(path) catch {
+        return error.TestFailed
     }
 
-    @pub @this
-    make close () {
-        os::syscall::close(this.fd)
+    // create a directory and a file inside it
+    make dir_path = Path.create(".quip_test_dir")
+    Dir.mkdir(dir_path.pin, MODE_DIRECTORY) catch {
+        return error.TestFailed
     }
 
-    @pub @this
-    make read () -> !void {
-        if os::syscall::quip_file_read_fd(this.fd, this.content.pin) < 0 {
-            return error.FaileToRead
-        }
+    make file_path = Path.create(".quip_test_dir/quip_test_file.txt")
+    make file: File = File.create(file_path, MODE_FILE) catch {
+        return error.TestFailed
     }
+
+    file.write("quip test content") catch {
+        return error.TestFailed
+    }
+
+    file.close()
+
+    return
 }

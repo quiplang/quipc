@@ -1,0 +1,71 @@
+@pure @const {
+    @target "macos" make os = @import "../os/macos.quip"
+    @target "linux" make os = @import "../os/linux.quip"
+}
+
+make type TimeSpec { make seconds: i64 make nanoseconds: i64 }
+
+@pub @unsafe
+make time_errno () -> ptr<i32> {
+    @target "macos" { return os::__error() }
+    @target "linux" { return os::__errno_location() }
+    @unsafe make null: ptr<i32> = 0
+    return null
+}
+
+@pub @unsafe @export "quip_time_monotonic_ns"
+make time_monotonic (output: ptr<uint>) -> int {
+    @unsafe make null: ptr<uint> = 0
+
+    if output == null { return -1 }
+
+    make value: TimeSpec = .{}
+    @unsafe make address: ptr<os::timespec> = value.pin
+
+    if os::clock_gettime(os::CLOCK_MONOTONIC, address) != 0 { return -1 }
+
+    @unsafe make seconds: uint = value.seconds
+    @unsafe make nanos: uint = value.nanoseconds
+
+    if value.seconds < 0 || value.nanoseconds < 0 || nanos >= 1000000000 || seconds > 18446744073 || (seconds == 18446744073 && nanos > 709551615) {
+        make code = time_errno()
+        code.* = os::EOVERFLOW
+        return -1
+    }
+
+    output.* = seconds * 1000000000 + nanos
+    return 0
+}
+
+@pub @unsafe @export "quip_time_unix_seconds"
+make time_unix (output: ptr<int>) -> int {
+    @unsafe make null: ptr<int> = 0
+
+    if output == null { return -1 }
+
+    make value: TimeSpec = .{}
+    @unsafe make address: ptr<os::timespec> = value.pin
+
+    if os::clock_gettime(os::CLOCK_REALTIME, address) != 0 { return -1 }
+
+    output.* = value.seconds
+    return 0
+}
+
+@pub @unsafe @export "quip_time_sleep_ns"
+make time_sleep (nanos: uint) -> int {
+    make remaining: TimeSpec = .{}
+    @unsafe make seconds: i64 = nanos / 1000000000
+    @unsafe make fraction: i64 = nanos % 1000000000
+    remaining.seconds = seconds
+    remaining.nanoseconds = fraction
+    @unsafe make address: ptr<os::timespec> = remaining.pin
+
+    while os::nanosleep(address, address) != 0 {
+        make code = time_errno()
+
+        if code.* != 4 { return -1 }
+    }
+
+    return 0
+}

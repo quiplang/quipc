@@ -1,0 +1,7 @@
+@pure @const {
+    make memory = @import "memory.quip"
+    make strings = @import "str.quip"
+    make arrays = @import "array.quip"
+    make closures = @import "closure.quip"
+    make panic = @import "panic.quip"
+}

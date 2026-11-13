@@ -1,0 +1,13 @@
+@pub
+make enum Kind {
+    None,
+    String,
+    Descriptor,
+}
+
+/// The cleanup associated with a local, including captured storage.
+@pub
+make type Local {
+    @pub make kind: Kind = Kind.None
+    @pub make in_environment: bool = false
+}

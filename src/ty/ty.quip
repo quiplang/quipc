@@ -1,0 +1,466 @@
+// types of the program being compiled
+//
+// every type is an index into TyInterner.tys
+// primitives are interned first, so their ids are the constants below
+
+@pure @const {
+    make std: unit = @import "std"
+}
+
+@pub @const {
+    make TY_ERROR: uint = 0
+    make TY_VOID: uint = 1
+    make TY_BOOL: uint = 2
+    make TY_I8: uint = 3
+    make TY_I16: uint = 4
+    make TY_I32: uint = 5
+    make TY_I64: uint = 6
+    make TY_U8: uint = 7
+    make TY_U16: uint = 8
+    make TY_U32: uint = 9
+    make TY_U64: uint = 10
+    make TY_INT: uint = 11
+    make TY_UINT: uint = 12
+    make TY_F32: uint = 13
+    make TY_F64: uint = 14
+    make TY_FLOAT: uint = 15
+    make TY_STR: uint = 16
+    make TY_STRBUF: uint = 17       // String
+    make TY_TEXT: uint = 18
+    make TY_CHAR: uint = 19
+    make TY_ERROR_VAL: uint = 20    // type of `error.Name` expressions (the error-value kind)
+    make TY_AUTO: uint = 21         // any
+}
+
+/// identifies a kind of interned compiler type.
+@pub
+make enum TyKind {
+    Error,
+    Infer,              // auto
+    Void, Bool,
+    I8, I16, I32, I64, U8, U16, U32, U64, Int, Uint,
+    F32, F64, Float,
+    Text,               // string literal, must be translated to 'Str' or 'StrBuf'
+    Str, StrBuf, Char,
+    Array,
+    Optional,
+    Fallible,
+    ErrorVal, // the type of any `error.Name` expression; unifies with Fallible<T>
+    Ptr, Owned, Ref,
+    Func,
+    Adt,
+    Variant,
+}
+
+/// stores an interned type and its associated type ids.
+@pub
+make type Ty {
+    @pub make is_unsafe: bool = false
+    @pub make kind: TyKind = TyKind.Error
+    @pub make elem: uint = 0
+    @pub make args: uint[] = []
+    make def: uint = 0
+    make var: uint = 0
+}
+
+/// owns the type table and supplies stable ids for types in that table.
+@pub
+make type TyInterner {
+    @pub make tys: Ty[] = []
+    make next_var: uint = 0
+
+    /// creates an interner with the built-in types in their fixed id order.
+    @pub
+    make create () -> TyInterner {
+        make it = TyInterner {}
+
+        it.push_kind(TyKind.Error)
+        it.push_kind(TyKind.Void)
+        it.push_kind(TyKind.Bool)
+        it.push_kind(TyKind.I8)
+        it.push_kind(TyKind.I16)
+        it.push_kind(TyKind.I32)
+        it.push_kind(TyKind.I64)
+        it.push_kind(TyKind.U8)
+        it.push_kind(TyKind.U16)
+        it.push_kind(TyKind.U32)
+        it.push_kind(TyKind.U64)
+        it.push_kind(TyKind.Int)
+        it.push_kind(TyKind.Uint)
+        it.push_kind(TyKind.F32)
+        it.push_kind(TyKind.F64)
+        it.push_kind(TyKind.Float)
+        it.push_kind(TyKind.Str)
+        it.push_kind(TyKind.StrBuf)
+        it.push_kind(TyKind.Text)
+        it.push_kind(TyKind.Char)
+        it.push_kind(TyKind.ErrorVal)
+        it.push_kind(TyKind.Infer)
+        return it
+    }
+
+    /// appends the kind.
+    @this
+    make push_kind (kind: TyKind) -> uint {
+        make t = Ty {}
+
+        t.kind = kind
+        make id = this.tys.len()
+        this.tys.push(t)
+        return id
+    }
+
+    /// returns the kind of an interned type, or the error kind for an invalid id.
+    @pub @this
+    make kind_of (id: uint) -> TyKind {
+        if id >= this.tys.len() {
+            return TyKind.Error
+        }
+
+        return this.tys[id].kind
+    }
+
+    /// returns the element type id for an interned type, or zero for an invalid id.
+    @pub @this
+    make elem_of (id: uint) -> uint {
+        if id >= this.tys.len() {
+            return 0
+        }
+
+        return this.tys[id].elem
+    }
+
+    /// copies the type arguments of an interned type.
+    @pub @this
+    make args_of (id: uint) -> uint[] {
+        if id >= this.tys.len() {
+            make t: uint[] = []
+
+            return t
+        }
+
+        // copy out: `this.tys[id]` is a permanent arena slot, its `args` buffer must not be
+        // moved out from under it (that would leave two owners of the same heap buffer and
+        // cause a double free once both are dropped)
+        make copy: uint[] = []
+        make i: uint = 0
+
+        while i < this.tys[id].args.len() {
+            copy.push(this.tys[id].args[i])
+            i = i + 1
+        }
+
+        return copy
+    }
+
+    /// returns the inference variable id for an interned type, or zero for an invalid id.
+    @pub @this
+    make var_of (id: uint) -> uint {
+        if id >= this.tys.len() {
+            return 0
+        }
+
+        return this.tys[id].var
+    }
+
+    /// returns the definition id for an interned type, or zero for an invalid id.
+    @pub @this
+    make def_of (id: uint) -> uint {
+        if id >= this.tys.len() {
+            return 0
+        }
+
+        return this.tys[id].def
+    }
+
+    // structural intern: equal types share one id
+    // Infer is never interned; each variable is its own type
+    @pub @this
+    make intern (ty: Ty) -> uint {
+        make kind = ty.kind
+        make do_lookup = true
+
+        if kind == TyKind.Infer {
+            do_lookup = false
+        }
+
+        if kind == TyKind.Error {
+            do_lookup = false
+        }
+
+        if do_lookup {
+            make found = this.find_interned(ty.pin)
+
+            if found < this.tys.len() {
+                return found
+            }
+        }
+
+        make id = this.tys.len()
+        this.tys.push(ty)
+
+
+        return id
+    }
+
+    @this
+    make find_interned (b: ref<Ty>) -> uint {
+        make cursor: uint = 0
+
+        while cursor < this.tys.len() {
+            if this.eq_at(cursor, b) {
+                return cursor
+            }
+
+            cursor = cursor + 1
+        }
+
+        return this.tys.len()
+    }
+
+    /// compares an interned type with a candidate for structural equality.
+    @this
+    make eq_at (idx: uint, b: ref<Ty>) -> bool {
+        if this.tys[idx].is_unsafe != b.*.is_unsafe || this.tys[idx].kind != b.*.kind || this.tys[idx].elem != b.*.elem || this.tys[idx].def != b.*.def {
+            return false
+        }
+
+        if this.tys[idx].args.len() != b.*.args.len() {
+            return false
+        }
+
+        make i: uint = 0
+
+        while i < b.*.args.len() {
+            if this.tys[idx].args[i] != b.*.args[i] {
+                return false
+            }
+
+            i = i + 1
+        }
+
+        return true
+    }
+
+    @pub @this
+    make fresh_infer () -> uint {
+        make t = Ty {}
+
+        t.kind = TyKind.Infer
+        t.var = this.next_var
+        this.next_var = this.next_var + 1
+
+        return this.intern(t)
+    }
+
+    /// interns a type with a single element type.
+    @pub @this
+    make wrap (kind: TyKind, elem: uint) -> uint {
+        make t = Ty {}
+
+        t.kind = kind
+        t.elem = elem
+
+        return this.intern(t)
+    }
+
+    /// interns an algebraic data type associated with a definition id.
+    @pub @this
+    make adt (def: uint) -> uint {
+        make t = Ty {}
+
+        t.kind = TyKind.Adt
+        t.def = def
+
+        return this.intern(t)
+    }
+
+    // `variant<A, B, ...>`: structurally equal variants (same members, same order) share one id
+    @pub @this
+    make variant (args: uint[]) -> uint {
+        make t = Ty {}
+
+        t.kind = TyKind.Variant
+        t.args = args
+
+        return this.intern(t)
+    }
+
+    // source name of a primitive, or "" when the name is a user type
+    @pub
+    make prim (name: str) -> uint {
+        if name == "void" { return TY_VOID }
+
+        if name == "bool" { return TY_BOOL }
+
+        if name == "i8" { return TY_I8 }
+
+        if name == "i16" { return TY_I16 }
+
+        if name == "i32" { return TY_I32 }
+
+        if name == "i64" { return TY_I64 }
+
+        if name == "u8" { return TY_U8 }
+
+        if name == "u16" { return TY_U16 }
+
+        if name == "u32" { return TY_U32 }
+
+        if name == "u64" { return TY_U64 }
+
+        if name == "int" { return TY_INT }
+
+        if name == "uint" { return TY_UINT }
+
+        if name == "f32" { return TY_F32 }
+
+        if name == "f64" { return TY_F64 }
+
+        if name == "float" { return TY_FLOAT }
+
+        if name == "str" { return TY_STR }
+
+        if name == "String" { return TY_STRBUF }
+
+        if name == "char" { return TY_CHAR }
+
+        if name == "any" { return TY_AUTO }
+
+        return TY_ERROR
+    }
+
+    @pub @this
+    make is_copy (id: uint) -> bool {
+        make kind = this.kind_of(id)
+
+        match kind {
+            TyKind.Error { return true }
+
+            TyKind.ErrorVal { return true }
+
+            TyKind.Fallible { return this.is_copy(this.elem_of(id)) }
+
+            TyKind.Void { return true }
+
+            TyKind.Bool { return true }
+
+            TyKind.I8 { return true }
+
+            TyKind.I16 { return true }
+
+            TyKind.I32 { return true }
+
+            TyKind.I64 { return true }
+
+            TyKind.U8 { return true }
+
+            TyKind.U16 { return true }
+
+            TyKind.U32 { return true }
+
+            TyKind.U64 { return true }
+
+            TyKind.Int { return true }
+
+            TyKind.Uint { return true }
+
+            TyKind.F32 { return true }
+
+            TyKind.F64 { return true }
+
+            TyKind.Float { return true }
+
+            TyKind.Char { return true }
+
+            TyKind.Ptr { return true }
+
+            TyKind.Ref { return true }
+
+            TyKind.Optional { return this.is_copy(this.elem_of(id)) }
+            _ { return false }
+        }
+
+        return false
+    }
+
+    @pub @this
+    make is_int (id: uint) -> bool {
+        make kind = this.kind_of(id)
+
+        match kind {
+            TyKind.I8 { return true }
+
+            TyKind.I16 { return true }
+
+            TyKind.I32 { return true }
+
+            TyKind.I64 { return true }
+
+            TyKind.U8 { return true }
+
+            TyKind.U16 { return true }
+
+            TyKind.U32 { return true }
+
+            TyKind.U64 { return true }
+
+            TyKind.Int { return true }
+
+            TyKind.Uint { return true }
+            _ { return false }
+        }
+
+        return false
+    }
+
+    @pub @this
+    make is_float (id: uint) -> bool {
+        make kind = this.kind_of(id)
+
+        match kind {
+            TyKind.F32 { return true }
+
+            TyKind.F64 { return true }
+
+            TyKind.Float { return true }
+            _ { return false }
+        }
+
+        return false
+    }
+
+    @pub @this
+    make is_numeric (id: uint) -> bool {
+        return this.is_int(id) || this.is_float(id)
+    }
+
+    // `str`: a dynamic, growable string. `String` is the constant/fixed counterpart and is not
+    // a valid operand of `+`, so it is intentionally excluded here. `Text` is a string literal
+    // whose final identity (`str` or `String`) is decided during type resolution, so it behaves
+    // like a dynamic string until then.
+    @pub @this
+    make is_str (id: uint) -> bool {
+        match this.kind_of(id) {
+            TyKind.Str { return true }
+
+            TyKind.Text { return true }
+            _ { return false }
+        }
+
+        return false
+    }
+
+    // a single character that can be appended to a `str`: `char` and the raw `u8` byte
+    @pub @this
+    make is_char (id: uint) -> bool {
+        match this.kind_of(id) {
+            TyKind.Char { return true }
+
+            TyKind.U8 { return true }
+            _ { return false }
+        }
+
+        return false
+    }
+}

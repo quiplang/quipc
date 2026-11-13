@@ -1,0 +1,72 @@
+// C scalar types for macOS LP64 (arm64 and x86_64).
+// c_char is a byte; use c_schar when signed arithmetic is required.
+// These are aliases, not Quip structs. C strings are NUL-terminated ptr<c_char>.
+// ptr<c_void> is the C void* type. Quip str/String are not C strings.
+@pub @pure @const {
+    make c_bool: Type = bool
+    make c_char: Type = char
+    make c_schar: Type = i8
+    make c_uchar: Type = u8
+    make c_short: Type = i16
+    make c_ushort: Type = u16
+    make c_int: Type = i32
+    make c_uint: Type = u32
+    make c_long: Type = i64
+    make c_ulong: Type = u64
+    make c_longlong: Type = i64
+    make c_ulonglong: Type = u64
+    make c_float: Type = f32
+    make c_double: Type = f64
+    make c_void: Type = any
+    make size_t: Type = u64
+    make ssize_t: Type = i64
+    make ptrdiff_t: Type = i64
+    make intptr_t: Type = i64
+    make uintptr_t: Type = u64
+    make mode_t: Type = u16
+    make off_t: Type = i64
+    make pid_t: Type = i32
+    make uid_t: Type = u32
+    make gid_t: Type = u32
+    make time_t: Type = i64
+    make clock_t: Type = u64
+    make clockid_t: Type = u32
+    make useconds_t: Type = u32
+    make suseconds_t: Type = i32
+    make wchar_t: Type = i32
+}
+
+// C object sizes in bytes; Quip's @sizeof currently describes Quip storage slots.
+@pub @const {
+    make CHAR_SIZE: uint = 1
+    make SHORT_SIZE: uint = 2
+    make INT_SIZE: uint = 4
+    make LONG_SIZE: uint = 8
+    make POINTER_SIZE: uint = 8
+}
+
+@pure @const {
+    @target "macos" make os = @import "../os/macos.quip"
+    @target "linux" make os = @import "../os/linux.quip"
+}
+
+@pub @unsafe
+make printf (format: ptr<c_char>) -> int {
+    @unsafe make result: int = os::printf(format)
+    return result
+}
+
+@pub
+make to_str (s: ptr<c_char>) -> str {
+    make result = ""
+
+    @unsafe {
+        make i: uint = 0
+        while s[i] != '\0' {
+            result.push(s[i])
+            i++
+        }
+    }
+
+    return result
+}

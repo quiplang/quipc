@@ -1,0 +1,204 @@
+// size-class pool allocator
+//
+// every request is rounded up to a size class (multiples of 16 bytes up to 512, powers of two
+// beyond) and served from a per-class free list in O(1); an empty class carves a fresh block off
+// a bump region mapped from the OS. freeing pushes the block back on its class list, so memory is
+// reused without ever walking a list of live blocks (which is what made the first-fit `Heap`
+// quadratic for programs that keep hundreds of thousands of allocations alive).
+//
+// each block is preceded by a 16-byte header whose last word is the class index, so `free` needs
+// nothing but the pointer. memory is never returned to the OS.
+
+@pure @const {
+    make syscall: unit = @import "../os/syscall.quip"
+
+    make std: unit = @import "../pkg.quip"
+    make io: unit = @import "../io/pkg.quip"
+}
+
+// the word right before every allocation: the size class it was carved for
+make type Tag {
+    make cls: int = 0
+}
+
+// the first word of a free block links it to the next free block of the same class
+make type Link {
+    make next: ptr<Link>? = none
+}
+
+@pub
+make type Pool {
+    // `classes` free-list heads, stored in the first mapped chunk
+    make heads: ptr<Link>? = none
+    // the unused tail of the current chunk
+    make cur: ptr<char>? = none
+    make left: int = 0
+
+    // how many bytes one growth step maps from the OS
+    make chunk_size: int = 4194304
+    // every byte the pool has mapped so far
+    make mapped: int = 0
+
+    make alloc_count: int = 0
+    make free_count: int = 0
+
+    @pub
+    make init () -> Pool {
+        make p = Pool {}
+
+        @unsafe {
+            make raw_mem: ptr<any> = syscall::quip_map_anon(p.chunk_size)
+
+            make table: ptr<Link> = raw_mem
+            make i: int = 0
+            while i < 64 {
+                make slot: ptr<Link> = table + i
+                slot.*.next = none
+                i = i + 1
+            }
+
+            make table_bytes: int = 64 * (@sizeof Link)
+            make bytes: ptr<char> = raw_mem
+
+            p.heads = table
+            p.cur = bytes + table_bytes
+            p.left = p.chunk_size - table_bytes
+            p.mapped = p.chunk_size
+        }
+
+        return p
+    }
+
+    // the size class of a request: 1..32 are multiples of 16 up to 512, then doubling sizes
+    @pub
+    make class_of (size: int) -> int {
+        if size <= 512 {
+            return (size + 15) / 16
+        }
+
+        make cls: int = 32
+        make cap: int = 512
+
+        while cap < size {
+            cap = cap * 2
+            cls = cls + 1
+        }
+
+        return cls
+    }
+
+    // the number of payload bytes served for a size class
+    @pub
+    make class_size (cls: int) -> int {
+        if cls <= 32 {
+            return cls * 16
+        }
+
+        make cap: int = 512
+        make c: int = 32
+
+        while c < cls {
+            cap = cap * 2
+            c = c + 1
+        }
+
+        return cap
+    }
+
+    // maps a fresh chunk big enough for `need` bytes; what is left of the old one is abandoned
+    @pub @this
+    make grow (need: int) {
+        @unsafe {
+            make page: int = syscall::quip_page_size()
+
+            make want: int = this.chunk_size
+
+            if need > want {
+                want = need
+            }
+
+            // whole pages only
+            want = ((want + page - 1) / page) * page
+
+            make raw_mem: ptr<any> = syscall::quip_map_anon(want)
+            make bytes: ptr<char> = raw_mem
+
+            this.cur = bytes
+            this.left = want
+            this.mapped = this.mapped + want
+        }
+    }
+
+    @pub @this @allocator
+    make alloc (req_size: int) -> !owned<any> {
+        if req_size <= 0 {
+            return error.ZeroAllocation
+        }
+
+        make cls: int = Pool.class_of(req_size)
+
+        if cls >= 64 {
+            return error.OutOfMemory
+        }
+
+        @unsafe {
+            make table: ptr<Link> = this.heads.unwrap()
+            make head: ptr<Link> = table + cls
+
+            // a freed block of this class: pop it
+            if head.*.next != none {
+                make link: ptr<Link> = head.*.next.unwrap()
+                head.*.next = link.*.next
+                this.alloc_count = this.alloc_count + 1
+                @unsafe return link
+            }
+
+            // otherwise carve a new one: 16 header bytes, then the class's payload
+            make size: int = Pool.class_size(cls)
+            make need: int = size + 16
+
+            if this.left < need {
+                this.grow(need)
+            }
+
+            make start: ptr<char> = this.cur.unwrap()
+            make payload: ptr<char> = start + 16
+            this.cur = start + need
+            this.left = this.left - need
+
+            make tag: ptr<Tag> = payload
+            tag = tag - 1
+            tag.*.cls = cls
+
+            this.alloc_count = this.alloc_count + 1
+            @unsafe return payload
+        }
+
+        return error.OutOfMemory
+    }
+
+    @pub @this @deallocator
+    make free (raw_ptr: owned<any>) -> void {
+        @unsafe {
+            this.free_count = this.free_count + 1
+
+            make link: ptr<Link> = raw_ptr
+            make tag: ptr<Tag> = link
+            tag = tag - 1
+
+            make table: ptr<Link> = this.heads.unwrap()
+            make head: ptr<Link> = table + tag.*.cls
+
+            link.*.next = head.*.next
+            head.*.next = link
+        }
+    }
+
+    @pub @this
+    make dump () {
+        io::println("Debug allocations: " + this.alloc_count.to_str())
+        io::println("Debug frees: " + this.free_count.to_str())
+        io::println("Debug leaks: " + (this.alloc_count - this.free_count).to_str())
+        io::println("Debug mapped: " + this.mapped.to_str())
+    }
+}

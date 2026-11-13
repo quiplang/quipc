@@ -1,5 +1,8 @@
 @pub @pure @const {
 
-make to_str: unit = @import "./to_str.quip"
+    make to_str: unit = @import "./to_str.quip"
+    make to_int: unit = @import "./to_int.quip"
+    make to_uint: unit = @import "./to_uint.quip"
+
 
 }

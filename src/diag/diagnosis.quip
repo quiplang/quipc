@@ -1,12 +1,11 @@
 @pure @const {
-make std = @import "../../library/std/pkg.quip"
-
-make util = @import "../util/pkg.quip"
-make e = @import "err.quip"
+    make std = @import "std"
+    make util = @import "../util/pkg.quip"
+    make e = @import "err.quip"
+    make sm = @import "../core/sourcemap.quip"
 }
 
-// ====
-
+/// identifies the severity or kind of a diagnostic.
 @pub
 make enum DiagKind {
     Panic,      // Compiler internal error
@@ -16,113 +15,867 @@ make enum DiagKind {
     Help        // Severity 3
 }
 
+/// associates an explanatory message with a source range.
 @pub
 make type Label {
-    make range: util::Range
-    make msg: str
 
+    @pub {
+        make path: str = ""
+        make source: str = ""
+        make range: util::Range
+        make msg: str
+        make primary: bool = false
+    }
+
+
+    // secondary label, rendered with `-` in blue
     @pub
     make create (range: util::Range, msg: str) -> Label {
         make label = Label {}
+
         label.range = range
         label.msg = msg
+        label.primary = false
 
         return label
     }
+
+    /// creates a diagnostic label associated with another file and its source.
+    @pub
+    make in_file (path: str, source: str, range: util::Range, msg: str) -> Label {
+        make label = Label.create(range, msg)
+        label.path = path
+        label.source = source
+
+        return label
+    }
+
+    // primary label, rendered with `^` in the level color
+    @pub
+    make main (range: util::Range, msg: str) -> Label {
+        make label = Label {}
+
+        label.range = range
+        label.msg = msg
+        label.primary = true
+
+        return label
+    }
+
+    // byte offsets [start, end) covered by the label
+    @pub @this
+    make start () -> uint {
+        make s: uint = this.range.start.start
+
+        return s
+    }
+
+    /// returns the label end offset, falling back to the start span when needed.
+    @pub @this
+    make end () -> uint {
+        make s: uint = this.range.start.start
+        make t: uint = this.range.end.end
+
+        if t > s {
+            return t
+        }
+
+        t = this.range.start.end
+
+        return t
+    }
 }
 
+/// describes a diagnostic and its labels, notes, and suggested help.
 @pub
 make type Diag {
-    make kind: DiagKind
-    make msg: str
 
-    make range: util::Range
+    @pub {
+        make kind: DiagKind
+        make msg: str
 
-    make code: str
+        make range: util::Range
 
-    make labels: Label[]
-    make help_msg: str
+        make code: str
 
+        make labels: Label[]
+        make help_msg: str = ""
+        make note_msg: str = ""
+        make located: bool = true
+    }
+
+
+    /// constructs a warning diagnostic with a source range.
     @pub
-    make warn (code: e::Warn, range: util::Range, msg: str) -> Diag {
-        make d = Diag {}
-        d.kind = DiagKind.Error
-        d.msg = msg
+    make warn (code: e::Warn, range: util::Range, msg: str) -> owned<Diag> {
+        make d: owned<Diag> = std::mem::debug.alloc(@sizeof Diag).unwrap()
+        d.*.kind = DiagKind.Warning
+        d.*.msg = msg
+        d.*.range = range
+        d.*.code = e::warn_code(code)
+        d.*.labels = []
+        d.*.help_msg = ""
+        d.*.note_msg = ""
+        d.*.located = true
         return d
     }
 
+    // `range` becomes the primary label; use `attach` / `label` for more context
     @pub
     make err (code: e::Err, range: util::Range, msg: str) -> owned<Diag> {
         make d: owned<Diag> = std::mem::debug.alloc(@sizeof Diag).unwrap()
         d.*.kind = DiagKind.Error
         d.*.msg = msg
+        d.*.range = range
+        d.*.code = e::err_code(code)
+        d.*.labels = []
+        d.*.help_msg = ""
+        d.*.note_msg = ""
+        d.*.located = true
         return d
     }
 
+    /// constructs a fatal diagnostic without a source range.
     @pub
     make panic (code: e::Err, msg: str) -> owned<Diag> {
         make d: owned<Diag> = std::mem::debug.alloc(@sizeof Diag).unwrap()
         d.*.kind = DiagKind.Panic
         d.*.msg = msg
+        d.*.range = util::Range {}
+
+        d.*.code = e::err_code(code)
+        d.*.labels = []
+        d.*.help_msg = ""
+        d.*.note_msg = ""
+        d.*.located = false
         return d
     }
 
+    /// adds a label to this diagnostic.
     @pub @this
     make attach (label: Label) -> void {
         this.labels.push(label)
     }
 
+    // message printed next to the carets of the primary range
+    @pub @this
+    make label (msg: str) -> void {
+        this.labels.push(Label.main(this.range.copy(), msg))
+    }
+
+    /// sets the suggested help text for this diagnostic.
     @pub @this
     make help (msg: str) -> void {
         this.help_msg = msg
     }
 
+    /// adds a note to this diagnostic.
     @pub @this
-    make emit () {
-        std::io::println(this.msg)
-        return 0
-    }
-}
-
-@pub
-make type Diagnostic {
-    make diags: owned<Diag>[]
-    make limit: u32
-
-    @pub
-    make init () -> Diagnostic {
-        return Diagnostic {
-            limit = 10,
-        }
+    make note (msg: str) -> void {
+        if this.note_msg.len() > 0 { this.note_msg.push("\n") this.note_msg.push(msg) }
+        else { this.note_msg = msg }
     }
 
+    /// checks for primary.
     @pub @this
-    make report (diag: owned<Diag>) -> bool {
-
-        diag.*.emit()
-        // this.diags.push(diag)
-
-        if diag.*.kind == DiagKind.Panic {
-            return true
-        }
-
-        return false
-    }
-
-    @pub @this
-    make has_errors () -> bool {
-
-        for d : this.diags.iter() {
-            if d.*.kind == DiagKind.Error || d.*.kind == DiagKind.Panic {
+    make has_primary () -> bool {
+        for l : this.labels.iter() {
+            if l.primary {
                 return true
             }
         }
 
         return false
     }
+}
+
+/// collects and renders diagnostics for a source file.
+@pub
+make type Diagnostic {
+    make diags: owned<Diag>[]
+    make limit: u32
+    make error_count: u32 = 0
+
+    @pub make path: str = ""
+    make source: str = ""
+    make map: sm::LineMap
+    make has_source: bool = false
+    make aborting: bool = false
+    @pub make hide_warnings: bool = false
 
     @pub
-    make to_lsp_json () {
+    make init () -> Diagnostic {
+        make empty: str = ""
 
+        return Diagnostic {
+            limit = 10,
+            map = sm::LineMap.init(empty.pin),
+        }
+    }
+
+    // file the ranges of reported diagnostics point into
+    @pub @this
+    make set_source (path: str, source: str) -> void {
+        this.path = path
+        this.source = source
+        this.map = sm::LineMap.init(this.source.pin)
+        this.has_source = true
+    }
+
+    // returns true when the compiler entered the aborting state,
+    // the caller should stop its work and unwind so cleanup can run
+    /// records and renders a diagnostic.
+    @pub @this
+    make report (diag: owned<Diag>) -> bool {
+        if this.hide_warnings && diag.*.kind == DiagKind.Warning { return this.aborting }
+
+        // follow-up diagnostics are noise once aborting
+        if this.aborting {
+            return true
+        }
+
+        if diag.*.kind == DiagKind.Error || diag.*.kind == DiagKind.Panic {
+            this.error_count = this.error_count + 1
+        }
+
+        if diag.*.kind == DiagKind.Error && this.error_count > this.limit {
+            std::progress::clear()
+            std::io::println(paint(C_MAGENTA(), "fatal") + paint(C_BOLD(), ": too many errors, compilation aborted"))
+
+            this.aborting = true
+
+            return true
+        }
+
+        if diag.*.kind == DiagKind.Panic {
+            this.aborting = true
+        }
+
+        this.render(diag)
+
+        return this.aborting
+    }
+
+    // enter the aborting state without reporting a diagnostic
+    @pub @this
+    make abort () -> void {
+        this.aborting = true
+    }
+
+    // manually stop the current job, the compiler unwinds into the cleanup phase
+    @pub @this
+    make stop (reason: str) -> void {
+        if this.aborting {
+            return
+        }
+
+        this.print_stop(reason)
+        this.aborting = true
+    }
+
+    // like `stop`, but also shows the diagnostic that explains the reason
+    @pub @this
+    make stop_with (reason: str, diag: owned<Diag>) -> void {
+        if this.aborting {
+            return
+        }
+
+        this.print_stop(reason)
+
+        if diag.*.kind == DiagKind.Error || diag.*.kind == DiagKind.Panic {
+            this.error_count = this.error_count + 1
+        }
+
+        this.render(diag)
+        this.aborting = true
+    }
+
+    @this
+    make print_stop (reason: str) -> void {
+        std::progress::clear()
+        std::io::println(paint(C_MAGENTA(), "fatal") + paint(C_BOLD(), ": manually aborted due to: " + reason))
+        std::io::println("")
+    }
+
+    @pub @this
+    make is_aborting () -> bool {
+        return this.aborting
+    }
+
+    @pub @this
+    make has_errors () -> bool {
+        return this.error_count > 0
+    }
+
+    //
+    //  error[E0001]: unexpected token
+    //   --> src/main.quip:4:10
+    //    |
+    //  4 |     make 42
+    //    |     ---- ^^ expected identifier
+    //    |     |
+    //    |     declaration starts here
+    //    |
+    //    = help: try to declare a variable, Type, enum or function
+    //
+
+    /// renders a diagnostic.
+    @this
+    make render (d: owned<Diag>) -> void {
+        std::progress::clear()
+        make lc = level_color(d.*.kind)
+
+        make head: str = lc.copy()
+        head = head + C_BOLD() + level_str(d.*.kind)
+
+        if d.*.code.len() > 0 {
+            head = head + "[" + d.*.code + "]"
+        }
+
+        head = head + C_RESET() + C_BOLD() + ": " + d.*.msg + C_RESET()
+        std::io::println(head)
+
+        if this.has_source && d.*.located {
+            if !d.*.has_primary() {
+                d.*.labels.push(Label.main(d.*.range, ""))
+            }
+
+            this.render_labels(d.*.pin)
+        }
+
+        if d.*.help_msg.len() > 0 {
+            footer("help", d.*.help_msg.pin, C_CYAN())
+        }
+
+        if d.*.note_msg.len() > 0 {
+            footer("note", d.*.note_msg.pin, C_RESET())
+        }
+
+        std::io::println("")
+    }
+
+    /// renders the labels.
+    @this
+    make render_labels (d: ref<Diag>) -> void {
+        make paths: str[] = [this.path.copy()]
+        make i: uint = 0
+
+        while i < d.*.labels.len() {
+            make path = d.*.labels[i].path.copy()
+
+            if path.len() > 0 {
+                make found = false
+
+                for known : paths ! {
+                    if known == path { found = true }
+                }
+
+                if !found { paths.push(path) }
+            }
+
+            i = i + 1
+        }
+
+        for path : paths {
+            make group = Diag {}
+
+            group.kind = d.*.kind
+            group.labels = []
+            group.msg = ""
+            group.range = util::Range {}
+            group.code = ""
+            make source: str = ""
+            i = 0
+
+            while i < d.*.labels.len() {
+                make label = d.*.labels[i].pin
+                make location = label.*.path.copy()
+
+                if location.len() == 0 { location = this.path.copy() }
+
+                if location == path {
+                    group.labels.push(label.*)
+
+                    if label.*.path.len() > 0 { source = label.*.source.copy() }
+                }
+
+                i = i + 1
+            }
+
+            if group.labels.len() > 0 {
+                if path == this.path { this.render_label_group(group.pin) }
+                else {
+                    make context = Diagnostic.init()
+                    context.set_source(path, source)
+                    context.render_label_group(group.pin)
+                }
+            }
+        }
+    }
+
+    /// renders the label group.
+    @this
+    make render_label_group (d: ref<Diag>) -> void {
+        make count = d.*.labels.len()
+
+        if count == 0 {
+            return
+        }
+
+        // anchor = first primary label
+        make anchor: uint = d.*.labels[0].start()
+        make i: uint = count
+
+        while i > 0 {
+            i = i - 1
+
+            if d.*.labels[i].primary {
+                anchor = d.*.labels[i].start()
+            }
+        }
+
+        // gutter width = digits of the largest line number
+        make gw: uint = 1
+        i = 0
+
+        while i < count {
+            make end_loc: util::Location = this.map.resolve(this.last_byte(d.*.labels[i].pin))
+            make w = num_digits(end_loc.line + 1)
+
+            if w > gw {
+                gw = w
+            }
+
+            i = i + 1
+        }
+
+        make at: util::Location = this.map.resolve(anchor)
+        std::io::println(pad(gw) + paint(C_BLUE(), "--> ") + this.path + ":" + at.line.to_str() + ":" + at.col.to_str())
+        bar(gw)
+
+        make first_line = this.map.line_count()
+        i = 0
+
+        while i < count {
+            make line = this.map.resolve(d.*.labels[i].start()).line
+
+            if line < first_line { first_line = line }
+
+            i = i + 1
+        }
+
+        if first_line > 1 { this.source_line(gw, first_line - 1) }
+
+        // walk the lines that contain a label start, in ascending order
+        make last_line: uint = 0
+
+        while true {
+            make line: uint = 0
+            i = 0
+
+            while i < count {
+                make l = this.map.resolve(d.*.labels[i].start()).line
+
+                if l > last_line && (line == 0 || l < line) {
+                    line = l
+                }
+
+                i = i + 1
+            }
+
+            if line == 0 {
+                break
+            }
+
+            if last_line > 0 && line > last_line + 1 {
+                if line - last_line - 1 <= 3 {
+                    make ctx = last_line + 1
+
+                    while ctx < line {
+                        this.source_line(gw, ctx)
+                        ctx = ctx + 1
+                    }
+                } else {
+                    std::io::println(pad(gw + 1) + paint(C_BLUE(), "..."))
+                }
+            }
+
+            // a multiline label on this line is rendered on its own
+            make multi: uint = count
+            i = 0
+
+            while i < count {
+                make s = this.map.resolve(d.*.labels[i].start()).line
+                make t = this.map.resolve(this.last_byte(d.*.labels[i].pin)).line
+
+                if s == line && t != line {
+                    multi = i
+                    break
+                }
+
+                i = i + 1
+            }
+
+            if multi < count {
+                last_line = this.render_multiline(d, d.*.labels[multi].pin, d.*.kind, gw)
+            } else {
+                this.render_cluster(d, line, gw)
+                last_line = line
+            }
+        }
+
+        if last_line > 0 && last_line < this.map.line_count() { this.source_line(gw, last_line + 1) }
+
+        bar(gw)
+    }
+
+    // all single-line labels on `line` share one caret row
+    @this
+    make render_cluster (d: ref<Diag>, line: uint, gw: uint) -> void {
+        make lc = level_color(d.*.kind)
+        make count = d.*.labels.len()
+
+        this.source_line(gw, line)
+
+        make primary_msg: str = ""
+        make width: uint = 0
+
+        make i: uint = 0
+
+        while i < count {
+            make lbl = d.*.labels[i].pin
+            make s: util::Location = this.map.resolve(lbl.*.start())
+            make t: util::Location = this.map.resolve(this.last_byte(lbl))
+
+            if s.line == line && t.line == line {
+                if lbl.*.primary {
+                    primary_msg = lbl.*.msg !
+                }
+
+                if t.col > width {
+                    width = t.col
+                }
+            }
+
+            i = i + 1
+        }
+
+        // primary `^` wins over secondary `-` when labels overlap
+        make row: str = gutter(gw) + " "
+        make col: uint = 1
+
+        while col <= width {
+            make ch: char = ' '
+            i = 0
+
+            while i < count {
+                make lbl = d.*.labels[i].pin
+                make s: util::Location = this.map.resolve(lbl.*.start())
+                make t: util::Location = this.map.resolve(this.last_byte(lbl))
+
+                if s.line == line && t.line == line && col >= s.col && col <= t.col {
+                    if lbl.*.primary {
+                        ch = '^'
+                    } else {
+                        if ch == ' ' {
+                            ch = '-'
+                        }
+                    }
+                }
+
+                i = i + 1
+            }
+
+            if ch == '^' {
+                row = row + lc + '^' + C_RESET()
+            } else {
+                if ch == '-' {
+                    row = row + C_BLUE() + '-' + C_RESET()
+                } else {
+                    row = row + ' '
+                }
+            }
+
+            col = col + 1
+        }
+
+        if primary_msg.len() > 0 {
+            row = row + " " + lc + primary_msg + C_RESET()
+        }
+
+        std::io::println(row)
+
+        // secondary messages hang below their carets, rightmost first
+        make k: uint = count
+
+        while k > 0 {
+            k = k - 1
+            make lbl = d.*.labels[k].pin
+
+            if !lbl.*.primary && lbl.*.msg.len() > 0 {
+                make s: util::Location = this.map.resolve(lbl.*.start())
+                make t: util::Location = this.map.resolve(this.last_byte(lbl))
+
+                if s.line == line && t.line == line {
+                    std::io::println(gutter(gw) + " " + pad(s.col - 1) + paint(C_BLUE(), "|"))
+                    std::io::println(gutter(gw) + " " + pad(s.col - 1) + C_BLUE() + lbl.*.msg + C_RESET())
+                }
+            }
+        }
+    }
+
+    //  3 | │ make foo () {
+    //  4 | │     ...
+    //  5 | │ }
+    //    | ╰──────── message
+    @this
+    make render_multiline (d: ref<Diag>, lbl: ref<Label>, kind: DiagKind, gw: uint) -> uint {
+        make color: str = C_BLUE()
+
+        if lbl.*.primary {
+            color = level_color(kind)
+        }
+
+        make first: uint = this.map.resolve(lbl.*.start()).line
+        make last: uint = this.map.resolve(this.last_byte(lbl)).line
+        make total = last - first + 1
+
+        make l = first
+
+        while l <= last {
+            if total > 6 && l == first + 3 {
+                std::io::println(gutter(gw) + " " + color + "│ ⋮" + C_RESET())
+                l = last - 2
+            } else {
+                // a single-line label that starts inside this span (e.g. the primary caret on
+                // the offending line) must still be shown; render it normally instead of
+                // letting the multiline margin hide it
+                make has_own = false
+                make lbcount = d.*.labels.len()
+                make i: uint = 0
+
+                while i < lbcount {
+                    make lbl2 = d.*.labels[i].pin
+                    make st: util::Location = this.map.resolve(lbl2.*.start())
+                    make en: util::Location = this.map.resolve(this.last_byte(lbl2))
+
+                    if st.line == l && en.line == l {
+                        has_own = true
+                    }
+
+                    i = i + 1
+                }
+
+                if has_own {
+                    this.render_cluster(d, l, gw)
+                } else {
+                    std::io::println(paint(C_BLUE(), lpad(l.to_str(), gw) + " |") + " " + color + "│" + C_RESET() + " " + this.line_text(l))
+                }
+
+                l = l + 1
+            }
+        }
+
+        make tail = this.map.line_end(first) - this.map.line_start(first)
+
+        if tail < 4 { tail = 4 }
+
+        if tail > 50 { tail = 50 }
+
+        make row: str = gutter(gw) + " " + color + "╰"
+        make n: uint = 0
+
+        while n < tail {
+            row = row + "─"
+            n = n + 1
+        }
+
+        if lbl.*.msg.len() > 0 {
+            row = row + " " + lbl.*.msg
+        }
+
+        std::io::println(row + C_RESET())
+
+        return last
+    }
+
+    /// prints a numbered source line in the diagnostic gutter.
+    @this
+    make source_line (gw: uint, line: uint) -> void {
+        std::io::println(paint(C_BLUE(), lpad(line.to_str(), gw) + " |") + " " + this.line_text(line))
+    }
+
+    /// emits a line of the text.
+    @this
+    make line_text (line: uint) -> str {
+        make text: str = ""
+        make i = this.map.line_start(line)
+        make end = this.map.line_end(line)
+
+        while i < end {
+            if this.source[i] != '\r' {
+                text.push(this.source[i])
+            }
+
+            i = i + 1
+        }
+
+        return text
+    }
+
+    // offset of the last byte the label covers (inclusive)
+    @this
+    make last_byte (lbl: ref<Label>) -> uint {
+        make s = lbl.*.start()
+        make t = lbl.*.end()
+
+        if t > s {
+            return t - 1
+        }
+
+        return s
+    }
+}
+
+
+/// returns the terminal escape character.
+make esc () -> str {
+    make code: u8 = 27
+    @unsafe make ESC: char = code
+    make s: str = ""
+    s.push(ESC)
+    return s
+}
+
+/// returns the terminal sequence that resets formatting.
+make C_RESET () -> str   { return esc() + "[0m" }
+
+/// returns the terminal sequence that enables bold text.
+make C_BOLD () -> str    { return esc() + "[1m" }
+
+/// returns the terminal sequence for blue text.
+make C_BLUE () -> str    { return esc() + "[34m" }
+
+/// returns the terminal sequence for cyan text.
+make C_CYAN () -> str    { return esc() + "[36m" }
+
+/// returns the terminal sequence for yellow text.
+make C_YELLOW () -> str  { return esc() + "[33m" }
+
+/// returns the terminal sequence for red text.
+make C_RED () -> str     { return esc() + "[31m" }
+
+/// returns the terminal sequence for magenta text.
+make C_MAGENTA () -> str { return esc() + "[35m" }
+
+/// wraps text in a terminal color and resets formatting afterward.
+make paint (color: str, text: str) -> str {
+    return color + text + C_RESET()
+}
+
+/// returns the terminal color associated with a diagnostic kind.
+make level_color (kind: DiagKind) -> str {
+    match kind {
+        DiagKind.Panic { return C_MAGENTA() }
+
+        DiagKind.Error { return C_RED() }
+
+        DiagKind.Warning { return C_YELLOW() }
+
+        DiagKind.Info { return C_BLUE() }
+        _ { return C_CYAN() }
+    }
+
+    return C_RESET()
+}
+
+/// returns the display label for a diagnostic kind.
+make level_str (kind: DiagKind) -> str {
+    match kind {
+        DiagKind.Panic { return "fatal" }
+
+        DiagKind.Error { return "error" }
+
+        DiagKind.Warning { return "warning" }
+
+        DiagKind.Info { return "info" }
+        _ { return "help" }
+    }
+
+    return "info"
+}
+
+/// counts the decimal digits needed to display an unsigned integer.
+make num_digits (n: uint) -> uint {
+    make d: uint = 1
+
+    while n >= 10 {
+        n = n / 10
+        d = d + 1
+    }
+
+    return d
+}
+
+/// returns a string containing the requested number of spaces.
+make pad (n: uint) -> str {
+    make s: str = ""
+    make i: uint = 0
+
+    while i < n {
+        s.push(' ')
+        i = i + 1
+    }
+
+    return s
+}
+
+/// left-pads text for the diagnostic gutter.
+make lpad (text: str, width: uint) -> str {
+    make s: str = ""
+    make n = text.len()
+
+    while n < width + 1 {
+        s.push(' ')
+        n = n + 1
+    }
+
+    return s + text
+}
+
+// "   |"
+make gutter (gw: uint) -> str {
+    return paint(C_BLUE(), pad(gw + 1) + " |")
+}
+
+/// prints an empty diagnostic gutter.
+make bar (gw: uint) -> void {
+    std::io::println(gutter(gw))
+}
+
+//   = help: first line
+//           second line
+/// prints a labeled, colored diagnostic footer with continuation lines.
+make footer (label: str, text: ref<str>, color: str) -> void {
+    make line: str = ""
+    make first = true
+    make i: uint = 0
+    make n = text.*.len()
+
+    while i <= n {
+        if i == n || text.*[i] == '\n' {
+            if first {
+                std::io::println(pad(2) + paint(C_BLUE(), "= ") + label + ": " + color + line + C_RESET())
+                first = false
+            } else {
+                std::io::println(pad(label.len() + 6) + color + line + C_RESET())
+            }
+
+            line = ""
+        } else {
+            line.push(text.*[i])
+        }
+
+        i = i + 1
     }
 }

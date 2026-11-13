@@ -1,0 +1,31 @@
+@pure @const {
+    make std: unit = @import "std/pkg.quip"
+}
+
+@pub @entry
+make build (argc: int, argv: ptr<char>[]) -> int {
+    make b = std::Build.from_args(argv) catch {
+        std::progress::fail("invalid build arguments")
+        std::progress::finish(true)
+        return 1
+    }
+
+    std::progress::begin("Project build", b.progress_enabled, b.options.show_quipc_debug)
+    std::progress::phase("Configure", 0, 1, "project")
+
+    // b.options.hide_warnings = true
+
+    make exe = std::Executable.default()
+    exe.add_import("std", "~/.quip/current/lib/std/pkg.quip") // create global alias to standard library
+
+    b.add_executable(exe)
+
+    b.proceed() catch {
+        std::progress::fail("failed to build the project")
+        std::progress::finish(false)
+        return 1
+    }
+
+    std::progress::finish(true)
+    return 0
+}

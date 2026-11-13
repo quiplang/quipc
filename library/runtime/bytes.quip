@@ -1,0 +1,23 @@
+// Byte operations used below the allocating container layer.
+@pub @unsafe
+make copy (destination: ptr<char>, source: ptr<char>, count: uint) -> void {
+    make i: uint = 0
+    while i < count { destination[i] = source[i] i = i + 1 }
+}
+
+@pub @unsafe
+make zero (destination: ptr<char>, count: uint) -> void {
+    make i: uint = 0
+    while i < count { destination[i] = '\0' i = i + 1 }
+}
+
+@pub @unsafe
+make move (destination: ptr<char>, source: ptr<char>, count: uint) -> void {
+    @unsafe make dst: uint = destination
+    @unsafe make src: uint = source
+
+    if dst <= src || dst - src >= count { copy(destination, source, count) return }
+
+    make i = count
+    while i > 0 { i = i - 1 destination[i] = source[i] }
+}

@@ -1,0 +1,60 @@
+@impl int
+@static
+make max () -> int {
+    return 0xffffffff
+}
+
+@impl int
+@static
+make min () -> int {
+    return 0x80000000
+}
+
+
+@impl i8
+@static
+make max () -> i8 {
+    return 0xff
+}
+
+@impl i8
+@static
+make min () -> i8 {
+    return 0x80
+}
+
+@impl i16
+@static
+make max () -> i16 {
+    return 0xffff
+}
+
+@impl i16
+@static
+make min () -> i16 {
+    return 0x8000
+}
+
+@impl i32
+@static
+make max () -> i32 {
+    return 0xffffffff
+}
+
+@impl i32
+@static
+make min () -> i32 {
+    return 0x80000000
+}
+
+@impl i64
+@static
+make max () -> i64 {
+    return 0xffffffffffffffff
+}
+
+@impl i64
+@static
+make min () -> i64 {
+    return 0x8000000000000000
+}

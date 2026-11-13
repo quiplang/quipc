@@ -1,0 +1,178 @@
+// stack slot allocation: recycle a slot once a local reaches its kill line,
+// unless the local was ever pinned (its address may still be observed)
+
+@pure @const {
+    make mir = @import "../mir/mir.quip"
+    make graph = @import "lifetimes/graph.quip"
+    make report = @import "report.quip"
+}
+
+/// plans stack slots for mir locals using their liveness information.
+@pub
+make build (g: ref<graph::LivenessGraph>, body: ref<mir::MirBody>, structs: ref<mir::MirStruct[]>) -> report::MemSlot[] {
+    make out: report::MemSlot[] = []
+
+    make n = g.*.nlocals
+    make nstmts = g.*.nstmts
+
+    if n == 0 {
+        return out
+    }
+
+    // Linear last-use intervals cannot prove a slot dead across a back edge:
+    // a later loop iteration may still read it. Keep distinct slots until the
+    // allocator has CFG interference information for such functions.
+    make back_edge = false
+    make bi: uint = 0
+
+    while bi < body.*.terms.len() {
+        make term = body.*.terms[bi].pin
+
+        if term.*.kind == mir::MirTermKind.Goto || term.*.kind == mir::MirTermKind.Call
+            || term.*.kind == mir::MirTermKind.Branch {
+            if term.*.target <= bi { back_edge = true }
+        }
+
+        if term.*.kind == mir::MirTermKind.Branch && term.*.other <= bi { back_edge = true }
+
+        bi = bi + 1
+    }
+
+    if back_edge {
+        make local: uint = 0
+
+        while local < n {
+            make entry = report::MemSlot {}
+
+            entry.local = local
+            entry.name = body.*.locals[local].name.copy()
+            entry.ty = body.*.locals[local].ty.copy()
+            entry.is_param = body.*.locals[local].is_param
+            entry.is_temp = body.*.locals[local].is_temp
+            entry.is_copy = body.*.locals[local].is_copy
+            entry.size = report::size_of_type(entry.ty.copy(), structs)
+
+            if entry.size == 0 { entry.size = 8 }
+
+            entry.slot = local
+            entry.birth = g.*.birth[local]
+            entry.kill = graph::kill_line(g, local)
+            entry.locked = g.*.ever_pinned[local] != 0
+            out.push(entry)
+            local = local + 1
+        }
+
+        return out
+    }
+
+    // births and frees bucketed by linear index
+    make birth_at: uint[] = []
+    make free_at: graph::IdList[] = []
+    make i = 0
+
+    while i < nstmts {
+        birth_at.push(n)
+        free_at.push(graph::IdList {})
+        i = i + 1
+    }
+
+    i = 0
+
+    while i < n {
+        if g.*.has_birth[i] != 0 {
+            make b = g.*.birth[i]
+
+            if b < nstmts {
+                birth_at[b] = i
+            }
+
+            make k = graph::kill_line(g, i)
+
+            if k > b && k < nstmts {
+                free_at[k].ids.push(i)
+            }
+        }
+
+        i = i + 1
+    }
+
+    make slot_of: uint[] = []
+    i = 0
+
+    while i < n {
+        slot_of.push(i)
+        i = i + 1
+    }
+
+    make free_list: uint[] = []
+    make next_slot = g.*.param_count + 1
+
+    make idx = 0
+
+    while idx < nstmts {
+        // frees before births: a dying local donates its slot to a new one
+        make fl = free_at[idx].ids.pin
+        make k = 0
+
+        while k < fl.*.len() {
+            make l = fl.*[k]
+
+            if g.*.ever_pinned[l] == 0 {
+                free_list.push(slot_of[l])
+            }
+
+            k = k + 1
+        }
+
+        make bl = birth_at[idx]
+
+        if bl < n {
+            if free_list.len() > 0 {
+                slot_of[bl] = free_list.pop()
+            } else {
+                slot_of[bl] = next_slot
+                next_slot = next_slot + 1
+            }
+        }
+
+        idx = idx + 1
+    }
+
+    i = 0
+
+    while i < n {
+        make include = g.*.has_birth[i] != 0
+
+        if i <= g.*.param_count {
+            include = true
+        }
+
+        if include {
+            make entry = report::MemSlot {}
+
+            entry.local = i
+            entry.name = body.*.locals[i].name !
+            entry.ty = body.*.locals[i].ty.copy()
+            entry.is_param = body.*.locals[i].is_param
+            entry.is_temp = body.*.locals[i].is_temp
+            entry.is_copy = body.*.locals[i].is_copy
+            entry.size = report::size_of_type(entry.ty.copy(), structs)
+
+            if entry.size == 0 { entry.size = 8 }
+
+            entry.slot = slot_of[i]
+
+            if g.*.has_birth[i] != 0 {
+                entry.birth = g.*.birth[i]
+            }
+
+            entry.kill = graph::kill_line(g, i)
+            entry.locked = g.*.ever_pinned[i] != 0
+            out.push(entry)
+        }
+
+        i = i + 1
+    }
+
+    return out
+}

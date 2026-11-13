@@ -5,6 +5,7 @@ make os: unit = @import "../os/pkg.quip"
 make io: unit = @import "../io/pkg.quip"
 
 make to_str: unit = @import "../fmt/pkg.quip"
+make native: unit = @import "../internal/process.quip"
 }
 
 @pub
@@ -18,37 +19,39 @@ make enum ProcessState {
 @pub
 make type Command {
 
-    make name: str
-    make args: str[]
+    @pub {
+        make name: str = ""
+        make args: str[] = []
 
-    make env: str[] = []
-    make work_dir: str = none
+        make env: str[] = []
+        make work_dir: str? = none
 
-    make fd_in: int = none
-    make fd_out: int = none
-    make fd_err: int = none
+        // Negative descriptors inherit the parent stream, including with older runtimes.
+        make fd_in: int = -1
+        make fd_out: int = -1
+        make fd_err: int = -1
+    }
 
     @pub
     make create (name: str, args: str[]) -> Command {
         make command: Command = Command {}
         command.name = name
         command.args = args
-
         return command
     }
 
     @pub @this
     make get () -> str {
-
         make result: str = ""
 
-        result.push(this.name)
-        result = result + " "
+        result.push(this.name.copy())
+        result.push(" ")
 
-
-        for arg : this.args {
-            result.push(arg)
-            result = result + " "
+        make i: int = 0
+        while i < this.args.len() {
+            result.push(this.args[i])
+            result.push(" ")
+            i = i + 1
         }
 
         return result
@@ -63,20 +66,24 @@ make type Command {
 @pub
 make type Process {
 
-    make command: Command
+    @pub {
+        make command: Command = .{}
 
-    make pid: int = none
+        make pid: int = 0
 
-    make state: ProcessState = ProcessState.None
+        make state: ProcessState = ProcessState.None
 
-    make exit_code: int = 0
-    make signal_code: int = 0
+        make exit_code: int = 0
+        make signal_code: int = 0
+    }
+
 
     @pub
     make spawn (command: Command) -> !Process {
-        make pid: int = os::syscall::quip_spawn_process_qp(
+        make pid: int = os::syscall::quip_spawn_process(
             command.name.pin, command.args.pin,
-            command.fd_in, command.fd_out, command.fd_err)
+            command.fd_in, command.fd_out, command.fd_err
+        )
 
         if pid < 0 {
             return error.ProcessSpawnFailed
@@ -112,9 +119,13 @@ make type Process {
 
     @pub
     make run (command: Command) -> int {
-        return os::syscall::quip_run_process_qp(
+
+        make result: int = os::syscall::quip_run_process(
             command.name.pin, command.args.pin,
             command.fd_in, command.fd_out, command.fd_err)
+
+
+        return result
     }
 }
 

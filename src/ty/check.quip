@@ -1,0 +1,3695 @@
+@pure @const {
+    make std = @import "std"
+
+    make util = @import "../util/pkg.quip"
+    make lexer = @import "../core/token.quip"
+    make hir = @import "../hir/hir.quip"
+    make ty = @import "ty.quip"
+    make facts = @import "../analysis/facts.quip"
+    make context = @import "../diag/context.quip"
+    make lookup = @import "../semantics/symbol/lookup.quip"
+    make diags = @import "../diag/diagnosis.quip"
+    make e = @import "../diag/err.quip"
+}
+
+@pub
+make enum UseKind {
+    None,
+    Copy,
+    Move,
+    Place,
+}
+
+@const make USE_NONE: uint = 0
+@const make USE_COPY: uint = 1
+
+@const make USE_MOVE: uint = 2
+@const make USE_PLACE: uint = 3
+
+/// stores type-checking results for one function.
+@pub
+make type TypeckResults {
+    @pub make call_tys: uint[] = []
+    @pub make expr_tys: uint[] = []
+    @pub make local_tys: uint[] = []
+    @pub make uses: uint[] = []
+    @pub make closure_checks: facts::ClosureCheck[] = []
+    @pub make closure_shapes: facts::ClosureShape[] = []
+    @pub make closure_uses: uint[] = []
+    @pub make field_checks: facts::FieldCheck[] = []
+    @pub make semantic_checks: facts::UseCheck[] = []
+    // resolved symbol for an attached-function call: parallel (expr_idx, name) pairs
+    @pub make call_exprs: uint[] = []
+    @pub make call_names: str[] = []
+    @pub make c_exprs: uint[] = []
+    @pub make variadic_exprs: uint[] = []
+    @pub make variadic_counts: uint[] = []
+    // ABI classification for calls resolved through dependency signatures
+    @pub make abi_exprs: uint[] = []
+    @pub make abi_arg_starts: uint[] = []
+    @pub make abi_arg_counts: uint[] = []
+    @pub make abi_arg_types: uint[] = []
+    @pub make abi_arg_aggs: bool[] = []
+    @pub make abi_ret_aggs: bool[] = []
+    // 1 when the expression at this index is a namespace call (`alias::name`), indexed like `expr_tys`
+    @pub make ns_calls: uint[] = []
+    // resolved namespace constants / enum variants: parallel (expr_idx, literal) pairs
+    @pub make const_exprs: uint[] = []
+    @pub make const_lits: lexer::Token[] = []
+    @pub make ret_ty: uint = ty::TY_VOID
+}
+
+/// collects type-checking results for a module.
+@pub
+make type ModuleTypeck {
+    @pub make funcs: TypeckResults[] = []
+    @pub make checked_functions: uint = 0
+    @pub make reused_functions: uint = 0
+    // Resolved return names for array-copy declarations, consumed by semantic checking.
+    @pub make array_copy_funcs: uint[] = []
+    @pub make array_copy_returns: str[] = []
+}
+
+/// type-checks a hir module using the supplied imported signatures.
+@pub
+make check (module: ref<hir::HirModule>, imports: ref<hir::HirImport[]>, namespaces: ref<hir::HirNamespace[]>, sigs: ref<hir::HirAttachedSig[]>, structs: ref<hir::HirStructSig[]>, funcs: ref<hir::HirFuncSig[]>, tys: ref<ty::TyInterner>, diag: ref<diags::Diagnostic>) -> ModuleTypeck {
+    make ck = Checker.create(module, imports, namespaces, sigs, structs, funcs, tys, diag)
+
+    return ck.run()
+}
+
+/// type-checks a module while reusing eligible previous function results.
+@pub
+make check_cached (module: ref<hir::HirModule>, imports: ref<hir::HirImport[]>, namespaces: ref<hir::HirNamespace[]>, sigs: ref<hir::HirAttachedSig[]>, structs: ref<hir::HirStructSig[]>, funcs: ref<hir::HirFuncSig[]>, tys: ref<ty::TyInterner>, diag: ref<diags::Diagnostic>, previous: ref<ModuleTypeck>, reuse: ref<bool[]>) -> ModuleTypeck {
+    make ck = Checker.create(module, imports, namespaces, sigs, structs, funcs, tys, diag)
+    ck.previous = previous.*.funcs
+    ck.reuse = reuse.*
+
+    return ck.run()
+}
+
+/// resolves types and checks hir against declarations and constraints.
+make type Checker {
+    make previous: TypeckResults[] = []
+    make reuse: bool[] = []
+    make module: ref<hir::HirModule>
+    make imports: ref<hir::HirImport[]>
+    make namespaces: ref<hir::HirNamespace[]>
+    make sigs: ref<hir::HirAttachedSig[]>
+    make structs: ref<hir::HirStructSig[]>
+    make funcs: ref<hir::HirFuncSig[]>
+    make tys: ref<ty::TyInterner>
+    make diag: ref<diags::Diagnostic>
+    make out: TypeckResults = .{}
+    make subst: uint[] = []
+    make ret_ty: uint = ty::TY_VOID
+    make symbols: lookup::Resolver
+    make cur_func_range: util::Range = .{}
+    // type resolved together with a namespace constant/variant
+    make resolved_ty: uint = ty::TY_ERROR
+
+    // depth of enclosing `@unsafe` blocks; operations such as `__syscall` require it to be > 0
+    make unsafe_depth: uint = 0
+
+    // guards recursive type-alias expansion (`make A: Type = A`)
+    make alias_depth: uint = 0
+
+    make create (module: ref<hir::HirModule>, imports: ref<hir::HirImport[]>, namespaces: ref<hir::HirNamespace[]>, sigs: ref<hir::HirAttachedSig[]>, structs: ref<hir::HirStructSig[]>, funcs: ref<hir::HirFuncSig[]>, tys: ref<ty::TyInterner>, diag: ref<diags::Diagnostic>) -> Checker {
+        make ck = Checker { module = module, imports = imports, namespaces = namespaces, sigs = sigs, structs = structs, funcs = funcs, tys = tys, diag = diag, symbols = lookup::Resolver { module = module, namespaces = namespaces, sigs = sigs, structs = structs, funcs = funcs } }
+
+        return ck
+    }
+
+    @this
+    make run () -> ModuleTypeck {
+        make mod = ModuleTypeck {}
+
+        // Array-copy return types require the type resolver; declaration shape and
+        // duplicate implementations are checked in the semantic pass.
+        make method_index: uint = 0
+
+        while method_index < this.module.*.attached_funcs.len() {
+            make method = this.module.*.attached_funcs[method_index].pin
+
+            if method.*.func < this.module.*.funcs.len() {
+                make function = this.module.*.funcs[method.*.func].pin
+
+                if facts::is_array_copy(function, method.*.type_name.copy()) && function.*.has_this && function.*.body.param_count == 1 && function.*.has_ret_ty {
+                    make returned = this.lower_type(function.*.body.pin, function.*.ret_ty)
+                    mod.array_copy_funcs.push(method_index)
+                    mod.array_copy_returns.push(this.type_name_of(returned))
+                }
+            }
+
+            method_index = method_index + 1
+        }
+
+        make complete: bool[] = []
+        make i: uint = 0
+
+        while i < this.module.*.funcs.len() {
+            mod.funcs.push(TypeckResults {})
+            complete.push(false)
+            i = i + 1
+        }
+
+        make remaining = complete.len()
+        i = 0
+
+        while i < complete.len() {
+            if i < this.reuse.len() && this.reuse[i] && i < this.previous.len() {
+                mod.funcs[i] = this.previous[i]
+                complete[i] = true
+                remaining = remaining - 1
+                mod.reused_functions = mod.reused_functions + 1
+            }
+
+            i = i + 1
+        }
+
+        while remaining > 0 && !this.diag.*.is_aborting() {
+            make advanced = false
+            i = 0
+
+            while i < complete.len() {
+                if !complete[i] && this.module.*.funcs[i].capture_locals.len() == this.module.*.funcs[i].capture_type_ids.len() {
+                    mod.checked_functions = mod.checked_functions + 1
+                    mod.funcs[i] = this.check_func(i)
+                    complete[i] = true
+                    remaining = remaining - 1
+                    advanced = true
+                }
+
+                i = i + 1
+            }
+
+            if !advanced { break }
+        }
+
+        if remaining > 0 && !this.diag.*.is_aborting() {
+            make d = diags::Diag.err(e::Err.TypeMismatch, this.module.*.funcs[0].range !, "unable to resolve lambda capture types")
+            this.diag.*.report(d)
+        }
+
+        return mod
+    }
+
+    /// checks the function.
+    @this
+    make check_func (idx: uint) -> TypeckResults {
+        make module = this.module
+        make f = module.*.funcs[idx].pin
+
+
+        while this.out.closure_checks.len() > 0 { make _ = this.out.closure_checks.pop() }
+
+        while this.out.closure_shapes.len() > 0 { make _ = this.out.closure_shapes.pop() }
+
+        while this.out.closure_uses.len() > 0 { make _ = this.out.closure_uses.pop() }
+
+        while this.out.semantic_checks.len() > 0 { make _ = this.out.semantic_checks.pop() }
+
+        while this.out.field_checks.len() > 0 { make _ = this.out.field_checks.pop() }
+
+        this.unsafe_depth = 0
+
+        if facts::unsafe_function(f) { this.unsafe_depth = 1 }
+
+        make body = f.*.body.pin
+
+        while this.out.expr_tys.len() > 0 { make _ = this.out.expr_tys.pop() }
+
+        while this.out.call_tys.len() > 0 { make _ = this.out.call_tys.pop() }
+
+        while this.out.local_tys.len() > 0 { make _ = this.out.local_tys.pop() }
+
+        while this.out.uses.len() > 0 { make _ = this.out.uses.pop() }
+
+        while this.out.call_exprs.len() > 0 { make _ = this.out.call_exprs.pop() }
+
+        while this.out.call_names.len() > 0 { make _ = this.out.call_names.pop() }
+
+        while this.out.c_exprs.len() > 0 { make _ = this.out.c_exprs.pop() }
+
+        while this.out.variadic_exprs.len() > 0 { make _ = this.out.variadic_exprs.pop() }
+
+        while this.out.variadic_counts.len() > 0 { make _ = this.out.variadic_counts.pop() }
+
+        while this.out.abi_exprs.len() > 0 { make _ = this.out.abi_exprs.pop() }
+
+        while this.out.abi_arg_starts.len() > 0 { make _ = this.out.abi_arg_starts.pop() }
+
+        while this.out.abi_arg_counts.len() > 0 { make _ = this.out.abi_arg_counts.pop() }
+
+        while this.out.abi_arg_aggs.len() > 0 { make _ = this.out.abi_arg_aggs.pop() }
+
+        while this.out.abi_arg_types.len() > 0 { make _ = this.out.abi_arg_types.pop() }
+
+        while this.out.abi_ret_aggs.len() > 0 { make _ = this.out.abi_ret_aggs.pop() }
+
+        while this.out.ns_calls.len() > 0 { make _ = this.out.ns_calls.pop() }
+
+        while this.out.const_exprs.len() > 0 { make _ = this.out.const_exprs.pop() }
+
+        while this.out.const_lits.len() > 0 { make _ = this.out.const_lits.pop() }
+
+        while this.subst.len() > 0 {
+            make _ = this.subst.pop()
+        }
+
+        this.ret_ty = ty::TY_VOID
+
+        make ei: uint = 0
+
+        while ei < body.*.exprs.len() {
+            this.out.call_tys.push(ty::TY_ERROR)
+            this.out.expr_tys.push(ty::TY_ERROR)
+            this.out.uses.push(USE_NONE)
+            this.out.ns_calls.push(0)
+            ei = ei + 1
+        }
+
+        make li: uint = 0
+
+        while li < body.*.locals.len() {
+            make local = body.*.locals[li].pin
+
+            if local.*.has_ty {
+                this.out.local_tys.push(this.lower_type(body, local.*.ty))
+            }
+
+            if !local.*.has_ty {
+                this.out.local_tys.push(this.fresh())
+            }
+
+            li = li + 1
+        }
+
+
+        make ci: uint = 0
+
+        while ci < f.*.capture_locals.len() {
+            this.out.local_tys[f.*.capture_locals[ci]] = f.*.capture_type_ids[ci]
+            ci = ci + 1
+        }
+
+        this.cur_func_range = f.*.range !
+
+        if f.*.has_ret_ty {
+            this.cur_func_range = body.*.types[f.*.ret_ty].range !
+            this.ret_ty = this.lower_type(body, f.*.ret_ty)
+
+            if this.ret_ty == ty::TY_AUTO {
+                make d = diags::Diag.err(e::Err.UnexpectedAutoType, f.*.range, "unexpected 'any' Type")
+                d.help("function's return Type must be specified explicitly")
+                this.diag.*.report(d)
+                return .{
+                    ret_ty = ty::TY_ERROR
+                }
+            }
+
+        } else {
+            make d = diags::Diag.err(e::Err.MissingTypeDeclaration, f.*.range, "function declaration is missing Type declaration")
+            d.help("function's Type must be specified explicitly to avoid misunderstanding")
+            this.diag.*.report(d)
+            return .{
+                ret_ty = ty::TY_ERROR
+            }
+        }
+
+        if f.*.capture_locals.len() > 0 {
+            this.out.closure_checks.push(facts::ClosureCheck { kind = 1, ty = this.ret_ty, range = f.*.range.copy() })
+        }
+
+        this.out.ret_ty = this.ret_ty
+        this.check_block(body, body.*.root)
+        this.finish_infer(body)
+        make closure_index: uint = 0
+
+        while closure_index < this.out.closure_checks.len() {
+            make resolved = this.resolve(this.out.closure_checks[closure_index].ty)
+            this.out.closure_checks[closure_index].ty = resolved
+            this.collect_closure_shape(resolved, 0)
+            closure_index = closure_index + 1
+        }
+
+        make out = TypeckResults {}
+        make oi: uint = 0
+
+        while oi < this.out.expr_tys.len() {
+            out.call_tys.push(this.out.call_tys[oi])
+            out.expr_tys.push(this.out.expr_tys[oi])
+            oi = oi + 1
+        }
+
+        oi = 0
+
+        while oi < this.out.local_tys.len() { out.local_tys.push(this.out.local_tys[oi]) oi = oi + 1 }
+
+        oi = 0
+
+        while oi < this.out.uses.len() { out.uses.push(this.out.uses[oi]) oi = oi + 1 }
+
+        while this.out.call_names.len() > 0 {
+            out.call_exprs.push(this.out.call_exprs.pop())
+            out.call_names.push(this.out.call_names.pop())
+        }
+
+        for ce : this.out.c_exprs { out.c_exprs.push(ce) }
+
+        make vi: uint = 0
+
+        while vi < this.out.variadic_exprs.len() {
+            out.variadic_exprs.push(this.out.variadic_exprs[vi])
+            out.variadic_counts.push(this.out.variadic_counts[vi])
+            vi = vi + 1
+        }
+
+        oi = 0
+
+        while oi < this.out.abi_exprs.len() {
+            out.abi_exprs.push(this.out.abi_exprs[oi])
+            out.abi_arg_starts.push(this.out.abi_arg_starts[oi])
+            out.abi_arg_counts.push(this.out.abi_arg_counts[oi])
+            out.abi_ret_aggs.push(this.out.abi_ret_aggs[oi])
+            oi = oi + 1
+        }
+
+        oi = 0
+
+        while oi < this.out.abi_arg_aggs.len() {
+            out.abi_arg_types.push(this.out.abi_arg_types[oi])
+            out.abi_arg_aggs.push(this.out.abi_arg_aggs[oi])
+            oi = oi + 1
+        }
+
+        oi = 0
+
+        while oi < this.out.ns_calls.len() {
+            out.ns_calls.push(this.out.ns_calls[oi])
+            oi = oi + 1
+        }
+
+        oi = 0
+
+        while oi < this.out.const_exprs.len() {
+            out.const_exprs.push(this.out.const_exprs[oi])
+            make st = this.out.const_lits[oi].pin
+            make ct = lexer::Token {}
+
+            ct.kind = st.*.kind
+            ct.lexeme = st.*.lexeme.copy()
+            ct.span = st.*.span
+            out.const_lits.push(ct)
+            oi = oi + 1
+        }
+
+
+        while this.out.closure_checks.len() > 0 { out.closure_checks.push(this.out.closure_checks.pop()) }
+
+        while this.out.closure_shapes.len() > 0 { out.closure_shapes.push(this.out.closure_shapes.pop()) }
+
+        while this.out.closure_uses.len() > 0 { out.closure_uses.push(this.out.closure_uses.pop()) }
+
+        while this.out.field_checks.len() > 0 { out.field_checks.push(this.out.field_checks.pop()) }
+
+        while this.out.semantic_checks.len() > 0 { out.semantic_checks.push(this.out.semantic_checks.pop()) }
+
+        out.ret_ty = this.out.ret_ty
+
+        while this.out.expr_tys.len() > 0 { make _ = this.out.expr_tys.pop() }
+
+        while this.out.call_tys.len() > 0 { make _ = this.out.call_tys.pop() }
+
+        while this.out.local_tys.len() > 0 { make _ = this.out.local_tys.pop() }
+
+        while this.out.uses.len() > 0 { make _ = this.out.uses.pop() }
+
+        while this.out.ns_calls.len() > 0 { make _ = this.out.ns_calls.pop() }
+
+        while this.out.const_exprs.len() > 0 { make _ = this.out.const_exprs.pop() }
+
+        while this.out.const_lits.len() > 0 { make _ = this.out.const_lits.pop() }
+
+        return out
+    }
+
+    @this
+    make fresh () -> uint {
+        make id = this.tys.*.fresh_infer()
+        make v = this.tys.*.var_of(id)
+
+        while this.subst.len() <= v {
+            this.subst.push(ty::TY_ERROR)
+        }
+
+        return id
+    }
+
+    @this
+    make lower_type (body: ref<hir::HirBody>, idx: uint) -> uint {
+        if idx >= body.*.types.len() {
+            return ty::TY_ERROR
+        }
+
+        make ht = body.*.types[idx].pin
+        make id: int = ty::TY_ERROR
+
+        // `ns::Name` (and deeper `a::b::C`): validate the leading segment against the
+        // declared namespaces then try to resolve the final member type name locally.
+        if ht.*.is_namespace {
+            // build the full dotted prefix from all but the last arg
+            make ns_path = ht.*.name !
+            make mi: uint = 0
+
+            while mi + 1 < ht.*.args.len() {
+                make seg = body.*.types[ht.*.args[mi]].pin
+                ns_path = ns_path + "::" + (seg.*.name !)
+                mi = mi + 1
+            }
+
+            make nsi = this.symbols.find_namespace(ns_path !)
+
+            if nsi >= this.namespaces.*.len() {
+                make d = diags::Diag.err(e::Err.UnknownNamespace, ht.*.range.copy(), "unknown namespace")
+                d.label("namespace `" + ns_path + "` is not declared in this file")
+                this.diag.*.report(d)
+                return ty::TY_ERROR
+            }
+
+            // the last arg holds the member type name. when the namespace exports it as a
+            // type, resolve it through the namespace: a local item with the same name may be
+            // the alias currently being expanded, which would recurse instead of reaching
+            // the type behind the alias.
+            if ht.*.args.len() > 0 {
+                make last_idx = ht.*.args[ht.*.args.len() - 1]
+                make last = body.*.types[last_idx].pin
+                make member = last.*.name !
+
+                if this.symbols.namespace_has_type(nsi, member.copy()) {
+                    id = this.intern_imported_type(nsi, member)
+                } else {
+                    id = this.lookup_item(member)
+
+                    if id == ty::TY_ERROR {
+                        id = this.fresh()
+                    }
+                }
+            } else {
+                id = this.fresh()
+            }
+        } elif ht.*.name == "fn" && ht.*.args.len() > 0 {
+            make function = ty::Ty {}
+
+            function.kind = ty::TyKind.Func
+            function.elem = this.lower_type(body, ht.*.args[0])
+            make pi: uint = 1
+
+            while pi < ht.*.args.len() {
+                function.args.push(this.lower_type(body, ht.*.args[pi]))
+                pi = pi + 1
+            }
+
+            id = this.tys.*.intern(function)
+        } elif (ht.*.name == "ptr" || ht.*.name == "owned" || ht.*.name == "ref") && ht.*.args.len() > 0 {
+            make inner = this.lower_type(body, ht.*.args[0])
+
+            if ht.*.name == "ptr" {
+                id = this.tys.*.wrap(ty::TyKind.Ptr, inner)
+            } elif ht.*.name == "owned" {
+                id = this.tys.*.wrap(ty::TyKind.Owned, inner)
+            } else {
+                id = this.tys.*.wrap(ty::TyKind.Ref, inner)
+            }
+        } else {
+            id = ty::TyInterner.prim(ht.*.name)
+
+            if id == ty::TY_ERROR {
+                if ht.*.name.len() > 0 {
+                    id = this.lookup_item(ht.*.name)
+                }
+            }
+        }
+
+        if ht.*.name == "variant" {
+
+            make arg_ids: uint[] = []
+
+            for a : ht.*.args {
+                arg_ids.push(this.lower_type(body, a))
+            }
+
+            make vid = this.tys.*.variant(arg_ids)
+
+            if ht.*.is_optional {
+                vid = this.tys.*.wrap(ty::TyKind.Optional, vid)
+            }
+
+            if ht.*.is_fallible {
+                vid = this.tys.*.wrap(ty::TyKind.Fallible, vid)
+            }
+
+
+            return vid
+        }
+
+        if ht.*.is_ref {
+            id = this.tys.*.wrap(ty::TyKind.Ref, id)
+        }
+
+        if ht.*.is_ptr {
+            id = this.tys.*.wrap(ty::TyKind.Ptr, id)
+        }
+
+        if ht.*.is_array {
+            id = this.tys.*.wrap(ty::TyKind.Array, id)
+        }
+
+        if ht.*.is_optional {
+            id = this.tys.*.wrap(ty::TyKind.Optional, id)
+        }
+
+        if ht.*.is_fallible {
+            id = this.tys.*.wrap(ty::TyKind.Fallible, id)
+        }
+
+        return id
+    }
+
+    /// follows inference bindings to the current type id.
+    @this
+    make resolve (id: uint) -> uint {
+        if id == ty::TY_AUTO {
+            return id
+        }
+
+        if this.tys.*.kind_of(id) != ty::TyKind.Infer {
+            return id
+        }
+
+        make v = this.tys.*.var_of(id)
+
+        if v >= this.subst.len() {
+            return id
+        }
+
+        make bound = this.subst[v]
+
+        if bound == ty::TY_ERROR || bound == id {
+            return id
+        }
+
+        make resolved = this.resolve(bound)
+        this.subst[v] = resolved
+
+        return resolved
+    }
+
+    // `ptr<T>` is a raw pointer; `ref<T>` a borrowed one; `owned<T>` an owning one
+    @this
+    make is_pointer_kind (k: ty::TyKind) -> bool {
+        if k == ty::TyKind.Ptr || k == ty::TyKind.Ref || k == ty::TyKind.Owned {
+            return true
+        }
+
+        return false
+    }
+
+    // the raw pointer type `ptr<pointee>` for a pointer-like type
+    @this
+    make pointer_of (id: uint) -> uint {
+        return this.tys.*.wrap(ty::TyKind.Ptr, this.tys.*.elem_of(this.resolve(id)))
+    }
+
+    // binds inference variables and checks structural equality
+    // returns TY_ERROR on a conflict and does not report it
+    /// unifies two type ids, returning the error type when they conflict.
+    @this
+    make unify (expected: uint, got: uint) -> uint {
+
+        // expected
+        make aa = this.resolve(expected)
+        // got
+        make bb = this.resolve(got)
+
+        if aa == bb {
+            return aa
+        }
+
+        // `any` is the unconstrained source type, not an inference variable. It must not
+        // participate in substitution or the occurs check despite sharing the Infer kind.
+        if aa == ty::TY_AUTO {
+            return bb
+        }
+
+        if bb == ty::TY_AUTO {
+            return aa
+        }
+
+        // compare kinds through fresh `kind_of` calls: the kind enum itself is not
+        // marked copyable, so keeping it in a local would consume it on first read
+        if this.tys.*.kind_of(aa) == ty::TyKind.Error {
+            return bb
+        }
+
+        if this.tys.*.kind_of(bb) == ty::TyKind.Error {
+            return aa
+        }
+
+        if this.tys.*.kind_of(aa) == ty::TyKind.Infer {
+            make v = this.tys.*.var_of(aa)
+
+            if this.occurs_in(v, bb) {
+                return ty::TY_ERROR
+            }
+
+            this.bind(v, bb)
+            return bb
+        }
+
+        if this.tys.*.kind_of(bb) == ty::TyKind.Infer {
+            make v = this.tys.*.var_of(bb)
+
+            if this.occurs_in(v, aa) {
+                return ty::TY_ERROR
+            }
+
+            this.bind(v, aa)
+            return aa
+        }
+
+        if this.tys.*.kind_of(aa) == ty::TyKind.Variant || this.tys.*.kind_of(bb) == ty::TyKind.Variant {
+            return this.unify_variant(aa, bb)
+        }
+
+        // `Text` is a string literal with no identity yet: it takes the shape of the type it
+        // is unified with (`str` or `String`). When it only meets inference variables it stays
+        // `Text` until `finish_infer` defaults it to the dynamic `str`.
+        if this.tys.*.kind_of(aa) == ty::TyKind.Text || this.tys.*.kind_of(bb) == ty::TyKind.Text {
+            make other = bb
+
+            if this.tys.*.kind_of(aa) != ty::TyKind.Text {
+                other = aa
+            }
+
+            if this.tys.*.kind_of(other) == ty::TyKind.Text { return ty::TY_TEXT }
+
+            if this.tys.*.kind_of(other) == ty::TyKind.Str { return ty::TY_STR }
+
+            if this.tys.*.kind_of(other) == ty::TyKind.StrBuf { return ty::TY_STRBUF }
+        }
+
+        // `error.Name` (ErrorVal) is compatible with any Fallible<T>: the error arm
+        // of a fallible type accepts any error value regardless of the success type T.
+        if this.tys.*.kind_of(aa) == ty::TyKind.ErrorVal && this.tys.*.kind_of(bb) == ty::TyKind.Fallible {
+            return bb
+        }
+
+        if this.tys.*.kind_of(aa) == ty::TyKind.Fallible && this.tys.*.kind_of(bb) == ty::TyKind.ErrorVal {
+            return aa
+        }
+
+        // a plain success value (e.g. `0` in `return 0`) unifies with Fallible<T> by
+        // matching against the inner success type T.  Neither side may itself be an
+        // error/fallible/errorval type for this rule to apply.
+        if this.tys.*.kind_of(aa) == ty::TyKind.Fallible && this.tys.*.kind_of(bb) != ty::TyKind.Fallible && this.tys.*.kind_of(bb) != ty::TyKind.ErrorVal {
+            if this.unify(this.tys.*.elem_of(aa), bb) != ty::TY_ERROR {
+                return aa
+            }
+        }
+
+        if this.tys.*.kind_of(bb) == ty::TyKind.Fallible && this.tys.*.kind_of(aa) != ty::TyKind.Fallible && this.tys.*.kind_of(aa) != ty::TyKind.ErrorVal {
+            return ty::TY_ERROR
+        }
+
+        // a concrete value unifies with `T?` by matching against the payload type T, so that
+        // e.g. `make x: ptr<Block>? = some_ptr` and `this.next = new` are accepted.
+        if this.tys.*.kind_of(aa) == ty::TyKind.Optional && this.tys.*.kind_of(bb) != ty::TyKind.Optional && this.tys.*.kind_of(bb) != ty::TyKind.ErrorVal {
+            if this.unify(this.tys.*.elem_of(aa), bb) != ty::TY_ERROR {
+                return aa
+            }
+        }
+
+        if this.tys.*.kind_of(bb) == ty::TyKind.Optional && this.tys.*.kind_of(aa) != ty::TyKind.Optional && this.tys.*.kind_of(aa) != ty::TyKind.ErrorVal {
+            if this.unify(aa, this.tys.*.elem_of(bb)) != ty::TY_ERROR {
+                return bb
+            }
+        }
+
+        // raw pointers, borrows and owning pointers are interchangeable at the boundary:
+        // `owned<any>`, `ptr<any>` and `ref<any>` match any pointer-like receiver type, and
+        // the expected type is adopted (e.g. `make b: ptr<Block> = owned_ptr`).
+        if this.is_pointer_kind(this.tys.*.kind_of(aa)) && this.is_pointer_kind(this.tys.*.kind_of(bb)) {
+            return aa
+        }
+
+        if this.tys.*.kind_of(aa) == ty::TyKind.Func || this.tys.*.kind_of(bb) == ty::TyKind.Func {
+            if this.tys.*.kind_of(aa) != ty::TyKind.Func || this.tys.*.kind_of(bb) != ty::TyKind.Func { return ty::TY_ERROR }
+
+            if this.tys.*.tys[aa].is_unsafe != this.tys.*.tys[bb].is_unsafe { return ty::TY_ERROR }
+
+            if this.resolve(this.tys.*.elem_of(aa)) != this.resolve(this.tys.*.elem_of(bb)) { return ty::TY_ERROR }
+
+            make a = this.tys.*.args_of(aa)
+            make b = this.tys.*.args_of(bb)
+
+            if a.len() != b.len() { return ty::TY_ERROR }
+
+            make i: uint = 0
+
+            while i < a.len() {
+                if this.resolve(a[i]) != this.resolve(b[i]) { return ty::TY_ERROR }
+
+                i = i + 1
+            }
+
+            return aa
+        }
+
+        if this.tys.*.kind_of(aa) == ty::TyKind.Adt && this.tys.*.kind_of(bb) == ty::TyKind.Adt {
+            if this.adt_name(aa) == this.adt_name(bb) { return aa }
+
+            return ty::TY_ERROR
+        }
+
+        if this.tys.*.kind_of(aa) == this.tys.*.kind_of(bb) {
+            make ea = this.tys.*.elem_of(aa)
+            make eb = this.tys.*.elem_of(bb)
+
+            if ea != 0 || eb != 0 {
+                if this.unify(ea, eb) == ty::TY_ERROR {
+                    return ty::TY_ERROR
+                }
+            }
+
+            return aa
+        }
+
+        // the reference treats the fixed-width integer types as interchangeable, so a value of one
+        // integer type is accepted where another is expected (`@sizeof` yields `u32` but unifies
+        // with `int`, `return 0` works in a `uint` function, and so on)
+        if this.tys.*.is_int(aa) && this.tys.*.is_int(bb) {
+            return aa
+        }
+
+        return ty::TY_ERROR
+    }
+
+    // Prevent recursive inference substitutions such as `T = ptr<T>`, which would make
+    // `resolve` recurse indefinitely.
+    @this
+    make occurs_in (v: uint, id: uint) -> bool {
+        if id == ty::TY_AUTO {
+            return false
+        }
+
+        if this.tys.*.kind_of(id) == ty::TyKind.Infer {
+            return this.tys.*.var_of(id) == v
+        }
+
+        make elem = this.tys.*.elem_of(id)
+
+        if elem != 0 {
+            if this.occurs_in(v, elem) {
+                return true
+            }
+        }
+
+        make args = this.tys.*.args_of(id)
+        make i: uint = 0
+
+        while i < args.len() {
+            if this.occurs_in(v, args[i]) {
+                return true
+            }
+
+            i = i + 1
+        }
+
+        return false
+    }
+
+    // one side (or both) is a `variant<...>`: a concrete type unifies with it when it's one of
+    // its members, two variants unify when they contain exactly the same members
+    @this
+    make unify_variant (aa: uint, bb: uint) -> uint {
+        if this.tys.*.kind_of(aa) == ty::TyKind.Variant && this.tys.*.kind_of(bb) == ty::TyKind.Variant {
+            if this.variant_subset(aa, bb) && this.variant_subset(bb, aa) {
+                return aa
+            }
+
+            return ty::TY_ERROR
+        }
+
+        if this.tys.*.kind_of(aa) == ty::TyKind.Variant {
+            if this.variant_contains(aa, bb) {
+                return aa
+            }
+
+            return ty::TY_ERROR
+        }
+
+        if this.variant_contains(bb, aa) {
+            return bb
+        }
+
+        return ty::TY_ERROR
+    }
+
+    // is `t` (a concrete type) one of the members of the variant `v`?
+    @this
+    make variant_contains (v: uint, t: uint) -> bool {
+        make args = this.tys.*.args_of(v)
+        make i: uint = 0
+
+        while i < args.len() {
+            if this.unify(args[i], t) != ty::TY_ERROR {
+                return true
+            }
+
+            i = i + 1
+        }
+
+        return false
+    }
+
+    // is every member of the variant `a` also a member of the variant `b`?
+    @this
+    make variant_subset (a: uint, b: uint) -> bool {
+
+        make args = this.tys.*.args_of(a)
+        make i: uint = 0
+
+        while i < args.len() {
+            if !this.variant_contains(b, args[i]) {
+                return false
+            }
+
+            i = i + 1
+        }
+
+        return true
+    }
+
+    // human-readable rendering of a resolved type, for diagnostics
+    @this
+    make ty_name (id: uint) -> str {
+        make rid = this.resolve(id)
+        make kind = this.tys.*.kind_of(rid)
+
+        match kind {
+            ty::TyKind.Error { return "<error>" }
+
+            ty::TyKind.Infer { return "any" }
+
+            ty::TyKind.Void { return "void" }
+
+            ty::TyKind.Bool { return "bool" }
+
+            ty::TyKind.I8 { return "i8" }
+
+            ty::TyKind.I16 { return "i16" }
+
+            ty::TyKind.I32 { return "i32" }
+
+            ty::TyKind.I64 { return "i64" }
+
+            ty::TyKind.U8 { return "u8" }
+
+            ty::TyKind.U16 { return "u16" }
+
+            ty::TyKind.U32 { return "u32" }
+
+            ty::TyKind.U64 { return "u64" }
+
+            ty::TyKind.Int { return "int" }
+
+            ty::TyKind.Uint { return "uint" }
+
+            ty::TyKind.F32 { return "f32" }
+
+            ty::TyKind.F64 { return "f64" }
+
+            ty::TyKind.Float { return "float" }
+
+            ty::TyKind.Text { return "str" }
+
+            ty::TyKind.Str { return "str" }
+
+            ty::TyKind.StrBuf { return "String" }
+
+            ty::TyKind.Char { return "char" }
+
+            ty::TyKind.Array { return this.ty_name(this.tys.*.elem_of(rid)) + "[]" }
+
+            ty::TyKind.Optional { return this.ty_name(this.tys.*.elem_of(rid)) + "?" }
+
+            ty::TyKind.Fallible { return "!" + this.ty_name(this.tys.*.elem_of(rid))  }
+
+            ty::TyKind.ErrorVal { return "error" }
+
+            ty::TyKind.Ptr { return "pin<" + this.ty_name(this.tys.*.elem_of(rid)) + ">" }
+
+            ty::TyKind.Owned { return "owned<" + this.ty_name(this.tys.*.elem_of(rid)) + ">" }
+
+            ty::TyKind.Ref { return "ref<" + this.ty_name(this.tys.*.elem_of(rid)) + ">" }
+
+            ty::TyKind.Func {
+                make name: str = "("
+
+                if this.tys.*.tys[rid].is_unsafe { name = "@unsafe (" }
+
+                make parameters = this.tys.*.args_of(rid)
+                make i: uint = 0
+
+                while i < parameters.len() {
+                    if i > 0 { name = name + ", " }
+
+                    name = name + this.ty_name(parameters[i])
+                    i = i + 1
+                }
+
+                return name + ") -> " + this.ty_name(this.tys.*.elem_of(rid))
+            }
+
+            ty::TyKind.Adt {
+                make def = this.tys.*.def_of(rid)
+
+                if def < this.module.*.items.len() && this.module.*.items[def].display_name.len() > 0 { return this.module.*.items[def].display_name.copy() }
+
+                make internal = this.adt_name(rid)
+                make si = this.symbols.find_struct_sig(internal.copy())
+
+                if si < this.structs.*.len() && this.structs.*[si].display_name.len() > 0 { return this.structs.*[si].display_name.copy() }
+
+                return internal
+            }
+
+            ty::TyKind.Variant {
+                make s: str = "variant<"
+                make args = this.tys.*.args_of(rid)
+                make i: uint = 0
+
+                while i < args.len() {
+                    if i > 0 {
+                        s = s + ", "
+                    }
+
+                    s = s + this.ty_name(args[i])
+                    i = i + 1
+                }
+
+                return s + ">"
+            }
+            _ { return "<unknown>" }
+        }
+
+        return "<unknown>"
+    }
+
+    /// returns the declared name of an interned algebraic data type.
+    @this
+    make adt_name (id: uint) -> str {
+        make def = this.tys.*.def_of(id)
+
+        if def >= this.module.*.items.len() {
+            return "<type>"
+        }
+
+        make item = this.module.*.items[def].pin
+        // Return an independent buffer: callers consume the rendered name, while the
+        // item must keep its name for later type rendering and layout lookup.
+        return item.*.name.copy()
+    }
+
+    /// binds an inference variable to a type id.
+    @this
+    make bind (v: uint, id: uint) -> void {
+        while this.subst.len() <= v {
+            this.subst.push(ty::TY_ERROR)
+        }
+
+        this.subst[v] = id
+        return
+    }
+
+    // `Text` is only a placeholder while checking: a string literal takes its final identity
+    // (`str` or `String`) from the context it is unified with. Any `Text` still left once
+    // inference is done had no such context, so it becomes the dynamic `str`. The conversion is
+    // recursive so containers such as `Text[]` also become `str[]`.
+    @this
+    make default_text (id: uint) -> uint {
+        make rid = this.resolve(id)
+
+        if this.tys.*.kind_of(rid) == ty::TyKind.Text {
+            return ty::TY_STR
+        }
+
+        if this.tys.*.kind_of(rid) == ty::TyKind.Array || this.tys.*.kind_of(rid) == ty::TyKind.Optional || this.tys.*.kind_of(rid) == ty::TyKind.Fallible || this.tys.*.kind_of(rid) == ty::TyKind.Ptr || this.tys.*.kind_of(rid) == ty::TyKind.Owned || this.tys.*.kind_of(rid) == ty::TyKind.Ref {
+            make elem = this.tys.*.elem_of(rid)
+            make defaulted = this.default_text(elem)
+
+            if defaulted == elem {
+                return rid
+            }
+
+            return this.tys.*.wrap(this.tys.*.kind_of(rid), defaulted)
+        }
+
+        if this.tys.*.kind_of(rid) == ty::TyKind.Variant {
+            make args = this.tys.*.args_of(rid)
+            make changed = false
+            make vi: uint = 0
+
+            while vi < args.len() {
+                make defaulted = this.default_text(args[vi])
+
+                if defaulted != args[vi] {
+                    changed = true
+                }
+
+                args[vi] = defaulted
+                vi = vi + 1
+            }
+
+            if changed {
+                return this.tys.*.variant(args)
+            }
+
+            return rid
+        }
+
+        return rid
+    }
+
+    /// finishes the infer.
+    @this
+    make finish_infer (body: ref<hir::HirBody>) -> void {
+        make i: uint = 0
+
+        while i < this.out.expr_tys.len() {
+            this.out.expr_tys[i] = this.default_text(this.out.expr_tys[i])
+            this.out.call_tys[i] = this.default_text(this.out.call_tys[i])
+            i = i + 1
+        }
+
+        i = 0
+
+        while i < this.out.local_tys.len() {
+            make id = this.default_text(this.out.local_tys[i])
+
+            if this.tys.*.kind_of(id) == ty::TyKind.Infer {
+                make local = body.*.locals[i].pin
+
+                // only complain when the user wrote no type annotation at all;
+                // if `has_ty` is true they did write one (it just resolved to an
+                // unresolvable cross-module type), so don't blame them for it
+                if !local.*.has_ty {
+                    make d = diags::Diag.err(e::Err.TypeMismatch, local.*.range !, "could not infer the type of this local")
+                    d.label("type must be written here, or the local must be used in a typed context")
+                    this.diag.*.report(d)
+                }
+
+                id = ty::TY_ERROR
+            }
+
+            this.out.local_tys[i] = id
+            i = i + 1
+        }
+
+        this.out.ret_ty = this.default_text(this.ret_ty)
+
+        return
+    }
+
+    @this
+    make check_block (body: ref<hir::HirBody>, block: uint) -> void {
+        if block >= body.*.blocks.len() {
+            return
+        }
+
+        make b = body.*.blocks[block].pin
+        make i: uint = 0
+
+        while i < b.*.stmts.len() {
+            this.check_stmt(body, b.*.stmts[i])
+            i = i + 1
+        }
+
+        return
+    }
+
+    /// checks the statement.
+    @this
+    make check_stmt (body: ref<hir::HirBody>, idx: uint) -> void {
+        if idx >= body.*.stmts.len() {
+            return
+        }
+
+        make s = body.*.stmts[idx].pin
+
+        if s.*.is_unsafe {
+            this.unsafe_depth = this.unsafe_depth + 1
+        }
+
+        match s.*.kind {
+            hir::HirStmtKind.Let {
+                make ty_id = this.out.local_tys[s.*.local]
+                make declared = ty_id
+
+                // body.*.types[declared].name
+                if s.*.has_value {
+                    make local = body.*.locals[s.*.local].pin
+                    make local_type_idx = local.*.ty
+                    this.check_anonymous_fields(body, s.*.value, declared)
+                    make init = this.check_expr(body, s.*.value, UseKind.Copy)
+                    // Anonymous aggregate literals borrow their identity from
+                    // the written local type; TY_ERROR is their old placeholder,
+                    // not a failed expression. Do not poison a valid `T = .{}`.
+                    make initializer = body.*.exprs[s.*.value].pin
+
+                    if init == ty::TY_ERROR && local.*.has_ty &&
+                        initializer.*.kind == hir::HirExprKind.Constructor && initializer.*.name.len() == 0 {
+                        init = declared
+                    }
+
+
+                    if this.resolve(init) == ty::TY_ERROR {
+                        ty_id = ty::TY_ERROR
+                    } else {
+                        ty_id = this.unify(ty_id, init)
+                    }
+
+                    if ty_id == ty::TY_ERROR && this.resolve(init) != ty::TY_ERROR {
+                        if s.*.is_unsafe && local.*.has_ty && !(this.tys.*.kind_of(this.resolve(init)) == ty::TyKind.Func && this.tys.*.tys[this.resolve(init)].is_unsafe) {
+                            ty_id = declared
+                        } else {
+                            make value_ex = body.*.exprs[s.*.value].pin
+                            make d = diags::Diag.err(e::Err.TypeMismatch, value_ex.*.range !, "mismatched Types")
+                            d.label("found '" + this.ty_name(init) + "' Type here")
+
+                            if local.*.has_ty {
+                                d.attach(diags::Label.create(
+                                    body.*.types[local_type_idx].range !,
+                                    "expected '" + this.ty_name(declared) + "' Type")
+                                )
+                                d.help("expression Type must match the explicitly declared Type")
+                            }
+
+                            this.diag.*.report(d)
+                        }
+                    }
+
+                    this.out.local_tys[s.*.local] = ty_id
+                }
+            }
+
+            hir::HirStmtKind.Assign {
+                make place = this.check_expr(body, s.*.target, UseKind.Place)
+
+                if s.*.has_value {
+                    this.check_anonymous_fields(body, s.*.value, place)
+                    make value = this.check_expr(body, s.*.value, UseKind.Copy)
+
+                    make writable = true
+
+                    if s.*.op.kind != lexer::TokenKind.Equal {
+                        writable = this.writable_place(body, s.*.target)
+                    }
+
+                    if this.resolve(place) != ty::TY_ERROR && !writable {
+                        make target = body.*.exprs[s.*.target].pin
+                        make diagnostic = diags::Diag.err(e::Err.TypeMismatch, target.*.range !, "assignment requires a writable place")
+                        this.diag.*.report(diagnostic)
+                    }
+
+                    if s.*.op.kind != lexer::TokenKind.Equal {
+                        if writable {
+                            this.check_compound(body, s, place, value)
+                        }
+                    } elif this.resolve(place) != ty::TY_ERROR && this.resolve(value) != ty::TY_ERROR && this.unify(place, value) == ty::TY_ERROR {
+                        make value_ex = body.*.exprs[s.*.value].pin
+                        make d = diags::Diag.err(e::Err.TypeMismatch, value_ex.*.range !, "mismatched types")
+                        d.label("found `" + this.ty_name(value) + "` here")
+                        make target_ex = body.*.exprs[s.*.target].pin
+
+                        if target_ex.*.kind == hir::HirExprKind.Local {
+                            make local = body.*.locals[target_ex.*.local].pin
+
+                            if local.*.has_ty {
+                                d.attach(diags::Label.create(local.*.range !, "expected `" + this.ty_name(place) + "` because the variable's type is declared here"))
+                            }
+                        }
+
+                        if target_ex.*.kind == hir::HirExprKind.Field && target_ex.*.lhs < this.out.expr_tys.len() {
+                            make base = this.resolve(this.out.expr_tys[target_ex.*.lhs])
+
+                            while this.tys.*.kind_of(base) == ty::TyKind.Ref || this.tys.*.kind_of(base) == ty::TyKind.Ptr || this.tys.*.kind_of(base) == ty::TyKind.Owned { base = this.resolve(this.tys.*.elem_of(base)) }
+
+                            if this.tys.*.kind_of(base) == ty::TyKind.Adt { context::attach_field_context(this.structs, d.*.pin, this.adt_name(base), target_ex.*.name.copy()) }
+                        }
+
+                        d.help("assign a value compatible with the target's declared type")
+                        this.diag.*.report(d)
+                    }
+                }
+            }
+
+            hir::HirStmtKind.Expr {
+                this.check_expr(body, s.*.value, UseKind.None)
+            }
+
+            hir::HirStmtKind.If {
+                make cond = this.check_expr(body, s.*.value, UseKind.Copy)
+
+                if this.unify(ty::TY_BOOL, cond) == ty::TY_ERROR {
+                    make d = diags::Diag.err(e::Err.TypeMismatch, body.*.exprs[s.*.value].range.copy(), "condition must have type `bool`")
+                    d.label("found `" + this.ty_name(cond) + "`, expected `bool`")
+                    d.attach(diags::Label.create(util::Range.of(s.*.range.start.start, s.*.range.start.end), "this branch requires a boolean condition"))
+                    d.help("compare the value explicitly or produce a boolean expression")
+                    this.diag.*.report(d)
+                }
+
+                this.check_block(body, s.*.then_block)
+
+                if s.*.has_else {
+                    this.check_block(body, s.*.else_block)
+                }
+            }
+
+            hir::HirStmtKind.Loop {
+                this.check_block(body, s.*.then_block)
+            }
+
+            hir::HirStmtKind.Block {
+                this.check_block(body, s.*.then_block)
+            }
+
+            hir::HirStmtKind.Return {
+                if s.*.has_value {
+                    this.check_anonymous_fields(body, s.*.value, this.ret_ty)
+                    make value = this.check_expr(body, s.*.value, UseKind.Copy)
+                    make unified = this.unify(this.ret_ty, value)
+
+                    if this.resolve(value) != ty::TY_ERROR && unified == ty::TY_ERROR {
+                        make value_ex = body.*.exprs[s.*.value].pin
+                        make d = diags::Diag.err(e::Err.TypeMismatch, value_ex.*.range !, "mismatched Types")
+                        d.label("found `" + this.ty_name(value) + "` here")
+                        d.attach(diags::Label.create(this.cur_func_range !, "expected `" + this.ty_name(this.ret_ty) + "`"))
+                        this.diag.*.report(d)
+                    }
+
+                    // Keep the declared return type after a failure so a later,
+                    // independent bad return is still checked against it.
+                    if unified != ty::TY_ERROR {
+                        this.ret_ty = unified
+                    }
+
+                    this.out.ret_ty = this.ret_ty
+                }
+
+                if !s.*.has_value {
+                    if this.unify(this.ret_ty, ty::TY_VOID) == ty::TY_ERROR {
+                        make d = diags::Diag.err(e::Err.TypeMismatch, s.*.range !, "mismatched Types")
+                        d.label("return has no value, expected `" + this.ty_name(this.ret_ty) + "`")
+                        d.attach(diags::Label.create(this.cur_func_range !, "the function's return type is declared here"))
+                        this.diag.*.report(d)
+                    }
+                }
+            }
+
+            hir::HirStmtKind.Break {}
+
+            hir::HirStmtKind.Unsupported {}
+
+            hir::HirStmtKind.Match {
+                this.check_match(body, s.*.value, s.*.cases, false)
+            }
+
+            _ {}
+        }
+
+        if s.*.is_unsafe {
+            this.unsafe_depth = this.unsafe_depth - 1
+        }
+
+        return
+    }
+
+    // type-check a `match`: the scrutinee, every case binding/body/result, and (for expression
+    // matches) the common type of the case results
+    @this
+    make check_match (body: ref<hir::HirBody>, scrut: uint, cases: uint[], want_result: bool) -> uint {
+        make scr_ty = this.resolve(this.check_expr(body, scrut, UseKind.Copy))
+        make result = ty::TY_VOID
+        make seen = false
+
+        make ci = 0
+
+        while ci < cases.len() {
+            make cidx = cases[ci]
+
+            if cidx < body.*.cases.len() {
+                make hc = body.*.cases[cidx].pin
+
+                if hc.*.has_pattern {
+                    make pt = this.check_expr(body, hc.*.pattern, UseKind.Copy)
+                    hc.*.is_error = pt == ty::TY_ERROR_VAL
+                    make resolved = false
+                    make pi: uint = 0
+
+                    while pi < this.out.const_exprs.len() {
+                        if this.out.const_exprs[pi] == hc.*.pattern {
+                            hc.*.kind = hir::HirPatternKind.Literal
+                            make lit = this.out.const_lits[pi].pin
+                            hc.*.lit.kind = lit.*.kind
+                            hc.*.lit.lexeme = lit.*.lexeme.copy()
+                            hc.*.lit.span = lit.*.span
+                            resolved = true
+                        }
+
+                        pi = pi + 1
+                    }
+
+                    if !resolved {
+                        facts::record_invalid_pattern(this.out.semantic_checks.pin, hc.*.range.copy())
+                    }
+                }
+
+                if hc.*.has_bind {
+                    if hc.*.kind == hir::HirPatternKind.Some {
+                        make rsk = this.resolve(scr_ty)
+                        make sk = this.tys.*.kind_of(rsk)
+
+                        if sk == ty::TyKind.Variant {
+                            // variant member binding: keep the local's declared/annotated type
+                        } elif sk == ty::TyKind.Optional {
+                            make pt = this.tys.*.elem_of(rsk)
+
+                            if pt == 0 {
+                                pt = this.fresh()
+                            }
+
+                            this.out.local_tys[hc.*.bind] = pt
+                        } elif sk == ty::TyKind.Fallible {
+                            make pt = this.tys.*.elem_of(rsk)
+
+                            if pt == 0 {
+                                pt = this.fresh()
+                            }
+
+                            this.out.local_tys[hc.*.bind] = pt
+                        } else {
+                            make u = this.unify(scr_ty, this.out.local_tys[hc.*.bind])
+                            this.out.local_tys[hc.*.bind] = u
+                        }
+                    } else {
+                        make u = this.unify(scr_ty, this.out.local_tys[hc.*.bind])
+                        this.out.local_tys[hc.*.bind] = u
+                    }
+                }
+
+                if hc.*.has_body {
+                    this.check_block(body, hc.*.body)
+                }
+
+                if hc.*.has_result {
+                    make rt = this.check_expr(body, hc.*.result, UseKind.Copy)
+
+                    if want_result {
+                        if seen {
+                            make joined = this.unify(result, rt)
+
+                            if joined != ty::TY_ERROR {
+                                result = joined
+                            } else {
+                                make members: uint[] = []
+
+                                if this.tys.*.kind_of(result) == ty::TyKind.Variant {
+                                    members = this.tys.*.args_of(result)
+                                } else { members.push(result) }
+
+                                members.push(rt)
+                                result = this.tys.*.variant(members)
+                            }
+                        } else {
+                            result = rt
+                            seen = true
+                        }
+                    }
+                }
+            }
+
+            ci = ci + 1
+        }
+
+        return result
+    }
+
+    /// checks the expression.
+    @this
+    make check_expr (body: ref<hir::HirBody>, idx: uint, how: UseKind) -> uint {
+        if idx % 64 == 0 && this.diag.*.is_aborting() { return ty::TY_ERROR }
+
+        if idx >= body.*.exprs.len() {
+            return ty::TY_ERROR
+        }
+
+        make ex = body.*.exprs[idx].pin
+        facts::require_unsafe(this.unsafe_depth, this.out.semantic_checks.pin, ex.*.requires_unsafe, ex.*.range.copy())
+        make id = ty::TY_ERROR
+
+        match ex.*.kind {
+            hir::HirExprKind.Literal { id = this.lit_ty(ex.*.lit.pin) }
+
+            hir::HirExprKind.Local {
+                if ex.*.local < this.out.local_tys.len() {
+                    id = this.out.local_tys[ex.*.local]
+                }
+
+                this.note_use(idx, id, how)
+            }
+
+            hir::HirExprKind.Lambda {
+                make fi = this.symbols.find_func(ex.*.name !)
+
+                if fi < this.module.*.funcs.len() {
+
+                    while this.module.*.funcs[fi].capture_type_ids.len() > 0 { make _ = this.module.*.funcs[fi].capture_type_ids.pop() }
+
+                    for argument : ex.*.args {
+                        make captured = this.resolve(this.check_expr(body, argument, UseKind.Copy))
+
+                        this.out.closure_checks.push(facts::ClosureCheck { expr = idx, ty = captured, range = ex.*.range.copy() })
+
+                        this.module.*.funcs[fi].capture_type_ids.push(captured)
+                    }
+
+                    id = this.function_type(fi)
+                }
+            }
+
+            hir::HirExprKind.Path {
+                make fi = this.symbols.find_func(ex.*.name !)
+
+                if fi < this.module.*.funcs.len() {
+                    facts::require_unsafe_local(this.unsafe_depth, this.out.semantic_checks.pin, this.module.*.funcs[fi].pin, ex.*.range.copy())
+                    id = this.function_type(fi)
+                } else {
+                    for item : this.module.*.items {
+                        if item.name == ex.*.name { facts::require_unsafe(this.unsafe_depth, this.out.semantic_checks.pin, item.is_unsafe, ex.*.range.copy()) }
+                    }
+
+                    id = this.lookup_item(ex.*.name)
+
+                    if id == ty::TY_ERROR && this.symbols.find_namespace(ex.*.name !) >= this.namespaces.*.len() {
+                        make d = diags::Diag.err(e::Err.UnknownSymbol, ex.*.range !, "unknown symbol `" + ex.*.name + "`")
+                        d.label("no symbol named `" + ex.*.name + "` is declared in this scope")
+                        this.diag.*.report(d)
+                    }
+                }
+            }
+
+            hir::HirExprKind.Binary { id = this.check_binary(body, ex) }
+
+            hir::HirExprKind.Unary { id = this.check_unary(body, ex) }
+
+            hir::HirExprKind.Update { id = this.check_update(body, ex) }
+
+            hir::HirExprKind.Call { id = this.check_call(body, idx, ex, how != UseKind.None) }
+
+            hir::HirExprKind.Index {
+                id = this.check_index(body, ex)
+                this.note_use(idx, id, how)
+            }
+
+            hir::HirExprKind.Deref {
+                id = this.check_deref(body, ex)
+                this.note_use(idx, id, how)
+            }
+
+            hir::HirExprKind.Pin {
+                id = this.tys.*.wrap(ty::TyKind.Ref, this.resolve(this.check_expr(body, ex.*.lhs, UseKind.Place)))
+            }
+
+            hir::HirExprKind.Copy {
+                id = this.check_expr(body, ex.*.lhs, UseKind.Place)
+
+                if this.resolve(id) != ty::TY_ERROR && !this.can_explicit_copy(id) {
+                    make d = diags::Diag.err(e::Err.TypeMismatch, ex.*.range !, "this type cannot be copied")
+                    make temp = "has type `" + this.ty_name(id) + "`, which is moved instead of copied"
+                    d.label(temp)
+                    d.help("define an attached function tagged `@copy` for `" + this.ty_name(id) + "` to make `!` copy it")
+                    this.diag.*.report(d)
+                }
+
+                this.out.uses[idx] = USE_COPY
+            }
+
+            hir::HirExprKind.Field {
+                // `error.SomeName` is lowered as a Field expr whose LHS is Path("error").
+                // Give it the dedicated ErrorVal type so it can unify with Fallible<T>.
+                make field_lhs = body.*.exprs[ex.*.lhs].pin
+                make ns_value = false
+
+                if field_lhs.*.kind != hir::HirExprKind.Path || field_lhs.*.name != "error" {
+                    make value_path = this.symbols.access_path(body, ex.*.lhs)
+                    this.resolved_ty = ty::TY_ERROR
+
+                    if value_path.len() > 0 {
+                        make nsi = this.symbols.find_namespace(value_path.copy())
+
+                        if nsi < this.namespaces.*.len() {
+                            for exported : this.namespaces.*[nsi].exports {
+                                if exported.name == ex.*.name { facts::require_unsafe(this.unsafe_depth, this.out.semantic_checks.pin, exported.is_unsafe, ex.*.range.copy()) }
+                            }
+                        }
+
+                        ns_value = this.namespace_value_type(value_path, ex.*.name !, idx)
+                    }
+                }
+
+                // field_lhs.*.
+
+                if ns_value {
+                    id = this.resolved_ty
+                } elif field_lhs.*.kind == hir::HirExprKind.Path && field_lhs.*.name == "error" {
+                    id = ty::TY_ERROR_VAL
+                    make tok = lexer::Token {}
+
+                    tok.kind = lexer::TokenKind.KeyError
+                    tok.lexeme = ex.*.name.copy()
+                    this.record_const(idx, tok.pin)
+                } else {
+                    // `ns::Type` used in an expression (e.g. the receiver of `ns::Type.create`):
+                    // resolve the member through the namespace when it exports a type.
+                    make lhs_path = this.symbols.access_path(body, ex.*.lhs)
+                    make nsi = this.symbols.find_namespace(lhs_path)
+                    make is_ns_type = false
+
+                    if nsi < this.namespaces.*.len() {
+                        if this.symbols.namespace_has_type(nsi, ex.*.name !) {
+                            id = this.intern_imported_type(nsi, ex.*.name !)
+                            is_ns_type = true
+                        }
+                    }
+
+                    if !is_ns_type {
+                        make base = this.resolve(this.check_expr(body, ex.*.lhs, UseKind.Place))
+                        make range = ex.*.range !
+
+                        if ex.*.has_member_span {
+                            range = util::Range.of(ex.*.member_span.start, ex.*.member_span.end)
+                        }
+
+                        if base == ty::TY_ERROR || this.require_deref(body, ex.*.lhs, base) {
+                            id = ty::TY_ERROR
+                        } else {
+                            id = this.check_field(base, ex.*.name !, range)
+                        }
+
+                        this.note_use(idx, id, how)
+                    }
+                }
+            }
+
+            hir::HirExprKind.Constructor { id = this.check_constructor(body, ex) }
+
+            hir::HirExprKind.Sizeof {
+                // the queried type is resolved for its diagnostics; the value itself is a `u32`
+                this.lower_type(body, ex.*.ty)
+                id = ty::TY_U32
+            }
+
+            hir::HirExprKind.Array { id = this.check_array(body, ex) }
+
+            hir::HirExprKind.EnumVariant { id = this.lookup_item(ex.*.name) }
+
+            hir::HirExprKind.Match { id = this.check_match(body, ex.*.lhs, ex.*.cases, true) }
+
+            hir::HirExprKind.Error {}
+
+            hir::HirExprKind.Unsupported {}
+            _ {}
+        }
+
+        if how != UseKind.Place { this.out.closure_uses.push(idx) }
+
+        this.out.expr_tys[idx] = id
+        return id
+    }
+
+    // may `value !` copy a value of this type? trivially copyable types and the built-in
+    // buffers (`str`, `String`, arrays, and optionals/fallibles/variants of copyable types) can; a
+    // user type can when it declares an attached function tagged `@copy`
+    @this
+    make can_explicit_copy (id: uint) -> bool {
+        make rid = this.resolve(id)
+
+        if this.tys.*.kind_of(rid) == ty::TyKind.Func { return true }
+
+        if this.tys.*.is_copy(rid) || this.tys.*.kind_of(rid) == ty::TyKind.Infer {
+            return true
+        }
+
+        if this.tys.*.kind_of(rid) == ty::TyKind.Str || this.tys.*.kind_of(rid) == ty::TyKind.StrBuf || this.tys.*.kind_of(rid) == ty::TyKind.Text {
+            return true
+        }
+
+        if this.tys.*.kind_of(rid) == ty::TyKind.Array || this.tys.*.kind_of(rid) == ty::TyKind.Optional || this.tys.*.kind_of(rid) == ty::TyKind.Fallible {
+            return this.can_explicit_copy(this.tys.*.elem_of(rid))
+        }
+
+        if this.tys.*.kind_of(rid) == ty::TyKind.Variant {
+            make args = this.tys.*.args_of(rid)
+            make i: uint = 0
+
+            while i < args.len() {
+                if !this.can_explicit_copy(args[i]) {
+                    return false
+                }
+
+                i = i + 1
+            }
+
+            return true
+        }
+
+        if this.tys.*.kind_of(rid) == ty::TyKind.Adt {
+            make def = this.tys.*.def_of(rid)
+
+            if def < this.module.*.items.len() && this.module.*.items[def].kind == hir::HirItemKind.Enum { return true }
+
+            return this.has_copy_fn(this.adt_name(rid))
+        }
+
+        return false
+    }
+
+    // does an attached function tagged `@copy` exist for the type named `type_name`?
+    @this
+    make has_copy_fn (type_name: str) -> bool {
+        make i: uint = 0
+
+        while i < this.module.*.attached_funcs.len() {
+            make m = this.module.*.attached_funcs[i].pin
+
+            if m.*.type_name == type_name && m.*.func < this.module.*.funcs.len() {
+                make f = this.module.*.funcs[m.*.func].pin
+                make ti: uint = 0
+
+                while ti < f.*.tags.len() {
+                    if f.*.tags[ti] == "copy" {
+                        return true
+                    }
+
+                    ti = ti + 1
+                }
+            }
+
+            i = i + 1
+        }
+
+        make si: uint = 0
+
+        while si < this.sigs.*.len() {
+            if this.sigs.*[si].is_copy_fn && this.sigs.*[si].type_name == type_name {
+                return true
+            }
+
+            si = si + 1
+        }
+
+        return false
+    }
+
+    /// records the use.
+    @this
+    make note_use (idx: uint, id: uint, how: UseKind) -> void {
+        if how == UseKind.Place {
+            this.out.uses[idx] = USE_PLACE
+            return
+        }
+
+        if this.tys.*.is_copy(this.resolve(id)) {
+            this.out.uses[idx] = USE_COPY
+            return
+        }
+
+        this.out.uses[idx] = USE_MOVE
+
+        return
+    }
+
+    /// selects the compiler type for a literal token.
+    @this
+    make lit_ty (tok: ref<lexer::Token>) -> uint {
+        match tok.*.kind {
+            lexer::TokenKind.LiteralNum {
+                if this.has_dot(tok.*.lexeme) {
+                    return ty::TY_FLOAT
+                }
+
+                return ty::TY_INT
+            }
+
+            lexer::TokenKind.LiteralString { return ty::TY_TEXT }
+
+            lexer::TokenKind.LiteralChar { return ty::TY_CHAR }
+
+            lexer::TokenKind.KeyTrue { return ty::TY_BOOL }
+
+            lexer::TokenKind.KeyFalse { return ty::TY_BOOL }
+
+            lexer::TokenKind.KeyNone { return this.fresh() }
+            _ { return ty::TY_ERROR }
+        }
+
+        return ty::TY_ERROR
+    }
+
+    // a `LiteralNum` lexeme is a float literal when it contains a decimal point (`15.0`)
+    // as opposed to a plain integer (`15`)
+    @this
+    make has_dot (lexeme: str) -> bool {
+        make i: uint = 0
+
+        while i < lexeme.len() {
+            if lexeme[i] == '.' {
+                return true
+            }
+
+            i = i + 1
+        }
+
+        return false
+    }
+
+    @this
+    make check_binary (body: ref<hir::HirBody>, ex: ref<hir::HirExpr>) -> uint {
+        make lt = this.check_expr(body, ex.*.lhs, UseKind.Place)
+        make rt = this.check_expr(body, ex.*.rhs, UseKind.Place)
+
+        // Both operands were visited so independent errors still surface, but
+        // a failed child must not create arithmetic/type errors in its parents.
+        if this.resolve(lt) == ty::TY_ERROR || this.resolve(rt) == ty::TY_ERROR {
+            return ty::TY_ERROR
+        }
+
+        make lhs = body.*.exprs[ex.*.lhs].pin
+        make rhs = body.*.exprs[ex.*.rhs].pin
+        make op = ex.*.lit.kind
+
+        // Operators borrow place operands for the duration of evaluation.
+        this.out.uses[ex.*.lhs] = USE_COPY
+        this.out.uses[ex.*.rhs] = USE_COPY
+
+        // pointer arithmetic: `ptr<T> +/- int` (and `ref<T> + int`) yields `ptr<T>`; the offset
+        // is scaled by the pointee size at codegen time
+        if op == lexer::TokenKind.Plus || op == lexer::TokenKind.Minus {
+            make lk = this.tys.*.kind_of(this.resolve(lt))
+            make rk = this.tys.*.kind_of(this.resolve(rt))
+
+            if this.is_pointer_kind(lk) && this.tys.*.is_int(this.resolve(rt)) {
+                return this.pointer_of(lt)
+            }
+
+            if op == lexer::TokenKind.Plus && this.tys.*.is_int(this.resolve(lt)) && this.is_pointer_kind(rk) {
+                return this.pointer_of(rt)
+            }
+        }
+
+        // string concatenation: `str + str`, `str + char` and `str + u8` (with the single
+        // character on either side) build a new dynamic `str`. This must be handled before the
+        // generic `unify`, which would otherwise reject `str + char` as a type mismatch.
+        if op == lexer::TokenKind.Plus {
+            make lr = this.resolve(lt)
+            make rr = this.resolve(rt)
+
+            if this.tys.*.is_str(lr) && (this.tys.*.is_str(rr) || this.tys.*.is_char(rr)) {
+                return lt
+            }
+
+            if this.tys.*.is_char(lr) && this.tys.*.is_str(rr) {
+                return rt
+            }
+
+            // the other operand may be an unresolved inference variable (e.g. the result of a
+            // cross-module `@impl` method call whose return type is not modelled); treat it as
+            // the string side of the concatenation
+            if this.tys.*.is_str(lr) && this.tys.*.kind_of(rr) == ty::TyKind.Infer {
+                return lt
+            }
+
+            if this.tys.*.kind_of(lr) == ty::TyKind.Infer && this.tys.*.is_str(rr) {
+                return rt
+            }
+        }
+
+        make joined = this.unify(lt, rt)
+
+        if joined == ty::TY_ERROR {
+            make d = diags::Diag.err(e::Err.TypeMismatch, rhs.*.range !, "mismatched types")
+            d.label("found `" + this.ty_name(rt) + "` here")
+            d.attach(diags::Label.create(lhs.*.range !, "expected `" + this.ty_name(lt) + "` because the other operand has this type"))
+            this.diag.*.report(d)
+        }
+
+        if op == lexer::TokenKind.Plus || op == lexer::TokenKind.Minus || op == lexer::TokenKind.Asterisk || op == lexer::TokenKind.Slash || op == lexer::TokenKind.Percent {
+            make resolved = this.resolve(joined)
+
+            if !this.tys.*.is_numeric(resolved) {
+                if resolved != ty::TY_ERROR {
+                    make d = diags::Diag.err(e::Err.TypeMismatch, ex.*.range !, "arithmetic needs a numeric Type")
+                    make temp = "has `" + this.ty_name(resolved) + "` Type, expected a numeric Type"
+                    d.label(temp)
+                    this.diag.*.report(d)
+                    return ty::TY_ERROR
+                }
+            }
+
+            return joined
+        }
+
+        if op == lexer::TokenKind.EqualEqual || op == lexer::TokenKind.NotEqual || op == lexer::TokenKind.Less || op == lexer::TokenKind.Greater || op == lexer::TokenKind.LessEqual || op == lexer::TokenKind.GreaterEqual {
+            return ty::TY_BOOL
+        }
+
+        if op == lexer::TokenKind.DoubleAmpersand || op == lexer::TokenKind.DoublePipe {
+            if this.unify(ty::TY_BOOL, joined) == ty::TY_ERROR {
+                make d = diags::Diag.err(e::Err.TypeMismatch, ex.*.range !, "mismatched types")
+                d.label("found `" + this.ty_name(joined) + "`, expected `bool`")
+                this.diag.*.report(d)
+            }
+
+            return ty::TY_BOOL
+        }
+
+        return joined
+    }
+
+    @this
+    make writable_place (body: ref<hir::HirBody>, index: uint) -> bool {
+        make expression = body.*.exprs[index].pin
+
+        if expression.*.kind == hir::HirExprKind.Local || expression.*.kind == hir::HirExprKind.Deref {
+            return true
+        }
+
+        if expression.*.kind == hir::HirExprKind.Field || expression.*.kind == hir::HirExprKind.Index {
+            make base = this.resolve(this.out.expr_tys[expression.*.lhs])
+
+            if this.tys.*.kind_of(base) == ty::TyKind.StrBuf || this.tys.*.kind_of(base) == ty::TyKind.Text {
+                return false
+            }
+
+            if this.is_pointer_kind(this.tys.*.kind_of(base)) {
+                return true
+            }
+
+            return this.writable_place(body, expression.*.lhs)
+        }
+
+        return false
+    }
+
+    @this
+    make check_update (body: ref<hir::HirBody>, expression: ref<hir::HirExpr>) -> uint {
+        make result = this.resolve(this.check_expr(body, expression.*.lhs, UseKind.Place))
+
+        if result == ty::TY_ERROR {
+            return result
+        }
+
+        if !this.writable_place(body, expression.*.lhs) {
+            make operand = body.*.exprs[expression.*.lhs].pin
+            make diagnostic = diags::Diag.err(e::Err.TypeMismatch, operand.*.range !, "increment/decrement requires a writable place")
+            this.diag.*.report(diagnostic)
+            return ty::TY_ERROR
+        }
+
+        if !this.tys.*.is_numeric(result) && this.tys.*.kind_of(result) != ty::TyKind.Ptr {
+            make diagnostic = diags::Diag.err(e::Err.TypeMismatch, expression.*.range !, "increment/decrement requires a number or raw pointer")
+            this.diag.*.report(diagnostic)
+            return ty::TY_ERROR
+        }
+
+        return result
+    }
+
+    @this
+    make check_compound (body: ref<hir::HirBody>, statement: ref<hir::HirStmt>, left: uint, right: uint) {
+        if this.resolve(left) == ty::TY_ERROR || this.resolve(right) == ty::TY_ERROR {
+            return
+        }
+
+        make lhs = this.resolve(left)
+        make rhs = this.resolve(right)
+        make operator = statement.*.op.kind
+        make valid = false
+
+        if operator == lexer::TokenKind.PlusEqual && this.tys.*.is_str(lhs) &&
+            (this.tys.*.is_str(rhs) || this.tys.*.is_char(rhs)) {
+            valid = true
+        } elif (operator == lexer::TokenKind.PlusEqual || operator == lexer::TokenKind.MinusEqual) &&
+            this.tys.*.kind_of(lhs) == ty::TyKind.Ptr && this.tys.*.is_int(rhs) {
+            valid = true
+        } elif operator == lexer::TokenKind.PlusEqual || operator == lexer::TokenKind.MinusEqual ||
+            operator == lexer::TokenKind.AsteriskEqual || operator == lexer::TokenKind.SlashEqual {
+            valid = this.tys.*.is_numeric(lhs) && this.tys.*.is_numeric(rhs)
+        } else {
+            valid = this.tys.*.is_int(lhs) && this.tys.*.is_int(rhs)
+        }
+
+        if !valid {
+            make range = util::Range.of(statement.*.op.span.start, statement.*.op.span.end)
+            make diagnostic = diags::Diag.err(e::Err.TypeMismatch, range, "invalid operands for compound assignment")
+            diagnostic.label("cannot apply `" + statement.*.op.lexeme + "` to `" + this.ty_name(lhs) + "` and `" + this.ty_name(rhs) + "`")
+            this.diag.*.report(diagnostic)
+        }
+    }
+
+    @this
+    make check_unary (body: ref<hir::HirBody>, ex: ref<hir::HirExpr>) -> uint {
+        make id = this.check_expr(body, ex.*.lhs, UseKind.Place)
+
+        if this.resolve(id) == ty::TY_ERROR {
+            return ty::TY_ERROR
+        }
+
+        this.out.uses[ex.*.lhs] = USE_COPY
+
+        if ex.*.lit.kind == lexer::TokenKind.Not {
+            make operand = body.*.exprs[ex.*.lhs].pin
+
+            if this.unify(ty::TY_BOOL, id) == ty::TY_ERROR {
+                make d = diags::Diag.err(e::Err.TypeMismatch, operand.*.range !, "mismatched types")
+                d.label("found `" + this.ty_name(id) + "`, expected `bool`")
+                this.diag.*.report(d)
+            }
+
+            return ty::TY_BOOL
+        }
+
+        if ex.*.lit.kind == lexer::TokenKind.Minus {
+            make resolved = this.resolve(id)
+
+            if !this.tys.*.is_numeric(resolved) {
+                if resolved != ty::TY_ERROR {
+                    make operand = body.*.exprs[ex.*.lhs].pin
+                    make d = diags::Diag.err(e::Err.TypeMismatch, operand.*.range !, "negation needs a numeric type")
+                    make temp = "has type `" + this.ty_name(resolved) + "`, expected a numeric type"
+                    d.label(temp)
+                    this.diag.*.report(d)
+                }
+
+                return ty::TY_ERROR
+            }
+        }
+
+        return id
+    }
+
+    @this
+    make check_array (body: ref<hir::HirBody>, ex: ref<hir::HirExpr>) -> uint {
+        // all elements must share one type; an empty literal leaves the element type to
+        // inference so it can unify with an explicit annotation such as `str[]`
+        make elem = this.fresh()
+
+        make i = 0
+
+        while i < ex.*.args.len() {
+            make ety = this.check_expr(body, ex.*.args[i], UseKind.Copy)
+            elem = this.unify(elem, ety)
+            i = i + 1
+        }
+
+        return this.tys.*.wrap(ty::TyKind.Array, this.resolve(elem))
+    }
+
+    @this
+    make check_index (body: ref<hir::HirBody>, ex: ref<hir::HirExpr>) -> uint {
+        make base = this.resolve(this.check_expr(body, ex.*.lhs, UseKind.Place))
+        make index = this.resolve(this.check_expr(body, ex.*.rhs, UseKind.Copy))
+
+        if !this.tys.*.is_int(index) {
+            if index != ty::TY_ERROR {
+                make index_ex = body.*.exprs[ex.*.rhs].pin
+                make d = diags::Diag.err(e::Err.TypeMismatch, index_ex.*.range !, "index must be an integer")
+                make temp = "has type `" + this.ty_name(index) + "`, expected an integer"
+                d.label(temp)
+                this.diag.*.report(d)
+            }
+        }
+
+        // a `ref<T>` base (e.g. `this`) is indexed through the reference: `this[i]` == `this.*[i]`
+        make bk = this.tys.*.kind_of(base)
+
+        if bk == ty::TyKind.Ref {
+            base = this.resolve(this.tys.*.elem_of(base))
+            bk = this.tys.*.kind_of(base)
+        }
+
+        // `String` is immutable: indexing reads a `char`, writes are rejected by `Assign`
+        if bk == ty::TyKind.Text || bk == ty::TyKind.Str || bk == ty::TyKind.StrBuf {
+            return ty::TY_CHAR
+        }
+
+        if bk == ty::TyKind.Array {
+            return this.tys.*.elem_of(base)
+        }
+
+        // indexing a raw pointer is C-style pointer arithmetic up to the elem type
+        if bk == ty::TyKind.Ptr {
+            return this.tys.*.elem_of(base)
+        }
+
+        if bk != ty::TyKind.Error && bk != ty::TyKind.Infer {
+            make base_ex = body.*.exprs[ex.*.lhs].pin
+            make d = diags::Diag.err(e::Err.TypeMismatch, base_ex.*.range !, "cannot index this type")
+            make temp = "has type `" + this.ty_name(base) + "`, which cannot be indexed"
+            d.label(temp)
+            this.diag.*.report(d)
+        }
+
+        return ty::TY_ERROR
+    }
+
+    @this
+    make check_deref (body: ref<hir::HirBody>, ex: ref<hir::HirExpr>) -> uint {
+        make base = this.resolve(this.check_expr(body, ex.*.lhs, UseKind.Place))
+        make bk = this.tys.*.kind_of(base)
+
+        if bk == ty::TyKind.Ptr || bk == ty::TyKind.Owned || bk == ty::TyKind.Ref {
+            return this.tys.*.elem_of(base)
+        }
+
+        if bk != ty::TyKind.Error && bk != ty::TyKind.Infer {
+            make base_ex = body.*.exprs[ex.*.lhs].pin
+            make d = diags::Diag.err(e::Err.TypeMismatch, base_ex.*.range !, "cannot dereference this type")
+            d.label("has type `" + this.ty_name(base) + "`, expected `pin<T>`, `owned<T>` or `ref<T>`")
+            this.diag.*.report(d)
+        }
+
+        return ty::TY_ERROR
+    }
+
+    @this
+    make check_call (body: ref<hir::HirBody>, idx: uint, ex: ref<hir::HirExpr>, used: bool) -> uint {
+        make id = this.check_call_raw(body, idx, ex)
+        this.out.call_tys[idx] = id
+
+        if ex.*.has_catch {
+            if ex.*.has_catch_bind { this.out.local_tys[ex.*.catch_bind] = ty::TY_ERROR_VAL }
+
+            this.check_block(body, ex.*.catch_block)
+
+            if this.resolve(id) != ty::TY_ERROR && this.tys.*.kind_of(this.resolve(id)) != ty::TyKind.Fallible {
+                make d = diags::Diag.err(e::Err.TypeMismatch, ex.*.range !, "catch requires a fallible call")
+                this.diag.*.report(d)
+            }
+        }
+
+        // `expr catch { ... }` handles the error arm itself, so the expression's value is the
+        // success payload of a fallible call rather than the fallible value itself.
+        if ex.*.has_catch {
+            make rid = this.resolve(id)
+
+            if this.tys.*.kind_of(rid) == ty::TyKind.Fallible {
+                make payload = this.tys.*.elem_of(rid)
+
+                facts::record_catch(this.out.semantic_checks.pin, body, ex, used && this.tys.*.kind_of(payload) != ty::TyKind.Void)
+
+                return payload
+            }
+        }
+
+        return id
+    }
+
+    // Materialize field types while the inference context is available. Memory
+    // checking owns recursive ownership policy and consumes this portable graph.
+    @this
+    make collect_closure_shape (id: uint, depth: uint) {
+        if depth > 32 { return }
+
+        make resolved = this.resolve(id)
+
+        for shape : this.out.closure_shapes {
+            if shape.ty == resolved { return }
+        }
+
+        this.out.closure_shapes.push(facts::ClosureShape { ty = resolved })
+        make slot = this.out.closure_shapes.len() - 1
+        make children: uint[] = []
+        make kind = this.tys.*.kind_of(resolved)
+
+        if kind == ty::TyKind.Array || kind == ty::TyKind.Optional || kind == ty::TyKind.Fallible || kind == ty::TyKind.Owned {
+            children.push(this.tys.*.elem_of(resolved))
+        } elif kind == ty::TyKind.Variant {
+            for member : this.tys.*.args_of(resolved) { children.push(member) }
+        } elif kind == ty::TyKind.Adt {
+            make name = this.adt_name(resolved)
+            make index = this.symbols.find_struct(name.copy())
+
+            if index < this.module.*.structs.len() {
+                make structure = this.module.*.structs[index].pin
+
+                for field : structure.*.fields {
+                    if field.has_ty { children.push(this.resolve(this.lower_type(structure.*.body.pin, field.ty))) }
+                    else { this.out.closure_shapes[slot].complete = false }
+                }
+            } else {
+                make index = this.symbols.find_struct_sig(name)
+
+                if index < this.structs.*.len() {
+                    for field : this.structs.*[index].fields { children.push(this.resolve(this.sig_type_of(field.ty.pin))) }
+                }
+            }
+        }
+
+        for child : children.iter() { this.out.closure_shapes[slot].children.push(child) }
+
+        for child : children { this.collect_closure_shape(child, depth + 1) }
+    }
+
+    /// processes a function for the type.
+    @this
+    make function_type (index: uint) -> uint {
+        make f = this.module.*.funcs[index].pin
+        make function = ty::Ty {}
+
+        function.kind = ty::TyKind.Func
+        function.is_unsafe = facts::unsafe_function(f)
+        function.elem = ty::TY_VOID
+
+        if f.*.has_ret_ty { function.elem = this.lower_type(f.*.body.pin, f.*.ret_ty) }
+
+        make i: uint = 0
+
+        while i < f.*.body.param_count {
+            make local = f.*.body.locals[i].pin
+
+            if !local.*.has_ty { return ty::TY_ERROR }
+
+            function.args.push(this.lower_type(f.*.body.pin, local.*.ty))
+            i = i + 1
+        }
+
+        return this.tys.*.intern(function)
+    }
+
+    @this
+    make check_indirect_call (body: ref<hir::HirBody>, idx: uint, ex: ref<hir::HirExpr>) -> uint {
+        make function = this.resolve(this.check_expr(body, ex.*.lhs, UseKind.Place))
+
+        if function == ty::TY_ERROR {
+            return ty::TY_ERROR
+        }
+
+        if this.tys.*.kind_of(function) != ty::TyKind.Func {
+            make d = diags::Diag.err(e::Err.TypeMismatch, ex.*.range !, "expression is not callable")
+            this.diag.*.report(d)
+            return ty::TY_ERROR
+        }
+
+        facts::require_unsafe(this.unsafe_depth, this.out.semantic_checks.pin, this.tys.*.tys[function].is_unsafe, ex.*.range.copy())
+        make parameters = this.tys.*.args_of(function)
+
+        if ex.*.args.len() != parameters.len() {
+            make d = diags::Diag.err(e::Err.TypeMismatch, ex.*.range !, "wrong number of lambda arguments")
+            d.label("expected " + parameters.len().to_str() + " argument(s)")
+            this.diag.*.report(d)
+        }
+
+        make start = this.out.abi_arg_types.len()
+        make i: uint = 0
+
+        while i < ex.*.args.len() {
+            make actual = this.check_expr(body, ex.*.args[i], UseKind.Copy)
+            make expected = actual
+
+            if i < parameters.len() {
+                expected = parameters[i]
+                this.check_anonymous_fields(body, ex.*.args[i], expected)
+
+                if this.unify(expected, actual) == ty::TY_ERROR {
+                    make argument = body.*.exprs[ex.*.args[i]].pin
+                    make d = diags::Diag.err(e::Err.TypeMismatch, argument.*.range !, "mismatched lambda argument type")
+                    d.label("expected `" + this.ty_name(expected) + "`, found `" + this.ty_name(actual) + "`")
+                    this.diag.*.report(d)
+                }
+            }
+
+            this.out.abi_arg_types.push(expected)
+            this.out.abi_arg_aggs.push(this.type_is_aggregate(expected))
+            i = i + 1
+        }
+
+        make result = this.tys.*.elem_of(function)
+        this.out.abi_exprs.push(idx)
+        this.out.abi_arg_starts.push(start)
+        this.out.abi_arg_counts.push(ex.*.args.len())
+        this.out.abi_ret_aggs.push(this.type_is_aggregate(result))
+        return result
+    }
+
+    @this
+    make check_call_raw (body: ref<hir::HirBody>, idx: uint, ex: ref<hir::HirExpr>) -> uint {
+        make cal = body.*.exprs[ex.*.lhs].pin
+
+        // `recv.name(args)` is an attached-function call: resolve it against `HirModule.attached_funcs`
+        if cal.*.kind == hir::HirExprKind.Field {
+            // `alias::name(args)` / `a::b::name(args)` where the prefix names an imported unit or a
+            // unit it re-exports is a namespace call
+            make dotted = this.symbols.access_path(body, cal.*.lhs)
+            make nsi = this.symbols.find_namespace(dotted)
+
+            if nsi < this.namespaces.*.len() {
+                return this.check_namespace_call(body, idx, ex, cal, nsi)
+            }
+
+            make owner = body.*.exprs[cal.*.lhs].pin
+
+            if owner.*.kind == hir::HirExprKind.Path && ty::TyInterner.prim(owner.*.name !) != ty::TY_ERROR {
+                // Primitive type names are valid owners of static attached
+                // functions, but are not runtime values to type-check.
+                make local = this.symbols.find_attached_func(owner.*.name.copy(), cal.*.name.copy())
+
+                if local < this.module.*.attached_funcs.len() {
+                    make function = this.module.*.attached_funcs[local].func
+
+                    if !this.module.*.funcs[function].has_this { return this.resolve_local_attached(body, idx, ex, local) }
+                } else {
+                    make imported = this.symbols.find_attached_sig(owner.*.name.copy(), cal.*.name.copy())
+
+                    if imported < this.sigs.*.len() && !this.sigs.*[imported].has_this { return this.resolve_sig_attached(body, idx, ex, imported) }
+                }
+
+                make d = diags::Diag.err(e::Err.UnknownAttachedFunc, cal.*.range !, "unknown static attached function")
+                d.label("no static function named `" + cal.*.name + "` for `" + owner.*.name + "`")
+                d.help("import its module, or call an instance method on a value")
+                this.diag.*.report(d)
+                return ty::TY_ERROR
+            }
+
+            make receiver = this.resolve(this.check_expr(body, cal.*.lhs, UseKind.Place))
+
+            if receiver == ty::TY_ERROR || this.require_deref(body, cal.*.lhs, receiver) {
+                return ty::TY_ERROR
+            }
+
+            make base = receiver
+
+            while this.is_pointer_kind(this.tys.*.kind_of(base)) { base = this.resolve(this.tys.*.elem_of(base)) }
+
+            if this.tys.*.kind_of(base) == ty::TyKind.Adt {
+                make name = this.adt_name(base)
+                make si = this.symbols.find_struct(name.copy())
+
+                if si < this.module.*.structs.len() {
+                    for field : this.module.*.structs[si].fields {
+                        if field.name == cal.*.name { return this.check_indirect_call(body, idx, ex) }
+                    }
+                } else {
+                    make imported = this.symbols.find_struct_sig(name)
+
+                    if imported < this.structs.*.len() {
+                        for field : this.structs.*[imported].fields {
+                            if field.name == cal.*.name { return this.check_indirect_call(body, idx, ex) }
+                        }
+                    }
+                }
+            }
+
+            return this.check_attached_call(body, idx, ex, cal, receiver)
+        }
+
+        if cal.*.kind != hir::HirExprKind.Path {
+            return this.check_indirect_call(body, idx, ex)
+        }
+
+        make found = this.symbols.find_func(cal.*.name)
+
+        // `__syscall` is a compiler builtin: it forwards to the platform's `syscall` entry point
+        // and may only be reached from an `@unsafe` block. Its arguments are variadic and its
+        // result is an `int`.
+        if cal.*.name == "__syscall" {
+            facts::require_syscall_unsafe(this.unsafe_depth, this.out.semantic_checks.pin, cal.*.range.copy())
+
+            make ai: uint = 0
+
+            while ai < ex.*.args.len() {
+                this.check_expr(body, ex.*.args[ai], UseKind.Copy)
+                ai = ai + 1
+            }
+
+            this.out.uses[idx] = USE_COPY
+            return ty::TY_INT
+        }
+
+        if found >= this.module.*.funcs.len() {
+            make d = diags::Diag.err(e::Err.TypeMismatch, cal.*.range !, "unknown function `" + cal.*.name + "`")
+            d.label("no function named `" + cal.*.name + "` is declared in this module")
+            d.help("check the spelling, or import the defining module and call the function through its namespace")
+            this.diag.*.report(d)
+            return ty::TY_ERROR
+        }
+
+        make f = this.module.*.funcs[found].pin
+        facts::require_unsafe_local(this.unsafe_depth, this.out.semantic_checks.pin, f, cal.*.range.copy())
+        make params = f.*.body.param_count
+
+        if f.*.is_external { this.out.c_exprs.push(idx) }
+
+        if f.*.is_external && f.*.is_variadic {
+            this.out.variadic_exprs.push(idx)
+            this.out.variadic_counts.push(params)
+        }
+
+        if ex.*.args.len() < params || (!f.*.is_variadic && ex.*.args.len() != params) {
+            make d = diags::Diag.err(e::Err.TypeMismatch, ex.*.range !, "wrong number of arguments")
+            make temp = "found " + ex.*.args.len().to_str() + " arguments, expected " + params.to_str()
+            d.label(temp)
+            d.attach(diags::Label.create(util::Range.of(f.*.name_span.start, f.*.name_span.end), "function `" + f.*.name + "` is declared here"))
+            d.help("match the call's arguments to this function's declared parameters")
+            this.diag.*.report(d)
+        }
+
+        make callee = f.*.body.pin
+        make i: uint = 0
+
+        while i < ex.*.args.len() {
+            if i < params {
+                make arg_ty = this.check_expr(body, ex.*.args[i], UseKind.Copy)
+                make param = callee.*.locals[i].pin
+
+                if param.*.has_ty {
+                    make expect = this.lower_type(callee, param.*.ty)
+                    this.check_anonymous_fields(body, ex.*.args[i], expect)
+
+                    if this.unify(expect, arg_ty) == ty::TY_ERROR {
+                        make arg = body.*.exprs[ex.*.args[i]].pin
+                        make d = diags::Diag.err(e::Err.TypeMismatch, arg.*.range !, "mismatched types")
+                        d.label("found `" + this.ty_name(arg_ty) + "` here")
+                        d.attach(diags::Label.create(param.*.range !, "expected `" + this.ty_name(expect) + "` because the parameter's type is declared here"))
+                        this.diag.*.report(d)
+                    }
+                }
+            } else {
+                this.check_expr(body, ex.*.args[i], UseKind.Copy)
+            }
+
+            i = i + 1
+        }
+
+        if f.*.has_ret_ty {
+            return this.lower_type(callee, f.*.ret_ty)
+        }
+
+        return ty::TY_VOID
+    }
+
+    /// records the constant.
+    @this
+    make record_const (idx: uint, lit: ref<lexer::Token>) {
+        this.out.const_exprs.push(idx)
+        make cp = lexer::Token {}
+
+        cp.kind = lit.*.kind
+        cp.lexeme = lit.*.lexeme.copy()
+        cp.span = lit.*.span
+        this.out.const_lits.push(cp)
+    }
+
+    // resolve `ns::Enum.Variant` and `ns::CONST` against the flattened namespace exports:
+    // records the integer discriminant / literal value for expression `idx` and sets
+    // `resolved_ty` to the expression's type. returns false when the path is not such a value.
+    @this
+    make namespace_value_type (path: str, member: str, idx: uint) -> bool {
+        make value = this.symbols.namespace_value(path, member.copy())
+
+        if !value.found { return false }
+
+        make ns = this.namespaces.*[value.namespace].pin
+        make exported = ns.*.exports[value.export].pin
+
+        if value.kind == 0 {
+            make tok = lexer::Token {}
+            tok.kind = lexer::TokenKind.LiteralNum
+            tok.lexeme = value.variant.to_str()
+            this.record_const(idx, tok.pin)
+            this.resolved_ty = this.intern_imported_type(value.namespace, exported.*.name.copy())
+        } elif value.kind == 1 {
+            make signature = this.funcs.*[value.signature].pin
+            make function = ty::Ty {}
+            function.kind = ty::TyKind.Func
+            function.is_unsafe = signature.*.is_unsafe
+            function.elem = ty::TY_VOID
+
+            if signature.*.has_ret { function.elem = this.sig_type_of(signature.*.ret_ty.pin) }
+
+            for parameter : signature.*.param_tys { function.args.push(this.sig_type_of(parameter.pin)) }
+
+            this.resolved_ty = this.tys.*.intern(function)
+            make symbol = this.symbols.function_symbol(value.namespace, member.copy(), exported.*.is_external)
+            this.out.call_exprs.push(idx)
+            this.out.call_names.push(symbol)
+        } elif value.kind == 2 {
+            make tok = lexer::Token {}
+            tok.kind = lexer::TokenKind.Identifier
+            tok.lexeme = this.symbols.global_symbol(value.namespace, member.copy())
+            this.record_const(idx, tok.pin)
+            make sig = hir::HirTypeSig {}
+            sig.name = exported.*.global_type.copy()
+            this.resolved_ty = this.sig_type_of(sig.pin)
+        } else {
+            this.record_const(idx, exported.*.lit.pin)
+            this.resolved_ty = this.lit_ty(exported.*.lit.pin)
+        }
+
+        return true
+    }
+
+    // a type named through an imported namespace (e.g. `block::Block`): register a synthetic
+    // item for it so it keeps its source name, instead of degrading to a bare inference
+    // variable. this lets attached functions on the type resolve by name across units.
+    @this
+    make intern_imported_type (nsi: uint, name: str) -> uint {
+        make ns = this.namespaces.*[nsi].pin
+        make exported = this.symbols.find_export(nsi, name.copy())
+
+        if exported >= ns.*.exports.len() { return this.fresh() }
+
+        if ns.*.exports[exported].alias_primitive != ty::TY_ERROR { return ns.*.exports[exported].alias_primitive }
+
+        make is_enum = ns.*.exports[exported].is_enum
+
+        make item = hir::HirItem {}
+
+        item.kind = hir::HirItemKind.Type
+
+        if is_enum { item.kind = hir::HirItemKind.Enum }
+
+        item.name = name.copy()
+        make si = this.symbols.find_struct_sig(name)
+
+        if si < this.structs.*.len() { item.display_name = this.structs.*[si].display_name.copy() }
+
+        make idx = this.module.*.items.len()
+        this.module.*.items.push(item)
+        return this.tys.*.adt(idx)
+    }
+
+    // `alias::name(args)`: resolve the member against the imported unit's public exports and
+    // record the symbol the call must target (module-mangled, or plain for `@external` symbols)
+    @this
+    make check_namespace_call (body: ref<hir::HirBody>, idx: uint, ex: ref<hir::HirExpr>, cal: ref<hir::HirExpr>, nsi: uint) -> uint {
+        make namespaces = this.namespaces
+        make ns = namespaces.*[nsi].pin
+        make member = cal.*.name !
+
+        make exported = this.symbols.find_export(nsi, member.copy())
+
+        if exported >= ns.*.exports.len() {
+            for arg : ex.*.args { this.check_expr(body, arg, UseKind.Copy) }
+
+            make d = diags::Diag.err(e::Err.UnknownSymbol, cal.*.range.copy(), "unknown or private function `" + member + "`")
+            d.label("this module does not export `" + member + "`")
+            this.diag.*.report(d)
+            return ty::TY_ERROR
+        }
+
+        make fsi = this.symbols.find_func_sig(ns.*.module_name, member.copy())
+        make has_sig = fsi < this.funcs.*.len()
+
+        if has_sig {
+            make fs = this.funcs.*[fsi].pin
+            facts::require_unsafe_origin(this.unsafe_depth, this.out.semantic_checks.pin, fs.*.is_unsafe, cal.*.range.copy(), fs.*.path.copy(), fs.*.source, fs.*.name_span.copy())
+
+            if ex.*.args.len() < fs.*.param_tys.len() || (!fs.*.is_variadic && ex.*.args.len() != fs.*.param_tys.len()) {
+                make d = diags::Diag.err(e::Err.TypeMismatch, ex.*.range !, "wrong number of arguments")
+                make temp = "found " + ex.*.args.len().to_str() + " arguments, expected " + fs.*.param_tys.len().to_str()
+                d.label(temp)
+                context::attach_origin(d.*.pin, fs.*.path.copy(), fs.*.source, fs.*.name_span.copy(), "function `" + member + "` declared here")
+                d.help("match this function's parameter count at the call site")
+                this.diag.*.report(d)
+            }
+        }
+
+        make arg_types: uint[] = []
+        make arg_aggs: bool[] = []
+        make ai: uint = 0
+
+        while ai < ex.*.args.len() {
+            make arg_ty = this.check_expr(body, ex.*.args[ai], UseKind.Copy)
+
+            if has_sig {
+                make fs = this.funcs.*[fsi].pin
+
+                if ai < fs.*.param_tys.len() {
+                    make expect = this.sig_type_of(fs.*.param_tys[ai].pin)
+                    this.check_anonymous_fields(body, ex.*.args[ai], expect)
+
+                    if this.unify(expect, arg_ty) == ty::TY_ERROR {
+                        make arg = body.*.exprs[ex.*.args[ai]].pin
+                        make d = diags::Diag.err(e::Err.TypeMismatch, arg.*.range !, "mismatched types")
+                        d.label("found `" + this.ty_name(arg_ty) + "` here")
+                        context::attach_origin(d.*.pin, fs.*.path.copy(), fs.*.source, fs.*.param_tys[ai].span.copy(), "argument " + (ai + 1).to_str() + " must have type `" + this.ty_name(expect) + "` as declared here")
+                        context::attach_origin(d.*.pin, fs.*.path.copy(), fs.*.source, fs.*.name_span.copy(), "function declared here")
+                        d.help("pass a value of the declared parameter type, or change the parameter's declaration")
+                        this.diag.*.report(d)
+                    }
+                }
+            }
+
+            make is_aggregate = this.type_is_aggregate(arg_ty)
+
+            if has_sig {
+                make fs = this.funcs.*[fsi].pin
+
+                if ai < fs.*.param_aggs.len() {
+                    is_aggregate = fs.*.param_aggs[ai]
+                }
+            }
+
+            make abi_ty = arg_ty
+
+            if has_sig {
+                make fs = this.funcs.*[fsi].pin
+
+                if ai < fs.*.param_tys.len() { abi_ty = this.sig_type_of(fs.*.param_tys[ai].pin) }
+            }
+
+            arg_types.push(abi_ty)
+            arg_aggs.push(is_aggregate)
+            ai = ai + 1
+        }
+
+        make arg_start = this.out.abi_arg_aggs.len()
+        make abi_i: uint = 0
+
+        while abi_i < arg_types.len() {
+            this.out.abi_arg_types.push(arg_types[abi_i])
+            this.out.abi_arg_aggs.push(arg_aggs[abi_i])
+            abi_i = abi_i + 1
+        }
+
+        this.out.uses[idx] = USE_COPY
+
+        make known = exported < ns.*.exports.len()
+        make is_external = false
+
+        if known { is_external = ns.*.exports[exported].is_external }
+
+        make sym: str = ""
+
+        if known && is_external {
+            this.out.c_exprs.push(idx)
+
+            if has_sig {
+                make fs = this.funcs.*[fsi].pin
+
+                if fs.*.is_variadic {
+                    this.out.variadic_exprs.push(idx)
+                    this.out.variadic_counts.push(fs.*.param_tys.len())
+                }
+            }
+
+            // `@pub @external` symbols are plain C names, not module-mangled
+            sym = member !
+        } else {
+            sym = this.symbols.function_symbol(nsi, member.copy(), false)
+        }
+
+        this.out.call_exprs.push(idx)
+        this.out.call_names.push(sym !)
+        this.out.ns_calls[idx] = 1
+
+        if has_sig {
+            make fs = this.funcs.*[fsi].pin
+
+            this.out.abi_exprs.push(idx)
+            this.out.abi_arg_starts.push(arg_start)
+            this.out.abi_arg_counts.push(ex.*.args.len())
+            this.out.abi_ret_aggs.push(fs.*.ret_agg)
+
+            if fs.*.has_ret {
+                return this.sig_type_of(fs.*.ret_ty.pin)
+            }
+
+            return ty::TY_VOID
+        }
+
+        return this.fresh()
+    }
+
+    // References need an explicit dereference before member access. `this` is
+    // the implicit method receiver and remains usable directly inside methods.
+    @this
+    make require_deref (body: ref<hir::HirBody>, expr: uint, receiver: uint) -> bool {
+        if this.tys.*.kind_of(this.resolve(receiver)) != ty::TyKind.Ref || expr >= body.*.exprs.len() { return false }
+
+        make value = body.*.exprs[expr].pin
+
+        if value.*.kind == hir::HirExprKind.Local && value.*.local < body.*.locals.len() && body.*.locals[value.*.local].name == "this" { return false }
+
+        make d = diags::Diag.err(e::Err.TypeMismatch, value.*.range.copy(), "reference requires an explicit dereference before member access")
+        d.help("use `.*` to access the referenced value")
+        this.diag.*.report(d)
+        return true
+    }
+
+    // `recv.name(args)`: find the attached function for the receiver's type, record its mangled
+    // symbol for MIR, and check the written arguments against the parameters after `this`
+    @this
+    make check_attached_call (body: ref<hir::HirBody>, idx: uint, ex: ref<hir::HirExpr>, cal: ref<hir::HirExpr>, recv_ty: uint) -> uint {
+
+        // `.unwrap()` is built into Quip for Optional and Fallible types: it extracts the inner payload.
+        // the call is recorded under a reserved `__quip_builtin.*` symbol: unwrapping a `none` optional
+        // panics at runtime (the emitter expands it inline, see `gen_unwrap`)
+        if cal.*.name == "unwrap" {
+            make rk = this.tys.*.kind_of(recv_ty)
+
+            if rk == ty::TyKind.Optional || rk == ty::TyKind.Fallible {
+                if ex.*.args.len() != 0 {
+                    make d = diags::Diag.err(e::Err.TypeMismatch, ex.*.range !, "wrong number of arguments")
+                    d.label("`unwrap` takes no arguments, found " + ex.*.args.len().to_str())
+                    this.diag.*.report(d)
+                }
+
+                this.out.call_exprs.push(idx)
+
+                if rk == ty::TyKind.Optional {
+                    this.out.call_names.push("__quip_builtin.opt.unwrap")
+                } else {
+                    this.out.call_names.push("__quip_builtin.fal.unwrap")
+                }
+
+                make inner = this.tys.*.elem_of(recv_ty)
+
+                if inner != 0 {
+                    return inner
+                }
+
+                return this.fresh()
+            }
+        }
+
+        // built-in attached functions of `str` and dynamic arrays
+        make builtin = this.check_builtin_call(body, idx, ex, cal, recv_ty)
+
+        if builtin != ty::TY_AUTO {
+            return builtin
+        }
+
+        make recv_name = this.type_name_of(recv_ty)
+        make method = cal.*.name !
+
+        // 1. attached function declared in this module: check its full signature locally
+        make found = this.symbols.find_attached_func(recv_name.copy(), method.copy())
+
+        if found < this.module.*.attached_funcs.len() {
+            return this.resolve_local_attached(body, idx, ex, found)
+        }
+
+        if this.tys.*.kind_of(recv_ty) == ty::TyKind.Ptr {
+            make pointee_name = this.type_name_of(this.tys.*.elem_of(recv_ty))
+            found = this.symbols.find_attached_func(pointee_name, method.copy())
+
+            if found < this.module.*.attached_funcs.len() {
+                return this.resolve_local_attached(body, idx, ex, found)
+            }
+        }
+
+        // 2. attached function declared in a dependency: resolve it by (receiver type, name) from
+        //    the accumulated registry, check arity, target the type-mangled symbol and use the
+        //    portable return type
+        make sfound = this.symbols.find_attached_sig(recv_name.copy(), method.copy())
+
+        if sfound < this.sigs.*.len() {
+            return this.resolve_sig_attached(body, idx, ex, sfound)
+        }
+
+        if this.tys.*.kind_of(recv_ty) == ty::TyKind.Ptr {
+            make pointee_name = this.type_name_of(this.tys.*.elem_of(recv_ty))
+            sfound = this.symbols.find_attached_sig(pointee_name, method.copy())
+
+            if sfound < this.sigs.*.len() {
+                return this.resolve_sig_attached(body, idx, ex, sfound)
+            }
+        }
+
+        // 3. the receiver's type could not be resolved (e.g. an unknown field access): accept the
+        //    call only when exactly one attached function with that name is declared anywhere
+        if recv_name.len() == 0 {
+            make ufound = this.symbols.find_unique_sig(method.copy())
+
+            if ufound < this.sigs.*.len() {
+                return this.resolve_sig_attached(body, idx, ex, ufound)
+            }
+        }
+
+        make range = cal.*.range !
+
+        if cal.*.has_member_span {
+            range = util::Range.of(cal.*.member_span.start, cal.*.member_span.end)
+        }
+
+        make d = diags::Diag.err(e::Err.UnknownAttachedFunc, range, "unknown attached function")
+        d.label("no attached function named `" + method + "` for `" + recv_name + "` Type")
+        context::attach_field_context(this.structs, d.*.pin, recv_name.copy(), method.copy())
+        d.help("check the method name and receiver type, and import the module that defines the method")
+        this.diag.*.report(d)
+        return ty::TY_ERROR
+    }
+
+    // `str.len()`, `str.push(char | str)`, `T[].len()`, `T[].push(T)`, `T[].pop()`. the call is
+    // recorded under a reserved `__quip_builtin.*` symbol which the LLVM emitter expands inline.
+    // returns `TY_AUTO` when the call is not a built-in.
+    @this
+    make check_builtin_call (body: ref<hir::HirBody>, idx: uint, ex: ref<hir::HirExpr>, cal: ref<hir::HirExpr>, recv: uint) -> uint {
+        // a `ref<str>` / `ptr<T[]>` receiver is auto-dereferenced
+        make recv_ty = recv
+
+        if this.tys.*.kind_of(recv_ty) == ty::TyKind.Ref || this.tys.*.kind_of(recv_ty) == ty::TyKind.Ptr {
+            recv_ty = this.resolve(this.tys.*.elem_of(recv_ty))
+        }
+
+        make method = cal.*.name !
+        make is_str = this.tys.*.kind_of(recv_ty) == ty::TyKind.Str || this.tys.*.kind_of(recv_ty) == ty::TyKind.Text
+        make is_arr = this.tys.*.kind_of(recv_ty) == ty::TyKind.Array
+
+        if !is_str && !is_arr {
+            return ty::TY_AUTO
+        }
+
+        if is_arr && method == "copy" {
+            make owner = this.type_name_of(recv_ty)
+
+            if this.symbols.find_attached_func(owner.copy(), method.copy()) < this.module.*.attached_funcs.len() || this.symbols.find_attached_sig(owner, method.copy()) < this.sigs.*.len() { return ty::TY_AUTO }
+
+            make elem = this.resolve(this.tys.*.elem_of(recv_ty))
+            make kind = this.tys.*.kind_of(elem)
+
+            if kind != ty::TyKind.Bool && kind != ty::TyKind.Char && kind != ty::TyKind.Int && kind != ty::TyKind.Uint
+                && kind != ty::TyKind.I8 && kind != ty::TyKind.I16 && kind != ty::TyKind.I32 && kind != ty::TyKind.I64
+                && kind != ty::TyKind.U8 && kind != ty::TyKind.U16 && kind != ty::TyKind.U32 && kind != ty::TyKind.U64
+                && kind != ty::TyKind.F32 && kind != ty::TyKind.F64 && kind != ty::TyKind.Float { return ty::TY_AUTO }
+
+            if ex.*.args.len() != 0 {
+                make d = diags::Diag.err(e::Err.TypeMismatch, ex.*.range.copy(), "wrong number of arguments")
+                d.label("`copy` takes no arguments")
+                this.diag.*.report(d)
+            }
+
+            this.out.call_exprs.push(idx)
+            this.out.call_names.push("__quip_builtin.arr.copy")
+            return recv_ty
+        }
+
+        make sym: str = ""
+        make ret = ty::TY_VOID
+        make want_args: uint = 0
+
+        if method == "len" {
+            sym = "len"
+            ret = ty::TY_UINT
+        } elif method == "push" {
+            want_args = 1
+
+            if is_str {
+                sym = "str.push_char"
+
+                if ex.*.args.len() == 1 {
+                    make at = this.resolve(this.check_expr(body, ex.*.args[0], UseKind.Copy))
+                    make ak = this.tys.*.kind_of(at)
+
+                    if ak == ty::TyKind.Str || ak == ty::TyKind.Text || ak == ty::TyKind.StrBuf {
+                        sym = "str.push_str"
+                    } elif ak != ty::TyKind.Char {
+                        make d = diags::Diag.err(e::Err.TypeMismatch, ex.*.range !, "mismatched types")
+                        d.label("`str.push` takes a `char` or `str`, found `" + this.ty_name(at) + "`")
+                        this.diag.*.report(d)
+                    }
+                }
+            } else {
+                sym = "arr.push"
+
+                if ex.*.args.len() == 1 {
+                    make elem = this.tys.*.elem_of(recv_ty)
+                    make at = this.check_expr(body, ex.*.args[0], UseKind.Move)
+
+                    if this.unify(elem, at) == ty::TY_ERROR {
+                        make d = diags::Diag.err(e::Err.TypeMismatch, ex.*.range !, "mismatched types")
+                        d.label("expected `" + this.ty_name(elem) + "`, found `" + this.ty_name(at) + "`")
+                        this.diag.*.report(d)
+                    }
+                }
+            }
+        } elif method == "pop" && is_arr {
+            sym = "arr.pop"
+            ret = this.tys.*.elem_of(recv_ty)
+        } else {
+            return ty::TY_AUTO
+        }
+
+        if ex.*.args.len() != want_args {
+            make d = diags::Diag.err(e::Err.TypeMismatch, ex.*.range !, "wrong number of arguments")
+            make temp = "found " + ex.*.args.len().to_str() + " arguments, expected " + want_args.to_str()
+            d.label(temp)
+            this.diag.*.report(d)
+        }
+
+        this.out.call_exprs.push(idx)
+        this.out.call_names.push("__quip_builtin." + sym)
+        return ret
+    }
+
+    // resolve an attached call whose function is declared in this module: verify the argument
+    // count against the declared parameters, type-check each written argument and return the
+    // declared return type
+    @this
+    make resolve_local_attached (body: ref<hir::HirBody>, idx: uint, ex: ref<hir::HirExpr>, found: uint) -> uint {
+        make m = this.module.*.attached_funcs[found].pin
+        make f = this.module.*.funcs[m.*.func].pin
+        facts::require_unsafe_local(this.unsafe_depth, this.out.semantic_checks.pin, f, body.*.exprs[ex.*.lhs].range.copy())
+        make params = f.*.body.param_count
+        make has_this = f.*.has_this
+
+        make expect_n = params
+
+        if has_this && params > 0 {
+            expect_n = params - 1
+        }
+
+        if ex.*.args.len() != expect_n {
+            make d = diags::Diag.err(e::Err.TypeMismatch, ex.*.range !, "wrong number of arguments")
+            make temp = "found " + ex.*.args.len().to_str() + " arguments, expected " + expect_n.to_str()
+            d.label(temp)
+            d.attach(diags::Label.create(util::Range.of(f.*.name_span.start, f.*.name_span.end), "method is declared here"))
+            d.help("match the method's parameters; its receiver is passed implicitly")
+            this.diag.*.report(d)
+        }
+
+        this.out.call_exprs.push(idx)
+        this.out.call_names.push(f.*.name !)
+
+        make callee = f.*.body.pin
+        make ai: uint = 0
+        make param_offset: uint = 0
+
+        if has_this { param_offset = 1 }
+
+        while ai < ex.*.args.len() {
+            make param_idx = ai + param_offset
+
+            if param_idx < params && param_idx < callee.*.locals.len() {
+                make arg_ty = this.check_expr(body, ex.*.args[ai], UseKind.Copy)
+                make param = callee.*.locals[param_idx].pin
+
+                if param.*.has_ty {
+                    make expect = this.lower_type(callee, param.*.ty)
+                    this.check_anonymous_fields(body, ex.*.args[ai], expect)
+
+                    if this.unify(expect, arg_ty) == ty::TY_ERROR {
+                        make arg = body.*.exprs[ex.*.args[ai]].pin
+                        make d = diags::Diag.err(e::Err.TypeMismatch, arg.*.range !, "mismatched types")
+                        d.label("found `" + this.ty_name(arg_ty) + "` here")
+                        d.attach(diags::Label.create(param.*.range !, "expected `" + this.ty_name(expect) + "` because the parameter's type is declared here"))
+                        this.diag.*.report(d)
+                    }
+                }
+            }
+
+            ai = ai + 1
+        }
+
+        if f.*.has_ret_ty {
+            return this.lower_type(callee, f.*.ret_ty)
+        }
+
+        return ty::TY_VOID
+    }
+
+    // resolve an attached call whose function is declared in a dependency: its parameter types are
+    // not available here, so only the arity is checked; the return type is rebuilt from the
+    // portable signature
+    @this
+    make resolve_sig_attached (body: ref<hir::HirBody>, idx: uint, ex: ref<hir::HirExpr>, sfound: uint) -> uint {
+        make sig = this.sigs.*[sfound].pin
+        facts::require_unsafe_origin(this.unsafe_depth, this.out.semantic_checks.pin, sig.*.is_unsafe, body.*.exprs[ex.*.lhs].range.copy(), sig.*.path.copy(), sig.*.source, sig.*.name_span.copy())
+
+        make expect_n = sig.*.param_count
+
+        if sig.*.has_this && expect_n > 0 {
+            expect_n = expect_n - 1
+        }
+
+        if ex.*.args.len() != expect_n {
+            make d = diags::Diag.err(e::Err.TypeMismatch, ex.*.range !, "wrong number of arguments")
+            make temp = "found " + ex.*.args.len().to_str() + " arguments, expected " + expect_n.to_str()
+            d.label(temp)
+            make temp1 = "attached function `" + sig.*.name + "` on `" + sig.*.type_name + "` takes " + expect_n.to_str() + " argument(s)"
+            context::attach_origin(d.*.pin, sig.*.path.copy(), sig.*.source, sig.*.name_span.copy(), temp1)
+            d.help("match this method's parameter count; the receiver is supplied implicitly")
+            this.diag.*.report(d)
+        }
+
+        make arg_types: uint[] = []
+        make arg_aggs: bool[] = []
+        make param_offset: uint = 0
+
+        if sig.*.has_this { param_offset = 1 }
+
+        make ai: uint = 0
+
+        while ai < ex.*.args.len() {
+            make arg_ty = this.check_expr(body, ex.*.args[ai], UseKind.Copy)
+            make param_idx = ai + param_offset
+            make abi_ty = arg_ty
+
+            if param_idx < sig.*.param_tys.len() {
+                abi_ty = this.sig_type_of(sig.*.param_tys[param_idx].pin)
+                this.check_anonymous_fields(body, ex.*.args[ai], abi_ty)
+
+                if this.tys.*.kind_of(this.resolve(arg_ty)) == ty::TyKind.Fallible
+                    && this.unify(abi_ty, arg_ty) == ty::TY_ERROR {
+                    make d = diags::Diag.err(e::Err.TypeMismatch, body.*.exprs[ex.*.args[ai]].range.copy(), "handle a fallible argument with catch or unwrap")
+                    context::attach_origin(d.*.pin, sig.*.path.copy(), sig.*.source, sig.*.param_tys[param_idx].span.copy(), "this parameter requires a non-fallible value")
+                    d.help("handle the error before passing the result to this method")
+                    this.diag.*.report(d)
+                }
+            }
+
+            arg_types.push(abi_ty)
+
+            if param_idx < sig.*.param_aggs.len() {
+                arg_aggs.push(sig.*.param_aggs[param_idx])
+            } else {
+                arg_aggs.push(this.type_is_aggregate(arg_ty))
+            }
+
+            ai = ai + 1
+        }
+
+        make arg_start = this.out.abi_arg_aggs.len()
+        make abi_i: uint = 0
+
+        while abi_i < arg_types.len() {
+            this.out.abi_arg_types.push(arg_types[abi_i])
+            this.out.abi_arg_aggs.push(arg_aggs[abi_i])
+            abi_i = abi_i + 1
+        }
+
+        this.out.call_exprs.push(idx)
+        this.out.call_names.push(sig.*.symbol !)
+        this.out.abi_exprs.push(idx)
+        this.out.abi_arg_starts.push(arg_start)
+        this.out.abi_arg_counts.push(ex.*.args.len())
+
+        make ret = this.ret_of_sig(sig)
+        this.out.abi_ret_aggs.push(sig.*.ret_agg)
+        return ret
+    }
+
+    // rebuild an attached function's return type from its portable signature
+    @this
+    make ret_of_sig (sig: ref<hir::HirAttachedSig>) -> uint {
+        if !sig.*.has_ret {
+            return ty::TY_VOID
+        }
+
+        return this.sig_type_of(sig.*.ret_ty.pin)
+    }
+
+    @this
+    make find_imported_type (name: str) -> uint {
+        make i: uint = 0
+
+        while i < this.namespaces.*.len() {
+            if this.symbols.namespace_has_type(i, name.copy()) {
+                return this.intern_imported_type(i, name)
+            }
+
+            i = i + 1
+        }
+
+        return ty::TY_ERROR
+    }
+
+    // rebuild a portable type shape in this unit's interner. used for fields of imported structs
+    // and returns of attached functions declared in dependencies.
+    @this
+    make sig_type_of (sig: ref<hir::HirTypeSig>) -> uint {
+        make id = ty::TY_ERROR
+
+        if sig.*.prim != ty::TY_ERROR {
+            id = sig.*.prim
+        } elif sig.*.name == "ptr" || sig.*.name == "owned" || sig.*.name == "ref" {
+            if sig.*.args.len() > 0 {
+                make inner = this.sig_type_of(sig.*.args[0].pin)
+
+                if sig.*.name == "ptr" {
+                    id = this.tys.*.wrap(ty::TyKind.Ptr, inner)
+                } elif sig.*.name == "owned" {
+                    id = this.tys.*.wrap(ty::TyKind.Owned, inner)
+                } else {
+                    id = this.tys.*.wrap(ty::TyKind.Ref, inner)
+                }
+            }
+        } elif sig.*.name == "fn" && sig.*.args.len() > 0 {
+            make function = ty::Ty {}
+
+            function.kind = ty::TyKind.Func
+            function.elem = this.sig_type_of(sig.*.args[0].pin)
+            make i: uint = 1
+
+            while i < sig.*.args.len() {
+                function.args.push(this.sig_type_of(sig.*.args[i].pin))
+                i = i + 1
+            }
+
+            id = this.tys.*.intern(function)
+        } elif sig.*.name == "variant" {
+            make args: uint[] = []
+            make i: uint = 0
+
+            while i < sig.*.args.len() {
+                args.push(this.sig_type_of(sig.*.args[i].pin))
+                i = i + 1
+            }
+
+            id = this.tys.*.variant(args)
+        } elif sig.*.name.len() > 0 {
+            id = this.lookup_item(sig.*.name)
+
+            if id == ty::TY_ERROR {
+                id = this.find_imported_type(sig.*.name)
+            }
+
+            if id == ty::TY_ERROR && this.symbols.find_struct_sig(sig.*.name.copy()) < this.structs.*.len() {
+                make item = hir::HirItem {}
+
+                item.kind = hir::HirItemKind.Type
+                item.name = sig.*.name.copy()
+                make si = this.symbols.find_struct_sig(sig.*.name.copy())
+                item.display_name = this.structs.*[si].display_name.copy()
+                make idx = this.module.*.items.len()
+                this.module.*.items.push(item)
+                id = this.tys.*.adt(idx)
+            }
+        }
+
+        if id == ty::TY_ERROR {
+            id = this.fresh()
+        }
+
+        if sig.*.is_ref { id = this.tys.*.wrap(ty::TyKind.Ref, id) }
+
+        if sig.*.is_ptr { id = this.tys.*.wrap(ty::TyKind.Ptr, id) }
+
+        if sig.*.is_array { id = this.tys.*.wrap(ty::TyKind.Array, id) }
+
+        if sig.*.is_optional { id = this.tys.*.wrap(ty::TyKind.Optional, id) }
+
+        if sig.*.is_fallible { id = this.tys.*.wrap(ty::TyKind.Fallible, id) }
+
+        return id
+    }
+
+    /// gets the type of the is aggregate.
+    @this
+    make type_is_aggregate (id: uint) -> bool {
+        make kind = this.tys.*.kind_of(id)
+
+        if kind == ty::TyKind.Fallible { return true }
+
+        if kind == ty::TyKind.Array || kind == ty::TyKind.Optional || kind == ty::TyKind.Variant {
+            return true
+        }
+
+        if kind == ty::TyKind.Str || kind == ty::TyKind.StrBuf {
+            return true
+        }
+
+        if kind == ty::TyKind.Adt {
+            make def = this.tys.*.def_of(id)
+
+            if def < this.module.*.items.len() {
+                return this.module.*.items[def].kind == hir::HirItemKind.Type
+            }
+        }
+
+        return false
+    }
+
+    // source name of a resolved type, used to pick an attached function's receiver type
+    @this
+    make type_name_of (id: uint) -> str {
+        make rid = this.resolve(id)
+
+        if this.tys.*.kind_of(rid) == ty::TyKind.Adt {
+            return this.adt_name(rid)
+        }
+
+        if this.tys.*.kind_of(rid) == ty::TyKind.Array {
+            return this.type_name_of(this.tys.*.elem_of(rid)) + "[]"
+        }
+
+        if this.tys.*.kind_of(rid) == ty::TyKind.Ptr {
+            return "ptr"
+        }
+
+        if this.tys.*.kind_of(rid) == ty::TyKind.Ref || this.tys.*.kind_of(rid) == ty::TyKind.Owned || this.tys.*.kind_of(rid) == ty::TyKind.Optional || this.tys.*.kind_of(rid) == ty::TyKind.Fallible {
+            return this.type_name_of(this.tys.*.elem_of(rid))
+        }
+
+        match this.tys.*.kind_of(rid) {
+            ty::TyKind.Bool { return "bool" }
+
+            ty::TyKind.I8 { return "i8" }
+
+            ty::TyKind.I16 { return "i16" }
+
+            ty::TyKind.I32 { return "i32" }
+
+            ty::TyKind.I64 { return "i64" }
+
+            ty::TyKind.U8 { return "u8" }
+
+            ty::TyKind.U16 { return "u16" }
+
+            ty::TyKind.U32 { return "u32" }
+
+            ty::TyKind.U64 { return "u64" }
+
+            ty::TyKind.Int { return "int" }
+
+            ty::TyKind.Uint { return "uint" }
+
+            ty::TyKind.F32 { return "f32" }
+
+            ty::TyKind.F64 { return "f64" }
+
+            ty::TyKind.Float { return "float" }
+
+            ty::TyKind.Text { return "str" }
+
+            ty::TyKind.Str { return "str" }
+
+            ty::TyKind.StrBuf { return "String" }
+
+            ty::TyKind.Char { return "char" }
+            _ {}
+        }
+
+        make empty: str = ""
+
+        return empty
+    }
+
+    // the type of field `name` on `base`, reported as `UnknownField` when the receiver is a known
+    // type but does not declare the field. an unknown/inferred receiver stays an inference
+    // variable so namespaced and imported receivers keep type-checking permissively.
+    @this
+    make check_field (base: uint, name: str, range: util::Range) -> uint {
+        make rk = this.tys.*.kind_of(base)
+
+        if rk == ty::TyKind.Ref || rk == ty::TyKind.Ptr || rk == ty::TyKind.Owned {
+            return this.check_field(this.tys.*.elem_of(base), name, range)
+        }
+
+        // Built-in string descriptors are { data, length, capacity }, three
+        // eight-byte slots. Keep these types consistent with LLVM field access.
+        if rk == ty::TyKind.Str || rk == ty::TyKind.StrBuf || rk == ty::TyKind.Text {
+            if name == "data" { return this.tys.*.wrap(ty::TyKind.Ptr, ty::TY_CHAR) }
+
+            if name == "length" || name == "len" || name == "capacity" || name == "cap" {
+                return ty::TY_INT
+            }
+
+            make d = diags::Diag.err(e::Err.UnknownField, range, "unknown string field")
+            d.label("a string has data, length and capacity fields")
+            this.diag.*.report(d)
+            return ty::TY_ERROR
+        }
+
+        if rk != ty::TyKind.Adt {
+            return this.fresh()
+        }
+
+        make tname = this.adt_name(base)
+        make sid = this.symbols.find_struct(tname.copy())
+
+        // the receiver may be declared in a dependency, whose fields are only available through
+        // the portable struct signatures attached to this unit
+        if sid >= this.module.*.structs.len() {
+            make ssid = this.symbols.find_struct_sig(tname !)
+
+            if ssid < this.structs.*.len() {
+                make ss = this.structs.*[ssid].pin
+                make sfi: uint = 0
+
+                while sfi < ss.*.fields.len() {
+                    make sf = ss.*.fields[sfi].pin
+
+                    if sf.*.name == name {
+                        facts::require_unsafe_field(this.unsafe_depth, this.out.semantic_checks.pin, this.structs, sf.*.is_unsafe, range.copy(), tname.copy(), name.copy())
+                        facts::record_field_access(this.out.semantic_checks.pin, tname.copy(), name.copy(), range.copy())
+
+                        if sf.*.ty.prim == ty::TY_ERROR && sf.*.ty.name.len() == 0 { return this.fresh() }
+
+                        return this.sig_type_of(sf.*.ty.pin)
+                    }
+
+                    sfi = sfi + 1
+                }
+
+                make d = diags::Diag.err(e::Err.UnknownField, range, "unknown field")
+                d.label("no field named `" + name + "` is declared on type `" + tname + "`")
+                context::attach_field_context(this.structs, d.*.pin, tname.copy(), name.copy())
+                d.help("check the field name against the type declaration")
+                this.diag.*.report(d)
+                return ty::TY_ERROR
+            }
+
+            return base
+        }
+
+        make s = this.module.*.structs[sid].pin
+        make fi: uint = 0
+
+        while fi < s.*.fields.len() {
+            make f = s.*.fields[fi].pin
+
+            if f.*.name == name {
+                facts::require_unsafe_field(this.unsafe_depth, this.out.semantic_checks.pin, this.structs, f.*.is_unsafe, range.copy(), tname.copy(), name.copy())
+
+                if f.*.has_ty {
+                    return this.lower_type(s.*.body.pin, f.*.ty)
+                }
+
+                return this.fresh()
+            }
+
+            fi = fi + 1
+        }
+
+        make d = diags::Diag.err(e::Err.UnknownField, range, "unknown field")
+        d.label("no field named `" + name + "` is declared on type `" + tname + "`")
+                context::attach_field_context(this.structs, d.*.pin, tname.copy(), name.copy())
+                d.help("check the field name against the type declaration")
+        this.diag.*.report(d)
+        return ty::TY_ERROR
+    }
+
+    // A missing field may be assigned after a local's construction, provided
+    // that assignment is reached before any use of the incomplete local.
+    @this
+    make check_required_fields (body: ref<hir::HirBody>, ex: ref<hir::HirExpr>, local: uint, imported: uint) {
+        if this.unsafe_depth > 0 { return }
+
+        make count: uint = 0
+
+        if local < this.module.*.structs.len() { count = this.module.*.structs[local].fields.len() }
+        elif imported < this.structs.*.len() { count = this.structs.*[imported].fields.len() }
+        else { return }
+
+        make f: uint = 0
+
+        while f < count {
+            make name: str = ""
+            make owner: str = ""
+            make has_default = false
+            make empty_array = false
+
+            if local < this.module.*.structs.len() {
+                make structure = this.module.*.structs[local].pin
+                name = structure.*.fields[f].name.copy()
+                owner = structure.*.name.copy()
+                has_default = structure.*.fields[f].has_default
+
+                if structure.*.fields[f].has_ty {
+                    make field_ty = this.resolve(this.lower_type(structure.*.body.pin, structure.*.fields[f].ty))
+                    empty_array = this.tys.*.kind_of(field_ty) == ty::TyKind.Array
+                }
+            } else {
+                make structure = this.structs.*[imported].pin
+                name = structure.*.fields[f].name.copy()
+                owner = structure.*.name.copy()
+                has_default = structure.*.fields[f].has_default
+                make field_ty = this.resolve(this.sig_type_of(structure.*.fields[f].ty.pin))
+                empty_array = this.tys.*.kind_of(field_ty) == ty::TyKind.Array
+            }
+
+            make supplied = false
+            make i: uint = 0
+            while i < ex.*.args.len() {
+                make field_name: str = ""
+
+                if i < ex.*.field_names.len() { field_name = ex.*.field_names[i].copy() }
+
+                if field_name == name || (field_name.len() == 0 && i == f) { supplied = true }
+
+                i = i + 1
+            }
+
+            if !supplied && !has_default && !empty_array {
+                this.out.field_checks.push(facts::FieldCheck { range = ex.*.range.copy(), name = name, owner = owner })
+            }
+
+            f = f + 1
+        }
+    }
+
+    // Resolve anonymous field types and record uses for semantic visibility checks.
+    @this
+    make check_anonymous_fields (body: ref<hir::HirBody>, index: uint, expected: uint) {
+        if index >= body.*.exprs.len() { return }
+
+        make expression = body.*.exprs[index].pin
+
+        if expression.*.kind != hir::HirExprKind.Constructor || expression.*.name.len() > 0 { return }
+
+        make base = this.resolve(expected)
+        make kind = this.tys.*.kind_of(base)
+
+        while kind == ty::TyKind.Optional || kind == ty::TyKind.Fallible {
+            base = this.resolve(this.tys.*.elem_of(base))
+            kind = this.tys.*.kind_of(base)
+        }
+
+        if kind != ty::TyKind.Adt { return }
+
+        make name = this.adt_name(base)
+        make local = this.symbols.find_struct(name.copy())
+        this.check_required_fields(body, expression, local, this.symbols.find_struct_sig(name.copy()))
+
+        if local < this.module.*.structs.len() {
+            make structure = this.module.*.structs[local].pin
+            make i: uint = 0
+
+            while i < expression.*.args.len() {
+                make field_name: str = ""
+
+                if i < expression.*.field_names.len() { field_name = expression.*.field_names[i].copy() }
+
+                make f: uint = 0
+
+                while f < structure.*.fields.len() {
+                    make field = structure.*.fields[f].pin
+
+                    if field.*.name == field_name || (field_name.len() == 0 && f == i) {
+                        facts::require_unsafe(this.unsafe_depth, this.out.semantic_checks.pin, field.*.is_unsafe, body.*.exprs[expression.*.args[i]].range.copy())
+
+                        if field.*.has_ty { this.check_anonymous_fields(body, expression.*.args[i], this.lower_type(structure.*.body.pin, field.*.ty)) }
+
+                        break
+                    }
+
+                    f = f + 1
+                }
+
+                i = i + 1
+            }
+
+            return
+        }
+
+        make sid = this.symbols.find_struct_sig(name)
+
+        if sid >= this.structs.*.len() { return }
+
+        make structure = this.structs.*[sid].pin
+        make i: uint = 0
+
+        while i < expression.*.args.len() {
+            make field_name: str = ""
+
+            if i < expression.*.field_names.len() { field_name = expression.*.field_names[i].copy() }
+
+            make f: uint = 0
+
+            while f < structure.*.fields.len() {
+                make field = structure.*.fields[f].pin
+
+                if field.*.name == field_name || (field_name.len() == 0 && f == i) {
+                    make argument = body.*.exprs[expression.*.args[i]].pin
+                    facts::require_unsafe(this.unsafe_depth, this.out.semantic_checks.pin, field.*.is_unsafe, argument.*.range.copy())
+                    facts::record_field_access(this.out.semantic_checks.pin, structure.*.name.copy(), field.*.name.copy(), argument.*.range.copy())
+                    this.check_anonymous_fields(body, expression.*.args[i], this.sig_type_of(field.*.ty.pin))
+                    break
+                }
+
+                f = f + 1
+            }
+
+            i = i + 1
+        }
+    }
+
+    // a constructor validates its fields against the type's declaration: a named field must
+    // exist, and every value must unify with the declared field type
+    @this
+    make check_constructor (body: ref<hir::HirBody>, ex: ref<hir::HirExpr>) -> uint {
+        // strip a namespace prefix (`ns::Type { }` -> look up `Type`):
+        // find the last `::` separator and use the segment after it as the plain type name
+        make raw_name = ex.*.name !
+        make plain_name = raw_name.copy()
+        make pi: uint = 0
+
+        while pi + 1 < raw_name.len() {
+            if raw_name[pi] == ':' && raw_name[pi + 1] == ':' {
+                // reset: the plain name starts after this separator
+                make tmp: str = ""
+                make si = pi + 2
+
+                while si < raw_name.len() {
+                    tmp = tmp + raw_name[si]
+                    si = si + 1
+                }
+
+                plain_name = tmp
+            }
+
+            pi = pi + 1
+        }
+
+        make has_ns = plain_name.len() != raw_name.len()
+        make nsi = this.namespaces.*.len()
+
+        // when the name was namespace-qualified, validate the prefix
+        if has_ns {
+            make prefix_end = raw_name.len() - plain_name.len() - 2  // drop trailing ::
+            make ns_prefix: str = ""
+            make qi: uint = 0
+
+            while qi < prefix_end {
+                ns_prefix = ns_prefix + raw_name[qi]
+                qi = qi + 1
+            }
+
+            nsi = this.symbols.find_namespace(ns_prefix.copy())
+
+            if nsi >= this.namespaces.*.len() {
+                make d = diags::Diag.err(e::Err.UnknownNamespace, ex.*.range !, "unknown namespace in constructor")
+                d.label("namespace `" + ns_prefix + "` is not declared in this file")
+                this.diag.*.report(d)
+            }
+        }
+
+        make id = this.lookup_item(plain_name.copy())
+        make sid = this.symbols.find_struct(plain_name.copy())
+        make ssid = this.structs.*.len()
+
+        // an imported constructor (`ast::AST_Type { ... }`) has no local declaration; resolve it
+        // through the namespace so the expression gets the imported ADT type rather than `fresh`
+        if has_ns && nsi < this.namespaces.*.len() {
+            if this.symbols.namespace_has_type(nsi, plain_name.copy()) {
+                id = this.intern_imported_type(nsi, plain_name.copy())
+                sid = this.module.*.structs.len()
+                ssid = this.symbols.find_struct_sig(plain_name)
+            }
+        }
+
+        if !has_ns && this.tys.*.kind_of(this.resolve(id)) == ty::TyKind.Adt {
+            make owner = this.adt_name(this.resolve(id))
+            sid = this.symbols.find_struct(owner.copy())
+
+            if sid >= this.module.*.structs.len() { ssid = this.symbols.find_struct_sig(owner) }
+        }
+
+        if id != ty::TY_ERROR { this.check_required_fields(body, ex, sid, ssid) }
+
+        make fi: uint = 0
+
+        while fi < ex.*.args.len() {
+            make arg_ty = this.check_expr(body, ex.*.args[fi], UseKind.Copy)
+            make arg_ex = body.*.exprs[ex.*.args[fi]].pin
+            make fname: str = ""
+
+            if fi < ex.*.field_names.len() {
+                fname = ex.*.field_names[fi] !
+            }
+
+            if id != ty::TY_ERROR && sid < this.module.*.structs.len() {
+                make s = this.module.*.structs[sid].pin
+                make fty = ty::TY_ERROR
+                make found = false
+
+                if fname.len() > 0 {
+                    make dj: uint = 0
+
+                    while dj < s.*.fields.len() {
+                        make f = s.*.fields[dj].pin
+
+                        if f.*.name == fname {
+                            found = true
+                            facts::require_unsafe(this.unsafe_depth, this.out.semantic_checks.pin, f.*.is_unsafe, arg_ex.*.range.copy())
+
+                            if f.*.has_ty {
+                                fty = this.lower_type(s.*.body.pin, f.*.ty)
+                            }
+                        }
+
+                        dj = dj + 1
+                    }
+
+                    if !found {
+                        make d = diags::Diag.err(e::Err.UnknownField, ex.*.range !, "unknown field")
+                        d.label("no field named `" + fname + "` is declared on type `" + (ex.*.name !) + "`")
+                        this.diag.*.report(d)
+                    }
+                } elif fi < s.*.fields.len() {
+                    make f = s.*.fields[fi].pin
+                    found = true
+                    facts::require_unsafe(this.unsafe_depth, this.out.semantic_checks.pin, f.*.is_unsafe, arg_ex.*.range.copy())
+
+                    if f.*.has_ty {
+                        fty = this.lower_type(s.*.body.pin, f.*.ty)
+                    }
+                }
+
+                if found && fty != ty::TY_ERROR {
+                    this.check_anonymous_fields(body, ex.*.args[fi], fty)
+
+                    if this.unify(fty, arg_ty) == ty::TY_ERROR {
+                        make d = diags::Diag.err(e::Err.TypeMismatch, arg_ex.*.range !, "mismatched types")
+                        d.label("found `" + this.ty_name(arg_ty) + "` here")
+                        make field_name = fname.copy()
+
+                        if field_name.len() == 0 && fi < s.*.fields.len() { field_name = s.*.fields[fi].name.copy() }
+
+                        context::attach_field_context(this.structs, d.*.pin, s.*.name.copy(), field_name)
+                        d.note("this field requires `" + this.ty_name(fty) + "` according to its declaration")
+                        d.help("initialize the field with a value of the declared type")
+                        this.diag.*.report(d)
+                    }
+                }
+            } elif id != ty::TY_ERROR && ssid < this.structs.*.len() {
+                make ss = this.structs.*[ssid].pin
+                make fty = ty::TY_ERROR
+                make found = false
+
+                if fname.len() > 0 {
+                    make dj: uint = 0
+
+                    while dj < ss.*.fields.len() {
+                        make f = ss.*.fields[dj].pin
+
+                        if f.*.name == fname {
+                            found = true
+                            facts::require_unsafe(this.unsafe_depth, this.out.semantic_checks.pin, f.*.is_unsafe, arg_ex.*.range.copy())
+                            facts::record_field_access(this.out.semantic_checks.pin, ss.*.name.copy(), fname.copy(), arg_ex.*.range.copy())
+                            fty = this.sig_type_of(f.*.ty.pin)
+                        }
+
+                        dj = dj + 1
+                    }
+
+                    if !found {
+                        make d = diags::Diag.err(e::Err.UnknownField, ex.*.range !, "unknown field")
+                        d.label("no field named `" + fname + "` is declared on type `" + (ex.*.name !) + "`")
+                        this.diag.*.report(d)
+                    }
+                } elif fi < ss.*.fields.len() {
+                    make f = ss.*.fields[fi].pin
+                    found = true
+                    facts::require_unsafe(this.unsafe_depth, this.out.semantic_checks.pin, f.*.is_unsafe, arg_ex.*.range.copy())
+                    facts::record_field_access(this.out.semantic_checks.pin, ss.*.name.copy(), f.*.name.copy(), arg_ex.*.range.copy())
+                    fty = this.sig_type_of(f.*.ty.pin)
+                }
+
+                if found && fty != ty::TY_ERROR {
+                    this.check_anonymous_fields(body, ex.*.args[fi], fty)
+
+                    if this.unify(fty, arg_ty) == ty::TY_ERROR {
+                        make d = diags::Diag.err(e::Err.TypeMismatch, arg_ex.*.range !, "mismatched types")
+                        d.label("found `" + this.ty_name(arg_ty) + "` here")
+                        make field_name = fname.copy()
+
+                        if field_name.len() == 0 && fi < ss.*.fields.len() { field_name = ss.*.fields[fi].name.copy() }
+
+                        context::attach_field_context(this.structs, d.*.pin, ss.*.name.copy(), field_name)
+                        d.note("this field requires `" + this.ty_name(fty) + "` according to its declaration")
+                        d.help("initialize the field with a value of the declared type")
+                        this.diag.*.report(d)
+                    }
+                }
+            }
+
+            fi = fi + 1
+        }
+
+        return id
+    }
+
+    /// looks up the item.
+    @this
+    make lookup_item (name: str) -> uint {
+        make index = this.symbols.find_type_item(name)
+
+        if index >= this.module.*.items.len() { return ty::TY_ERROR }
+
+        if this.module.*.items[index].kind == hir::HirItemKind.Alias {
+            make id = this.expand_type_alias(index)
+
+            if id != ty::TY_ERROR { return id }
+        }
+
+        return this.tys.*.adt(index)
+    }
+
+    // resolve the aliased type of the `Alias` item at `item_idx`
+    @this
+    make expand_type_alias (item_idx: uint) -> uint {
+        if this.alias_depth > 64 {
+            return ty::TY_ERROR
+        }
+
+        make module = this.module
+        make ti: uint = 0
+
+        while ti < module.*.type_aliases.len() {
+            make ta = module.*.type_aliases[ti].pin
+
+            if ta.*.item == item_idx {
+                if !ta.*.has_target {
+                    return ty::TY_ERROR
+                }
+
+                this.alias_depth = this.alias_depth + 1
+                make id = this.lower_type(ta.*.body.pin, ta.*.target)
+                this.alias_depth = this.alias_depth - 1
+
+                return id
+            }
+
+            ti = ti + 1
+        }
+
+        return ty::TY_ERROR
+    }
+
+}

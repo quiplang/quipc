@@ -1,0 +1,8 @@
+@pub @pure @const {
+
+    make object: unit = @import "object.quip"
+
+    /// link native objects through Clang
+    make link: unit = @import "link.quip"
+
+}

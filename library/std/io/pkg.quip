@@ -1,14 +1,19 @@
 @pure @const {
-    make fmt: unit = @import "../fmt/pkg.quip"
-
-    make os: unit = @import "../os/pkg.quip"
-    make ffi: unit = @import "../ffi/cffi.quip"
 
     make mem: unit = @import "../mem/pkg.quip"
+    make ffi: unit = @import "../ffi/c.quip"
 
-    make path_pkg: unit = @import "path.quip"
-    make file_pkg: unit = @import "file.quip"
-    make dir_pkg: unit  = @import "dir.quip"
+    make file: unit = @import "./file.quip"
+    make path: unit = @import "./path.quip"
+    make dir: unit = @import "./dir.quip"
+
+    @target "macos" {
+        make os: unit = @import "../os/macos.quip"
+    }
+
+    @target "linux" {
+        make os: unit = @import "../os/linux.quip"
+    }
 }
 
 @pub @const @nomangle {
@@ -28,71 +33,54 @@
 }
 
 @pub @pure @const {
-    make Path: Type = path_pkg::Path
-    make File: Type = file_pkg::File
-    make Dir: Type  = dir_pkg::Dir
-   //  make DirMode: Type = dir_pkg::DirMode
+    make File: Type = file::File
+    make Path: Type = path::Path
+    make Dir: Type = dir::Dir
 }
 
 
+/// prints text followed by a newline to standard output
 @pub
-make println (fmt: variant<String, str, ptr<char>>) -> void {
+make println (fmt: variant<String, str, ref<str>>) -> void {
+    print(fmt)
 
-    make nl: String = "\n"
-    make bad_fmt: String = "unsupported format Type\n"
+    make new_line: String = "\n"
+    @unsafe os::write(os::STDOUT_FILENO, new_line.data, 1)
+}
+
+/// prints text to standard output
+@pub
+make print (fmt: variant<String, str, ref<str>>) -> void {
+
+    make bad_fmt = "unsupported format Type\n"
 
     match fmt {
 
         a: String {
-            os::syscall::write(STDOUT, a.data, a.length)
+            @unsafe os::write(os::STDOUT_FILENO, a.data, a.length)
         }
 
         b: str {
-            os::syscall::write(STDOUT, b.data, b.len())
+            @unsafe os::write(os::STDOUT_FILENO, b.data, b.len())
         }
 
-        c: ptr<char> {
-            make len = ffi::strlen(c.pin)
-            os::syscall::write(STDOUT, c, len)
+        c: ref<str> {
+            @unsafe os::write(os::STDOUT_FILENO, c.*.data, c.*.len())
         }
 
         _ {
-            os::syscall::write(STDOUT, bad_fmt.data, bad_fmt.length)
+            @unsafe os::write(os::STDOUT_FILENO, bad_fmt.data, bad_fmt.len())
             return
         }
     }
 
-    os::syscall::write(STDOUT, nl.data, 1)
 }
 
+/// read a line of input from the user in stdin
 @pub
-make print (fmt: variant<String, str, ptr<char>>) -> void {
-    make bad_fmt: String = "unsupported format Type\n"
-
-    match fmt {
-
-        a: String {
-            os::syscall::write(STDOUT, a.data, a.length)
-        }
-
-        b: str {
-            os::syscall::write(STDOUT, b.data, b.len())
-        }
-
-        c: ptr<char> {
-            make len = ffi::strlen(c.pin)
-            os::syscall::write(STDOUT, c, len)
-        }
-
-        _ {
-            os::syscall::write(STDOUT, bad_fmt.data, bad_fmt.length)
-            return
-        }
-    }
+make input () -> !str {
+    return error.Unimplemented
 }
-
-
-// TESTS
 
 @pub
 make test () -> !void {
@@ -111,12 +99,14 @@ make test () -> !void {
     }
 
     make file_path = Path.create(".quip_test_dir/quip_test_file.txt")
-    make file = File.create(file_path, MODE_FILE) catch {
+    make file: File = File.create(file_path, MODE_FILE) catch {
         return error.TestFailed
     }
+
     file.write("quip test content") catch {
         return error.TestFailed
     }
+
     file.close()
 
     return

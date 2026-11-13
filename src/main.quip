@@ -1,16 +1,38 @@
 @pure @const {
-make std = @import "../library/std/pkg.quip"
-make core = @import "core/pkg.quip"
+    make std = @import "std"
+
+    make version = @import "version.quip"
+
+    make core = @import "core/pkg.quip"
+
+    make t = @import "test.quip"
+
+    make i = @import "diag/issue.quip"
+}
+
+@pure @const {
+    make Issue: Type = i::Issue
 }
 
 @pub @entry
 make main (argc: int, argv: ptr<char>[]) -> int {
+
     if argv.len() < 2 {
-        std::io::println("usage: quipc_bootstrap <flag> <command>")
+        print_help()
         return 1
     }
 
+    make code = proceed(argv)
+    std::progress::finish(code == 0)
+
+    return code
+}
+
+/// parses command-line arguments and dispatches the selected command.
+make proceed (argv: ptr<char>[]) -> int {
+
     make driver = core::driver::Driver.init()
+    // parse command line arguments
     driver.config.parse(argv) catch {
         print_help()
         return 1
@@ -18,43 +40,86 @@ make main (argc: int, argv: ptr<char>[]) -> int {
 
     match driver.config.command {
 
+        core::config::CommandKind.Version {
+            std::io::println("Quip " + version::current)
+        }
+
+        core::config::CommandKind.Init {
+            driver.new_project() catch err {
+                return 1
+            }
+        }
+
         core::config::CommandKind.Compile {
-            std::io::println("compile command")
+            make visible = driver.config.progress && !driver.config.emit_llvm && !driver.config.emit_mir && !driver.config.emit_mem
+            std::progress::begin("Compile", visible, driver.config.options.show_quipc_debug)
             driver.compile() catch err {
+                std::progress::clear()
                 match err {
                     error.FileNotFound {
-                        std::io::println("unable to find: ".to_str() + driver.config.input.get())
+
+                        match driver.config.input {
+                            none { std::io::println("missing input file") }
+                            some {
+                                make prefix: str = "unable to find: "
+                                std::io::println(prefix + some.get())
+                            }
+                        }
+
                         return 1
                     }
 
                     error.CompilationAborted {
-                        std::io::println("compilation aborted")
                         return 1
                     }
 
-                    _ { return 1 }
+                    error.Panic {
+                        std::io::println("compiler panicked")
+                        std::process::abort()
+                    }
+
+                    _ {
+                        std::io::println("unknown error")
+                        return 1
+                    }
 
                 }
             }
         }
 
         core::config::CommandKind.Build {
-            std::io::println("build command")
+            std::progress::begin("Build", driver.config.progress, driver.config.options.show_quipc_debug)
             driver.build() catch err {
+                std::progress::clear()
+
                 match err {
                     error.FileNotFound {
-                        std::io::println("unable to find 'build.quip' build script")
+                        return 1
+                    }
+
+                    error.FailedToBuild {
                         return 1
                     }
 
                     _ { return 1 }
-
                 }
             }
         }
 
+        core::config::CommandKind.Help {
+            print_help()
+        }
+
         core::config::CommandKind.Run {
-            std::io::println("run command")
+            std::progress::begin("Compile", driver.config.progress, driver.config.options.show_quipc_debug)
+            make code = driver.run() catch err {
+                std::progress::clear()
+                match err { error.FileNotFound { std::io::println("unable to locate the run input or executable") } _ {} }
+
+                return 1
+            }
+
+            return code
         }
 
         _ {
@@ -67,14 +132,39 @@ make main (argc: int, argv: ptr<char>[]) -> int {
 }
 
 make print_help () -> void {
-    std::io::println("usage: quipc_bootstrap <flag> <command>")
+    std::io::println("Usage: quipc <command> [options]")
     std::io::println("")
-    std::io::println("commands:")
-    std::io::println("  compile <path/to/file.quip>         - compile the source code")
-    std::io::println("  build                               - build using the 'build.quip' script")
-    std::io::println("  run                                 - run the compiled code")
-    std::io::println("  help                                - show this help message")
+    std::io::println("Commands:")
+    std::io::println("  compile <file.quip>                     Compile a source file")
+    std::io::println("  build [step] [options] -- [args]         Build using build.quip")
+    std::io::println("  run [file] [options] -- [args]          Build and run (default: src/main.quip)")
+    std::io::println("  init <directory>                        Create a project")
+    std::io::println("  help, -h, --help                        Show this help")
+    std::io::println("  -V, --version                           Show the current version")
     std::io::println("")
-    std::io::println("flags:")
-    std::io::println("  -o, --output <path/to/executable>   - specify the output path for the executable")
+    std::io::println("Build and output options:")
+    std::io::println("  -o, --output <path>                     Set the executable output path")
+    std::io::println("  --name <name>                           Name the binary in target/<profile>")
+    std::io::println("  --debug, -g, --release                  Select the profile (default: debug)")
+    std::io::println("  --link <path>                           Link a native library file")
+    std::io::println("  --entry <name>                          Select the entry function")
+    std::io::println("  --platform <macos|linux|windows>        Select the target platform")
+    std::io::println("  --alias=(\"name\",\"path\")               Register an import alias (quote the tuple)")
+    std::io::println("")
+    std::io::println("LLVM options:")
+    std::io::println("  -O2, -O3                                Select standard or aggressive optimization")
+    std::io::println("  -Os                                     Optimize for code size")
+    std::io::println("  --emit-llvm                             Print LLVM IR and stop")
+    std::io::println("  --keep-llvm                             Retain intermediate LLVM IR files")
+    std::io::println("")
+    std::io::println("Diagnostic options:")
+    std::io::println("  --hide-warnings                         Hide warnings")
+    std::io::println("  --emit-mir                              Print MIR and stop")
+    std::io::println("  --emit-mem                              Print memory analysis and stop")
+    std::io::println("  --memory-dump                           Show memory analysis details")
+    std::io::println("")
+    std::io::println("")
+    std::io::println("Display options:")
+    std::io::println("  --no-progress                           Disable progress output")
+    std::io::println("  --verbose, --show-debug                 Show compiler commands")
 }

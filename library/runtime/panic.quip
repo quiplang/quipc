@@ -1,0 +1,14 @@
+@pure @const {
+    @target "macos" make os = @import "platform/macos.quip"
+    @target "linux" make os = @import "platform/linux.quip"
+}
+
+
+@unsafe @external @intrinsic "constant_address:thread 'main' panicked at '%s', %s:%d\n"
+make quip_panic_format () -> ptr<char>
+
+@pub @unsafe @export "__quip_panic"
+make runtime_panic (message: ptr<char>, file: ptr<char>, line: i32) -> void {
+    os::dprintf(2, quip_panic_format(), message, file, line)
+    os::abort()
+}

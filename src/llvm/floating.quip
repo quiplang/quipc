@@ -1,0 +1,117 @@
+@pure @const {
+    make api = @import "bindings.quip"
+}
+
+@pub
+make is_float (ty: str) -> bool {
+    return ty == "float" || ty == "f32" || ty == "f64"
+}
+
+@pub
+make supports_literal (raw: str) -> bool {
+    // The lexer has already validated the digits and decimal point.
+    return raw.len() < 2 || raw[0] != '0' ||
+        (raw[1] != 'x' && raw[1] != 'X' && raw[1] != 'b' && raw[1] != 'B')
+}
+
+/// Normalizes decimal literals before passing them to LLVM.
+@pub
+make spelling (raw: str) -> str {
+    make text: str = ""
+    for c : raw.iter() {
+        if c != '_' { text.push(c) }
+    }
+    if text.len() > 0 && text[text.len() - 1] == '.' { text.push('0') }
+    return text
+}
+
+// LLVMOpcode and LLVMRealPredicate values from llvm-c/Core.h.
+make opcode (op: str) -> i32 {
+    if op == "+" { return 9 }
+    if op == "-" { return 11 }
+    if op == "*" { return 13 }
+    if op == "/" { return 16 }
+    if op == "%" { return 19 }
+    return 0
+}
+
+make predicate (op: str) -> i32 {
+    if op == "==" { return 1 }
+    if op == ">" { return 2 }
+    if op == ">=" { return 3 }
+    if op == "<" { return 4 }
+    if op == "<=" { return 5 }
+    if op == "!=" { return 14 }
+    return 0
+}
+
+@pub
+make supports (op: str) -> bool {
+    return opcode(op.copy()) != 0 || predicate(op) != 0
+}
+
+/// Quip's scalar ABI transports floats as bits in a 64-bit word.
+@pub
+make type Lowering {
+    make i32_type: ptr<any>
+    make word: ptr<any>
+    make single: ptr<any>
+    make double: ptr<any>
+    make builder: ptr<any>
+    make unnamed: str = ""
+
+    @pub @unsafe
+    make create (context: ptr<any>, builder: ptr<any>) -> Lowering {
+        return Lowering {
+            i32_type = api::LLVMInt32TypeInContext(context),
+            word = api::LLVMInt64TypeInContext(context),
+            single = api::LLVMFloatTypeInContext(context),
+            double = api::LLVMDoubleTypeInContext(context),
+            builder = builder,
+        }
+    }
+
+    @this @unsafe
+    make from_word (value: ptr<any>, single: bool) -> ptr<any> {
+        if single {
+            make bits = api::LLVMBuildTrunc(this.builder, value, this.i32_type, this.unnamed.data)
+            return api::LLVMBuildBitCast(this.builder, bits, this.single, this.unnamed.data)
+        }
+        return api::LLVMBuildBitCast(this.builder, value, this.double, this.unnamed.data)
+    }
+
+    @this @unsafe
+    make to_word (value: ptr<any>, single: bool) -> ptr<any> {
+        if single {
+            make bits = api::LLVMBuildBitCast(this.builder, value, this.i32_type, this.unnamed.data)
+            return api::LLVMBuildZExt(this.builder, bits, this.word, this.unnamed.data)
+        }
+        return api::LLVMBuildBitCast(this.builder, value, this.word, this.unnamed.data)
+    }
+
+    @pub @this @unsafe
+    make constant (raw: str, single: bool) -> ptr<any> {
+        make text = spelling(raw)
+        make ty = this.double
+        if single { ty = this.single }
+        return this.to_word(api::LLVMConstRealOfString(ty, text.data), single)
+    }
+
+    @pub @this @unsafe
+    make negate (value: ptr<any>, single: bool) -> ptr<any> {
+        make floating = this.from_word(value, single)
+        return this.to_word(api::LLVMBuildFNeg(this.builder, floating, this.unnamed.data), single)
+    }
+
+    @pub @this @unsafe
+    make binary (op: str, left: ptr<any>, right: ptr<any>, single: bool) -> ptr<any> {
+        make a = this.from_word(left, single)
+        make b = this.from_word(right, single)
+        make pred = predicate(op.copy())
+        if pred != 0 {
+            make compared = api::LLVMBuildFCmp(this.builder, pred, a, b, this.unnamed.data)
+            return api::LLVMBuildZExt(this.builder, compared, this.word, this.unnamed.data)
+        }
+        return this.to_word(api::LLVMBuildBinOp(this.builder, opcode(op), a, b, this.unnamed.data), single)
+    }
+}

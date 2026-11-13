@@ -1,63 +1,95 @@
 @pure @const {
+
     make os: unit = @import "../os/pkg.quip"
 
-    make collections: unit = @import "../collections/pkg.quip"
+    make mem: unit = @import "../mem/pkg.quip"
+    make ffi: unit = @import "../ffi/c.quip"
 
     make math: unit = @import "../math/pkg.quip"
+}
+
+make __path_split (buffer: variant<String, str, ptr<char>>, c: char) -> str[] {
+    make s: str = match buffer {
+        x: str => x
+        y: String => y.to_str()
+        z: ptr<char> => z.to_str()
+        _ => ""
+    }
+
+    make result: str[] = []
+    make current: str = ""
+    make i: int = 0
+
+    while i < s.len() {
+        if s[i] == c {
+            if current.len() > 0 {
+                result.push(current + "")
+                current = ""
+            }
+        } else {
+            current = current + s[i]
+        }
+
+        i = i + 1
+    }
+
+    if current.len() > 0 {
+        result.push(current + "")
+    }
+
+    return result
 }
 
 @pub
 make type Path {
 
-    make content: str[]
-    make is_absolute: bool
+    @pub {
+        make content: str[] = []
+        make is_absolute: bool = false
+    }
 
     @target "macos" {
         @const make delimeter: char = '/'
     }
 
-    // @target "windows" {
-    //     @const make delimeter: char = '\\'
-    // }
 
     @pub
     make create (buffer: variant<String, str, ptr<char>>) -> Path {
         make path = Path {}
 
-        match buffer {
-            a: String {
-                path.is_absolute = a.len() > 0 && a[0] == path.delimeter
-            }
-
-            b: str {
-                path.is_absolute = b.len() > 0 && b[0] == path.delimeter
-            }
-
-            c: ptr<char> {
-                make t = c.to_str()
-                path.is_absolute = t.len() > 0 && t[0] == path.delimeter
-            }
+        make text: str = match buffer {
+            a: String => a.to_str()
+            b: str => b
+            c: ptr<char> => c.to_str()
+            _ => ""
         }
 
-        path.content = collections::split(buffer, path.delimeter)
+        if text.len() > 0 {
+            path.is_absolute = text[0] == path.delimeter
+        }
+
+        path.content = __path_split(text, path.delimeter)
 
         // resolve '~' (home directory) so it is not passed to the system
-        if path.content.len() > 0 && path.content[0] == "~" {
-            make home_parts = collections::split(os::getenv("HOME"), path.delimeter)
-            make resolved: str[] = []
+        if path.content.len() > 0 {
+            if path.content[0] == "~" {
 
-            for p : home_parts.iter() {
-                resolved.push(p)
+                @unsafe make home_parts = __path_split(os::getenv("HOME"), path.delimeter)
+                make resolved: str[] = []
+
+                for p : home_parts.iter() {
+                    resolved.push(p !)
+                }
+
+                make i: int = 1
+                while i < path.content.len() {
+                    resolved.push(path.content[i].copy())
+                    i = i + 1
+                }
+
+                path.content = resolved
+                path.is_absolute = true
             }
-
-            make i: int = 1
-            while i < path.content.len() {
-                resolved.push(path.content[i])
-                i = i + 1
-            }
-
-            path.content = resolved
-            path.is_absolute = true
         }
 
         return path
@@ -66,15 +98,19 @@ make type Path {
     @pub @this
     make get () -> str {
         make path: str = ""
+
         if this.is_absolute {
             path = path + this.delimeter
         }
+
         make i: int = 0
         while i < this.content.len() {
             path = path + this.content[i]
+
             if i < this.content.len() - 1 {
                 path = path + this.delimeter
             }
+
             i = i + 1
         }
 
@@ -90,8 +126,7 @@ make type Path {
             }
         }
 
-        make t = os::getcwd()
-        make cwd = Path.create(t)
+        make cwd = Path.create(os::getcwd())
         make result = Path {}
 
         for i : cwd.content.iter() {

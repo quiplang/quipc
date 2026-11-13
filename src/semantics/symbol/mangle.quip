@@ -1,0 +1,118 @@
+// Stable module-scoped symbols: f = free function, a = attached function,
+// t = nominal type identity, v = global variable accessor. External C symbols
+// and the entry wrapper retain their ABI names.
+// attached_name is only the temporary spelling used during HIR lowering.
+
+@pure @const {
+    make std = @import "std"
+}
+
+/// constructs the internal name of an attached function.
+@pub
+make attached_name (owner: str, name: str) -> str {
+    make out: str = ""
+    make i: uint = 0
+
+    while i < owner.len() {
+        out = out + owner[i]
+        i = i + 1
+    }
+
+    out = out + "__"
+
+    make j: uint = 0
+
+    while j < name.len() {
+        out = out + name[j]
+        j = j + 1
+    }
+
+    return out
+}
+
+// one FNV-1a step over byte `c` (kept separate so the `char`-to-`uint` cast is not combined
+// with a string index, which the reference compiler miscompiles)
+@pub
+make fnv_step (h: uint, c: char) -> uint {
+    @unsafe make raw: uint = c
+    make b: uint = raw & 255
+
+    return ((h ^ b) * 16777619) & 4294967295
+}
+
+// 32-bit FNV-1a over the bytes of `s`
+@pub
+make fnv1a (s: str) -> uint {
+    make h: uint = 2166136261
+    make i: uint = 0
+
+    while i < s.len() {
+        make c = s[i]
+        h = fnv_step(h, c)
+        i = i + 1
+    }
+
+    return h
+}
+
+// the low 28 bits of a hash, as 7 uppercase hex digits
+@pub
+make hex7 (v: uint) -> str {
+    make digits = "0123456789ABCDEF"
+    make out: str = ""
+    make k: uint = 0
+
+    while k < 7 {
+        make nib = (v >> ((6 - k) * 4)) & 15
+        out.push(digits[nib])
+        k = k + 1
+    }
+
+    return out
+}
+
+// cross-module symbol for a free function defined in `module` (a source path such as "src/io/posix.quip")
+/// constructs a link symbol for a module-level function.
+@pub
+make free_symbol (module: str, name: str) -> str {
+    @unsafe make h = fnv1a(module + "_" + (name !))
+
+    return name + "_f" + hex7(h >> 4)
+}
+
+// cross-module symbol for an attached function defined in `module`
+/// constructs a link symbol for an attached function.
+@pub
+make attached_symbol (module: str, owner: str, name: str) -> str {
+    return attached_link_symbol(module, attached_name(owner, name))
+}
+
+/// constructs the link symbol for a lowered attached function.
+@pub
+make attached_link_symbol (module: str, lowered: str) -> str {
+    make readable: str = ""
+    make i: uint = 0
+
+    while i < lowered.len() {
+        if lowered[i] == '[' || lowered[i] == ']' || lowered[i] == ':' { readable.push('_') }
+        else { readable.push(lowered[i]) }
+
+        if lowered[i] == '_' && i + 1 < lowered.len() && lowered[i + 1] == '_' { i = i + 1 }
+
+        i = i + 1
+    }
+
+    @unsafe return readable + "_a" + hex7(fnv1a(module + "::" + lowered) >> 4)
+}
+
+/// constructs a link symbol for a type declaration.
+@pub
+make type_symbol (module: str, name: str) -> str {
+    @unsafe return name + "_t" + hex7(fnv1a(module + "::" + name) >> 4)
+}
+
+/// constructs a link symbol for a variable declaration.
+@pub
+make variable_symbol (module: str, name: str) -> str {
+    @unsafe return name + "_v" + hex7(fnv1a(module + "::" + name) >> 4)
+}

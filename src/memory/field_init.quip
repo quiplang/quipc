@@ -1,0 +1,353 @@
+@pure @const {
+    make lexer = @import "../core/token.quip"
+    make facts = @import "../analysis/facts.quip"
+    make hir = @import "../hir/hir.quip"
+    make util = @import "../util/pkg.quip"
+    make diags = @import "../diag/diagnosis.quip"
+    make e = @import "../diag/err.quip"
+}
+
+// Check one incomplete field. Access to a different direct field does not
+// read this one; an access to the whole local can observe every field.
+make expr_mentions_field (body: ref<hir::HirBody>, idx: uint, local: uint, field: str, depth: uint) -> bool {
+    if idx >= body.*.exprs.len() || depth >= 64 { return true }
+
+    make ex = body.*.exprs[idx].pin
+
+    if ex.*.kind == hir::HirExprKind.Local { return ex.*.local == local }
+
+    if ex.*.kind == hir::HirExprKind.Field && ex.*.lhs < body.*.exprs.len() {
+        make base = body.*.exprs[ex.*.lhs].pin
+
+        if base.*.kind == hir::HirExprKind.Local && base.*.local == local { return ex.*.name == field }
+    }
+
+    if ex.*.kind == hir::HirExprKind.Literal || ex.*.kind == hir::HirExprKind.Path || ex.*.kind == hir::HirExprKind.EnumVariant || ex.*.kind == hir::HirExprKind.Sizeof { return false }
+
+    if ex.*.kind == hir::HirExprKind.Error || ex.*.kind == hir::HirExprKind.Unsupported || ex.*.kind == hir::HirExprKind.Match || ex.*.kind == hir::HirExprKind.Lambda { return true }
+
+    if ex.*.kind == hir::HirExprKind.Binary || ex.*.kind == hir::HirExprKind.Index {
+        return expr_mentions_field(body, ex.*.lhs, local, field.copy(), depth + 1) || expr_mentions_field(body, ex.*.rhs, local, field.copy(), depth + 1)
+    }
+
+    if ex.*.kind == hir::HirExprKind.Unary || ex.*.kind == hir::HirExprKind.Update || ex.*.kind == hir::HirExprKind.Field || ex.*.kind == hir::HirExprKind.Deref || ex.*.kind == hir::HirExprKind.Pin || ex.*.kind == hir::HirExprKind.Copy {
+        return expr_mentions_field(body, ex.*.lhs, local, field, depth + 1)
+    }
+
+    if ex.*.kind == hir::HirExprKind.Call && expr_mentions_field(body, ex.*.lhs, local, field.copy(), depth + 1) { return true }
+
+    make i = 0
+    while i < ex.*.args.len() {
+        if expr_mentions_field(body, ex.*.args[i], local, field.copy(), depth + 1) { return true }
+
+        i = i + 1
+    }
+
+    return false
+}
+
+// Facts for paths on which a particular field is still uninitialized.
+// A boolean fact is 0 (unknown), 1 (false), or 2 (true).
+make type FieldInitFacts {
+    make reachable: bool = true
+    make bad: bool = false
+    make bools: uint[] = []
+}
+
+make field_facts_copy (source: ref<FieldInitFacts>) -> FieldInitFacts {
+    make result = FieldInitFacts {}
+    result.reachable = source.*.reachable
+    result.bad = source.*.bad
+
+    for value : source.*.bools { result.bools.push(value) }
+
+    return result
+}
+
+make field_facts_merge (into: ref<FieldInitFacts>, other: ref<FieldInitFacts>) -> void {
+    if other.*.bad { into.*.bad = true }
+
+    if !other.*.reachable { return }
+
+    if !into.*.reachable {
+        into.*.reachable = true
+        make i = 0
+        while i < into.*.bools.len() { into.*.bools[i] = other.*.bools[i] i = i + 1 }
+
+        return
+    }
+
+    make i = 0
+    while i < into.*.bools.len() {
+        if into.*.bools[i] != other.*.bools[i] { into.*.bools[i] = 0 }
+
+        i = i + 1
+    }
+}
+
+make field_forget_bools (facts: ref<FieldInitFacts>) -> void {
+    make i = 0
+    while i < facts.*.bools.len() { facts.*.bools[i] = 0 i = i + 1 }
+}
+
+make field_bool_value (body: ref<hir::HirBody>, index: uint, facts: ref<FieldInitFacts>) -> uint {
+    if index >= body.*.exprs.len() { return 0 }
+
+    make expression = body.*.exprs[index].pin
+
+    if expression.*.kind == hir::HirExprKind.Literal {
+        if expression.*.lit.kind == lexer::TokenKind.KeyFalse { return 1 }
+
+        if expression.*.lit.kind == lexer::TokenKind.KeyTrue { return 2 }
+    }
+
+    if expression.*.kind == hir::HirExprKind.Local && expression.*.local < facts.*.bools.len() { return facts.*.bools[expression.*.local] }
+
+    return 0
+}
+
+// An error handler is another control-flow path. It must leave the function
+// or initialize the field before ordinary evaluation can resume.
+make field_check_catches (body: ref<hir::HirBody>, index: uint, local: uint, field: str, facts: ref<FieldInitFacts>, depth: uint) -> void {
+    if index >= body.*.exprs.len() || depth >= 64 { facts.*.bad = true return }
+
+    make expr = body.*.exprs[index].pin
+
+    if expr.*.has_catch {
+        make failure = field_facts_copy(facts)
+        field_forget_bools(failure.pin)
+        field_facts_block(body, expr.*.catch_block, 0, local, field.copy(), failure.pin, depth + 1)
+
+        if failure.bad || failure.reachable { facts.*.bad = true return }
+    }
+
+    if expr.*.kind == hir::HirExprKind.Binary || expr.*.kind == hir::HirExprKind.Index {
+        field_check_catches(body, expr.*.lhs, local, field.copy(), facts, depth + 1)
+        field_check_catches(body, expr.*.rhs, local, field.copy(), facts, depth + 1)
+    } elif expr.*.kind == hir::HirExprKind.Unary || expr.*.kind == hir::HirExprKind.Update || expr.*.kind == hir::HirExprKind.Field || expr.*.kind == hir::HirExprKind.Deref || expr.*.kind == hir::HirExprKind.Pin || expr.*.kind == hir::HirExprKind.Copy || expr.*.kind == hir::HirExprKind.Call {
+        field_check_catches(body, expr.*.lhs, local, field.copy(), facts, depth + 1)
+    }
+
+    make i = 0
+    while i < expr.*.args.len() {
+        field_check_catches(body, expr.*.args[i], local, field.copy(), facts, depth + 1)
+        i = i + 1
+    }
+}
+
+// Check the paths that still lack this field. Initialized paths leave this
+// analysis; this retains facts such as "uninitialized implies flag is false".
+make field_facts_block (body: ref<hir::HirBody>, block: uint, start: uint, local: uint, field: str, facts: ref<FieldInitFacts>, depth: uint) -> void {
+    if block >= body.*.blocks.len() || depth >= 64 { facts.*.bad = true return }
+
+    make i = start
+    while i < body.*.blocks[block].stmts.len() && facts.*.reachable && !facts.*.bad {
+        make id = body.*.blocks[block].stmts[i]
+
+        if id >= body.*.stmts.len() { facts.*.bad = true return }
+
+        make stmt = body.*.stmts[id].pin
+
+        if stmt.*.has_value {
+            field_check_catches(body, stmt.*.value, local, field.copy(), facts, depth + 1)
+
+            if facts.*.bad { return }
+        }
+
+        if stmt.*.kind == hir::HirStmtKind.Assign && stmt.*.target < body.*.exprs.len() && stmt.*.has_value {
+            make target = body.*.exprs[stmt.*.target].pin
+
+            if target.*.kind == hir::HirExprKind.Field && target.*.lhs < body.*.exprs.len() {
+                make base = body.*.exprs[target.*.lhs].pin
+
+                if base.*.kind == hir::HirExprKind.Local && base.*.local == local && target.*.name == field {
+                    if stmt.*.op.kind != lexer::TokenKind.Equal || expr_mentions_field(body, stmt.*.value, local, field.copy(), 0) { facts.*.bad = true return }
+
+                    facts.*.reachable = false
+                    return
+                }
+            }
+
+            if expr_mentions_field(body, stmt.*.target, local, field.copy(), 0) || expr_mentions_field(body, stmt.*.value, local, field.copy(), 0) { facts.*.bad = true return }
+
+            if target.*.kind == hir::HirExprKind.Local && target.*.local < facts.*.bools.len() {
+                make value: uint = 0
+
+                if stmt.*.op.kind == lexer::TokenKind.Equal { value = field_bool_value(body, stmt.*.value, facts) }
+
+                field_forget_bools(facts)
+                facts.*.bools[target.*.local] = value
+            } else { field_forget_bools(facts) }
+        } elif stmt.*.kind == hir::HirStmtKind.Let {
+            if stmt.*.has_value && expr_mentions_field(body, stmt.*.value, local, field.copy(), 0) { facts.*.bad = true return }
+
+            make value: uint = 0
+
+            if stmt.*.has_value { value = field_bool_value(body, stmt.*.value, facts) }
+
+            field_forget_bools(facts)
+
+            if stmt.*.local < facts.*.bools.len() { facts.*.bools[stmt.*.local] = value }
+        } elif stmt.*.kind == hir::HirStmtKind.If {
+            if !stmt.*.has_value || expr_mentions_field(body, stmt.*.value, local, field.copy(), 0) { facts.*.bad = true return }
+
+            make condition = field_bool_value(body, stmt.*.value, facts)
+            make yes = field_facts_copy(facts)
+            make no = field_facts_copy(facts)
+
+            if condition == 1 { yes.reachable = false }
+
+            if condition == 2 { no.reachable = false }
+
+            if stmt.*.value < body.*.exprs.len() {
+                make expr = body.*.exprs[stmt.*.value].pin
+
+                if expr.*.kind == hir::HirExprKind.Local && expr.*.local < facts.*.bools.len() {
+                    yes.bools[expr.*.local] = 2
+                    no.bools[expr.*.local] = 1
+                } else { field_forget_bools(yes.pin) field_forget_bools(no.pin) }
+            }
+
+            if yes.reachable { field_facts_block(body, stmt.*.then_block, 0, local, field.copy(), yes.pin, depth + 1) }
+
+            if no.reachable && stmt.*.has_else { field_facts_block(body, stmt.*.else_block, 0, local, field.copy(), no.pin, depth + 1) }
+
+            facts.*.reachable = false
+            field_facts_merge(facts, yes.pin)
+            field_facts_merge(facts, no.pin)
+        } elif stmt.*.kind == hir::HirStmtKind.Match {
+            if !stmt.*.has_value || expr_mentions_field(body, stmt.*.value, local, field.copy(), 0) { facts.*.bad = true return }
+
+            if stmt.*.value < body.*.exprs.len() && body.*.exprs[stmt.*.value].kind != hir::HirExprKind.Local && body.*.exprs[stmt.*.value].kind != hir::HirExprKind.Literal { field_forget_bools(facts) }
+
+            make combined = field_facts_copy(facts)
+            combined.reachable = false
+            make exhaustive = false
+            make has_some = false
+            make has_none = false
+            make ci = 0
+            while ci < stmt.*.cases.len() {
+                make case_id = stmt.*.cases[ci]
+
+                if case_id >= body.*.cases.len() { facts.*.bad = true return }
+
+                make arm = body.*.cases[case_id].pin
+
+                if arm.*.kind == hir::HirPatternKind.Wildcard || arm.*.kind == hir::HirPatternKind.Binding { exhaustive = true }
+
+                if arm.*.kind == hir::HirPatternKind.Some { has_some = true }
+
+                if arm.*.kind == hir::HirPatternKind.None { has_none = true }
+
+                make branch = field_facts_copy(facts)
+
+                if arm.*.has_result && expr_mentions_field(body, arm.*.result, local, field.copy(), 0) { branch.bad = true }
+
+                if arm.*.has_body { field_facts_block(body, arm.*.body, 0, local, field.copy(), branch.pin, depth + 1) }
+
+                field_facts_merge(combined.pin, branch.pin)
+                ci = ci + 1
+            }
+
+            if has_some && has_none { exhaustive = true }
+
+            if !exhaustive { field_facts_merge(combined.pin, facts) }
+
+            facts.*.reachable = false
+            field_facts_merge(facts, combined.pin)
+        } elif stmt.*.kind == hir::HirStmtKind.Block {
+            field_facts_block(body, stmt.*.then_block, 0, local, field.copy(), facts, depth + 1)
+        } elif stmt.*.kind == hir::HirStmtKind.Return {
+            if stmt.*.has_value && expr_mentions_field(body, stmt.*.value, local, field.copy(), 0) { facts.*.bad = true return }
+
+            facts.*.reachable = false
+        } elif stmt.*.kind == hir::HirStmtKind.Expr {
+            if stmt.*.has_value && expr_mentions_field(body, stmt.*.value, local, field.copy(), 0) { facts.*.bad = true return }
+
+            field_forget_bools(facts)
+        } else { facts.*.bad = true return }
+
+        i = i + 1
+    }
+}
+
+@pub
+make field_initialized_after (body: ref<hir::HirBody>, ex: ref<hir::HirExpr>, field: str) -> bool {
+    make b = 0
+
+    while b < body.*.blocks.len() {
+        make i = 0
+        while i < body.*.blocks[b].stmts.len() {
+            make si = body.*.blocks[b].stmts[i]
+
+            if si < body.*.stmts.len() {
+                make declaration = body.*.stmts[si].pin
+
+                if declaration.*.kind == hir::HirStmtKind.Let && declaration.*.has_value && declaration.*.value < body.*.exprs.len() {
+                    make value = body.*.exprs[declaration.*.value].pin
+
+                    if value.*.range.start.start == ex.*.range.start.start && value.*.range.end.end == ex.*.range.end.end {
+                        make facts = FieldInitFacts {}
+                        make n = 0
+
+                        while n < body.*.locals.len() { facts.bools.push(0) n = n + 1 }
+
+                        field_facts_block(body, b, i + 1, declaration.*.local, field, facts.pin, 0)
+                        return !facts.bad && !facts.reachable
+                    }
+                }
+            }
+
+            i = i + 1
+        }
+
+        b = b + 1
+    }
+
+    return false
+}
+
+// Resolved by type checking; validated by the memory checker.
+
+
+@pub
+make check (body: ref<hir::HirBody>, checks: ref<facts::FieldCheck[]>, structs: ref<hir::HirStructSig[]>, diag: ref<diags::Diagnostic>) -> void {
+    for candidate : checks.* {
+        make i: uint = 0
+        while i < body.*.exprs.len() {
+            make ex = body.*.exprs[i].pin
+
+            if ex.*.range.start.start == candidate.range.start.start && ex.*.range.end.end == candidate.range.end.end && ex.*.kind == hir::HirExprKind.Constructor {
+                if !field_initialized_after(body, ex, candidate.name.copy()) {
+                    make d = diags::Diag.err(e::Err.MissingFieldInitializer, candidate.range.copy(), "field `" + candidate.name.copy() + "` is not initialized")
+                    d.label("missing value for field `" + candidate.name.copy() + "` of type `" + candidate.owner.copy() + "`")
+
+                    for structure : structs.* {
+                        if structure.name == candidate.owner {
+                            match structure.source {
+                                none {}
+                                some {
+                                    for field : structure.fields {
+                                        if field.name == candidate.name {
+                                            d.*.attach(diags::Label.in_file(structure.path.copy(), some.*.copy(), util::Range.of(field.name_span.start, field.name_span.end), "field `" + candidate.name.copy() + "` declared here"))
+                                            break
+                                        }
+                                    }
+
+                                    d.*.attach(diags::Label.in_file(structure.path.copy(), some.*.copy(), util::Range.of(structure.name_span.start, structure.name_span.end), "type `" + structure.display_name.copy() + "` defined here"))
+                                }
+                            }
+                            break
+                        }
+                    }
+
+                    diag.*.report(d)
+                }
+
+                break
+            }
+
+            i = i + 1
+        }
+    }
+}

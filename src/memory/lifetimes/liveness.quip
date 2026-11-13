@@ -1,0 +1,261 @@
+// per-local liveness state used by the forward dataflow
+//
+// a state is the set of positions a local can be in at a program point:
+// Uninitialized, Alive, Moved, Pinned, Dead (+ the heap obligation flag `owned`);
+// states are merged with a union. A possible move invalidates a use, while
+// a possible uninitialized state invalidates a use; dead states are reported only
+// when no alive state remains.
+
+/// stores the possible lifetime and ownership states of each mir local.
+@pub
+make type LocalState {
+    @pub make active_pins: uint[] = []
+    @pub make pin_site: uint[] = []
+    @pub make move_site: uint[] = []
+    @pub make dead_site: uint[] = []
+    @pub make uninit: uint[] = []
+    @pub make alive: uint[] = []
+    @pub make moved: uint[] = []
+    @pub make pinned: uint[] = []
+    @pub make dead: uint[] = []
+    @pub make owned: uint[] = []
+}
+
+@pub
+make create (n: uint, npins: uint) -> LocalState {
+    make s = LocalState {}
+
+    make i = 0
+
+    while i < n {
+        s.pin_site.push(0)
+        s.move_site.push(0)
+        s.dead_site.push(0)
+        s.uninit.push(0)
+        s.alive.push(0)
+        s.moved.push(0)
+        s.pinned.push(0)
+        s.dead.push(0)
+        s.owned.push(0)
+        i = i + 1
+    }
+
+    i = 0
+
+    while i < npins { s.active_pins.push(0) i = i + 1 }
+
+    return s
+}
+
+// `_0` stays uninit, parameters enter the function alive
+/// marks parameters and captures alive at the function entry.
+@pub
+make init_entry (s: ref<LocalState>, param_count: uint, captures: ref<uint[]>) -> void {
+    make i = 1
+
+    while i <= param_count {
+        s.*.alive[i] = 1
+        i = i + 1
+    }
+
+    for local : captures.* { s.*.alive[local] = 1 }
+
+    return
+}
+
+/// copies all per-local lifetime flags and event sites.
+@pub
+make copy_of (s: ref<LocalState>) -> LocalState {
+    make out = LocalState {}
+
+    make i = 0
+
+    while i < s.*.alive.len() {
+        out.pin_site.push(s.*.pin_site[i])
+        out.move_site.push(s.*.move_site[i])
+        out.dead_site.push(s.*.dead_site[i])
+        out.uninit.push(s.*.uninit[i])
+        out.alive.push(s.*.alive[i])
+        out.moved.push(s.*.moved[i])
+        out.pinned.push(s.*.pinned[i])
+        out.dead.push(s.*.dead[i])
+        out.owned.push(s.*.owned[i])
+        i = i + 1
+    }
+
+    for active : s.*.active_pins { out.active_pins.push(active) }
+
+    return out
+}
+
+// overwrite every flag of `dst` with the value from `src`, reusing `dst`'s
+// arrays (no allocation, so `dst` stays the sole owner)
+@pub
+make reset_to (dst: ref<LocalState>, src: ref<LocalState>) -> void {
+    make i = 0
+
+    while i < dst.*.alive.len() {
+        dst.*.pin_site[i] = src.*.pin_site[i]
+        dst.*.move_site[i] = src.*.move_site[i]
+        dst.*.dead_site[i] = src.*.dead_site[i]
+        dst.*.uninit[i] = src.*.uninit[i]
+        dst.*.alive[i] = src.*.alive[i]
+        dst.*.moved[i] = src.*.moved[i]
+        dst.*.pinned[i] = src.*.pinned[i]
+        dst.*.dead[i] = src.*.dead[i]
+        dst.*.owned[i] = src.*.owned[i]
+        i = i + 1
+    }
+
+    i = 0
+
+    while i < dst.*.active_pins.len() { dst.*.active_pins[i] = src.*.active_pins[i] i = i + 1 }
+
+    return
+}
+
+/// checks whether two local states have the same flags and diagnostic sites.
+@pub
+make equal (a: ref<LocalState>, b: ref<LocalState>) -> bool {
+    if a.*.alive.len() != b.*.alive.len() { return false }
+
+    make i: uint = 0
+
+    while i < a.*.alive.len() {
+        if a.*.pin_site[i] != b.*.pin_site[i] || a.*.move_site[i] != b.*.move_site[i]
+            || a.*.dead_site[i] != b.*.dead_site[i] || a.*.uninit[i] != b.*.uninit[i]
+            || a.*.alive[i] != b.*.alive[i] || a.*.moved[i] != b.*.moved[i]
+            || a.*.pinned[i] != b.*.pinned[i] || a.*.dead[i] != b.*.dead[i]
+            || a.*.owned[i] != b.*.owned[i] { return false }
+
+            i = i + 1
+    }
+
+    i = 0
+
+    while i < a.*.active_pins.len() {
+        if a.*.active_pins[i] != b.*.active_pins[i] { return false }
+
+        i = i + 1
+    }
+
+    return true
+}
+
+// overwrite `dst` with `src`, returning true when any flag changed
+@pub
+make assign_changed (dst: ref<LocalState>, src: ref<LocalState>) -> bool {
+    make changed = false
+
+    make i = 0
+
+    while i < dst.*.alive.len() {
+        dst.*.pin_site[i] = src.*.pin_site[i]
+        dst.*.move_site[i] = src.*.move_site[i]
+        dst.*.dead_site[i] = src.*.dead_site[i]
+
+        if dst.*.uninit[i] != src.*.uninit[i] {
+            dst.*.uninit[i] = src.*.uninit[i]
+            changed = true
+        }
+
+        if dst.*.alive[i] != src.*.alive[i] {
+            dst.*.alive[i] = src.*.alive[i]
+            changed = true
+        }
+
+        if dst.*.moved[i] != src.*.moved[i] {
+            dst.*.moved[i] = src.*.moved[i]
+            changed = true
+        }
+
+        if dst.*.pinned[i] != src.*.pinned[i] {
+            dst.*.pinned[i] = src.*.pinned[i]
+            changed = true
+        }
+
+        if dst.*.dead[i] != src.*.dead[i] {
+            dst.*.dead[i] = src.*.dead[i]
+            changed = true
+        }
+
+        if dst.*.owned[i] != src.*.owned[i] {
+            dst.*.owned[i] = src.*.owned[i]
+            changed = true
+        }
+
+        i = i + 1
+    }
+
+    i = 0
+
+    while i < dst.*.active_pins.len() {
+        if dst.*.active_pins[i] != src.*.active_pins[i] { dst.*.active_pins[i] = src.*.active_pins[i] changed = true }
+
+        i = i + 1
+    }
+
+    return changed
+}
+
+// union merge, returns true when `dst` grew
+/// merges possible local states from another control-flow path.
+@pub
+make merge_into (dst: ref<LocalState>, src: ref<LocalState>) -> bool {
+    make changed = false
+
+    make i = 0
+
+    while i < dst.*.alive.len() {
+        if src.*.uninit[i] != 0 && dst.*.uninit[i] == 0 {
+            dst.*.uninit[i] = 1
+            changed = true
+        }
+
+        if src.*.alive[i] != 0 && dst.*.alive[i] == 0 {
+            dst.*.alive[i] = 1
+            changed = true
+        }
+
+        if src.*.moved[i] != 0 && dst.*.moved[i] == 0 {
+            dst.*.moved[i] = 1
+            dst.*.move_site[i] = src.*.move_site[i]
+            changed = true
+        }
+
+        if src.*.pinned[i] != 0 && dst.*.pinned[i] == 0 {
+            dst.*.pinned[i] = 1
+            dst.*.pin_site[i] = src.*.pin_site[i]
+            changed = true
+        }
+
+        if src.*.dead[i] != 0 && dst.*.dead[i] == 0 {
+            dst.*.dead[i] = 1
+            dst.*.dead_site[i] = src.*.dead_site[i]
+            changed = true
+        }
+
+        if src.*.owned[i] != 0 && dst.*.owned[i] == 0 {
+            dst.*.owned[i] = 1
+            changed = true
+        }
+
+        i = i + 1
+    }
+
+    i = 0
+
+    while i < dst.*.active_pins.len() {
+        if src.*.active_pins[i] != 0 && dst.*.active_pins[i] == 0 { dst.*.active_pins[i] = 1 changed = true }
+
+        i = i + 1
+    }
+
+    return changed
+}
+
+// the local still holds a usable value (pinned locals keep their value)
+@pub
+make has_value (s: ref<LocalState>, local: uint) -> bool {
+    return s.*.alive[local] != 0 || s.*.pinned[local] != 0
+}

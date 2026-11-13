@@ -1,18 +1,129 @@
+/// identifies compiler error categories.
 @pub
 make enum Err {
     None,
 
+    Internal,
+
+    // parser
     UnexpectedToken,
     UnexpectedEndOfFile,
     InvalidSyntax,
+    UnexpectedNode,
+    InvalidState,
 
-
-
+    // semantic
+    MissingEntryPoint,
+    EntryPointNotPublic,
     BadNodeKind,
+    TypeMismatch,
+    UnexpectedAutoType,
+    MissingTypeDeclaration,
+    TypeAliasNotPure,
+    DuplicateSymbol,
+    UnknownField,
+    MissingFieldInitializer,
+    UnknownAttachedFunc,
+    UnknownNamespace,
+    UnsafeRequired,
+    PrivateField,
+    UnknownSymbol,
 
+    // memory
+    RefOutlivesSource,
+    ReturnStackRef,
+    FreeWhileReferenced,
+    UseAfterMove,
+    UseOfUninitialized,
+    MoveWhilePinned,
+    AlreadyPinned,
+    AssignWhilePinned,
+    UseAfterScope,
 }
 
+/// identifies compiler warning categories.
 @pub
 make enum Warn {
     None,
+}
+
+/// returns the external code for an error category.
+@pub
+make err_code (code: Err) -> str {
+    match code {
+        Err.Internal { return "E0000" }
+        // parser 0000+
+        Err.UnexpectedToken { return "E0001" }
+
+        Err.UnexpectedEndOfFile { return "E0002" }
+
+        Err.InvalidSyntax { return "E0003" }
+
+        Err.UnexpectedNode { return "E0004" }
+
+        Err.InvalidState { return "E0005" }
+
+        // semantic 1000+
+        Err.MissingEntryPoint { return "E1000" }
+
+        Err.EntryPointNotPublic { return "E1001" }
+
+        Err.BadNodeKind { return "E1002" }
+
+        Err.TypeMismatch { return "E1003" }
+
+        Err.UnexpectedAutoType { return "E1004" }
+
+        Err.MissingTypeDeclaration { return "E1005" }
+
+        Err.TypeAliasNotPure { return "E1006" }
+
+        Err.DuplicateSymbol { return "E1007" }
+
+        Err.UnknownField { return "E1008" }
+
+        Err.MissingFieldInitializer { return "E1014" }
+
+        Err.UnknownAttachedFunc { return "E1009" }
+
+        Err.UnknownNamespace { return "E1011" }
+
+        Err.UnsafeRequired { return "E1010" }
+
+        Err.PrivateField { return "E1012" }
+
+        Err.UnknownSymbol { return "E1013" }
+
+        // memory 2000+
+        Err.RefOutlivesSource { return "E2000" }
+
+        Err.ReturnStackRef { return "E2001" }
+
+        Err.FreeWhileReferenced { return "E2002" }
+
+        Err.UseAfterMove { return "E2003" }
+
+        Err.UseOfUninitialized { return "E2004" }
+
+        Err.MoveWhilePinned { return "E2005" }
+
+        Err.AlreadyPinned { return "E2006" }
+
+        Err.AssignWhilePinned { return "E2007" }
+
+        Err.UseAfterScope { return "E2008" }
+        _ { return "" }
+    }
+
+    return ""
+}
+
+/// returns the external code for a warning category.
+@pub
+make warn_code (code: Warn) -> str {
+    match code {
+        _ { return "" }
+    }
+
+    return ""
 }

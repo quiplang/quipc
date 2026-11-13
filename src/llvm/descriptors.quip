@@ -1,0 +1,89 @@
+@pure @const {
+    make api = @import "bindings.quip"
+}
+
+@const make PrivateLinkage: i32 = 9
+
+@pub
+make type DescriptorField {
+    @pub make offset: uint = 0
+    @pub make schema: str = ""
+}
+
+@pub
+make type RuntimeDescriptor {
+    @pub make symbol: str = ""
+    @pub make kind: uint = 0
+    @pub make size: uint = 0
+    @pub make element: str = ""
+    @pub make fields: DescriptorField[] = []
+}
+
+@pub @unsafe
+make declare (context: ptr<any>, module: ptr<any>, symbol: str) {
+    make word = api::LLVMInt64TypeInContext(context)
+    make pointer = api::LLVMPointerTypeInContext(context, 0)
+    make types: ptr<any>[5] = [word, word, word, pointer, pointer]
+    @unsafe make first: ptr<ptr<any>> = types[0].pin
+    api::LLVMAddGlobal(module, api::LLVMStructTypeInContext(context, first, 5, 0), symbol.data)
+}
+
+@unsafe
+make descriptor_global (module: ptr<any>, symbol: str) -> ptr<any> {
+    return api::LLVMGetNamedGlobal(module, symbol.data)
+}
+
+@unsafe
+make initialize_constant (global: ptr<any>, value: ptr<any>) {
+    api::LLVMSetInitializer(global, value)
+    api::LLVMSetGlobalConstant(global, 1)
+    api::LLVMSetLinkage(global, PrivateLinkage)
+}
+
+@unsafe
+make build_fields (context: ptr<any>, module: ptr<any>, descriptor: ref<RuntimeDescriptor>, i64_type: ptr<any>, null_value: ptr<any>) -> ptr<any> {
+    if descriptor.*.fields.len() == 0 { return null_value }
+
+    make values: ptr<any>[] = []
+    for field : descriptor.*.fields {
+        make members: ptr<any>[2] = [
+            api::LLVMConstInt(i64_type, field.offset, 0),
+            descriptor_global(module, field.schema.copy()),
+        ]
+        @unsafe make member_ptr: ptr<ptr<any>> = members[0].pin
+        values.push(api::LLVMConstStructInContext(context, member_ptr, 2, 0))
+    }
+
+    @unsafe make value_ptr: ptr<ptr<any>> = values[0].pin
+    make array = api::LLVMConstArray2(api::LLVMTypeOf(values[0]), value_ptr, values.len())
+    make name = descriptor.*.symbol.copy() + ".fields"
+    make global = api::LLVMAddGlobal(module, api::LLVMTypeOf(array), name.data)
+    initialize_constant(global, array)
+    return global
+}
+
+/// Defines Quip's runtime ownership descriptors after all referenced globals have been declared.
+@pub @unsafe
+make build (context: ptr<any>, module: ptr<any>, descriptors: ref<RuntimeDescriptor[]>) {
+    make i64_type = api::LLVMInt64TypeInContext(context)
+    make null_value = api::LLVMConstNull(api::LLVMPointerTypeInContext(context, 0))
+
+    make i: uint = 0
+    while i < descriptors.*.len() {
+        make descriptor = descriptors.*[i].pin
+        make element = null_value
+        if descriptor.*.element.len() > 0 { element = descriptor_global(module, descriptor.*.element.copy()) }
+        make fields = build_fields(context, module, descriptor, i64_type, null_value)
+        make members: ptr<any>[5] = [
+            api::LLVMConstInt(i64_type, descriptor.*.kind, 0),
+            api::LLVMConstInt(i64_type, descriptor.*.size, 0),
+            api::LLVMConstInt(i64_type, descriptor.*.fields.len(), 0),
+            element,
+            fields,
+        ]
+        @unsafe make member_ptr: ptr<ptr<any>> = members[0].pin
+        make value = api::LLVMConstStructInContext(context, member_ptr, 5, 0)
+        initialize_constant(descriptor_global(module, descriptor.*.symbol.copy()), value)
+        i++
+    }
+}

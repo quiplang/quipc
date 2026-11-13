@@ -1,0 +1,516 @@
+// Allocation metadata and arena management are Quip. Native intrinsics supply
+// zeroed storage and raw callbacks.
+@pure @const {
+    @target "macos" make os = @import "platform/macos.quip"
+    @target "linux" make os = @import "platform/linux.quip"
+}
+
+make type Header {
+    make bytes: uint
+    make deallocate: ptr<any>
+    make context: ptr<any>
+    make previous: ptr<Header>
+    make next: ptr<Header>
+    make generation: uint
+    make persistent: uint
+    make alignment_padding: uint
+}
+
+make type State {
+    make allocate: ptr<any>
+    make deallocate: ptr<any>
+    make context: ptr<any>
+    make allocated: uint
+    make freed: uint
+    make live_bytes: uint
+    make peak_bytes: uint
+    make arena_releases: uint
+    make head: ptr<Header>
+}
+
+make type AllocationState {
+    make depth: uint
+    make callback_depth: uint
+    make retention_failed: uint
+}
+
+make type RetentionState {
+    make retained: ptr<uint>
+    make count: uint
+    make capacity: uint
+    make retained_free: ptr<any>
+    make retained_context: ptr<any>
+    make failed: uint
+}
+
+@unsafe @external @intrinsic "global_address"
+make quip_memory_state () -> ptr<State>
+
+@unsafe @external @intrinsic "global_address"
+make quip_memory_allocation_state () -> ptr<AllocationState>
+
+@unsafe @external @intrinsic "global_address"
+make quip_memory_retention_state () -> ptr<RetentionState>
+
+@unsafe @external @intrinsic "native_call"
+make quip_memory_call_allocate (callback: ptr<any>, context: ptr<any>, bytes: uint) -> ptr<any>
+
+@unsafe @external @intrinsic "native_call"
+make quip_memory_call_free (callback: ptr<any>, context: ptr<any>, buffer: ptr<any>) -> void
+
+make type Allocation {
+    make data: ptr<any>
+    make deallocate: ptr<any>
+    make context: ptr<any>
+}
+
+make type OwnedHeader {
+    make deallocate: ptr<any>
+    make context: ptr<any>
+}
+
+// The bootstrap allocator needs no managed values or standard-library globals.
+// Store the mapping size in a 16-byte prefix so returned pointers remain aligned.
+@unsafe @external @intrinsic "native_address:quip_memory_default_free"
+make memory_default_free_address () -> ptr<any>
+
+@unsafe
+make memory_default_allocate (size: uint) -> ptr<any> {
+    @unsafe make null: ptr<any> = 0
+
+    if size > 9223372036854775791 { return null }
+
+    make total = size + 16
+    make raw = memory_map(total)
+
+    if raw == null { return null }
+
+    @unsafe make header: ptr<uint> = raw
+    header.* = total
+    @unsafe make data: ptr<char> = raw
+    return data + 16
+}
+
+@pub @unsafe @export "quip_memory_default_free"
+make memory_default_free (context: ptr<any>, buffer: ptr<any>) -> void {
+    @unsafe make null: ptr<any> = 0
+
+    if buffer == null { return }
+
+    @unsafe make data: ptr<char> = buffer
+    @unsafe make header: ptr<uint> = data - 16
+    make size = header.*
+    memory_unmap(header, size)
+}
+
+@unsafe
+make memory_backend_allocate (size: uint, tracked: bool) -> Allocation {
+    make result: Allocation = .{}
+    make state = quip_memory_state()
+    make local = quip_memory_allocation_state()
+
+    if local.*.callback_depth != 0 { return result }
+
+
+    local.*.callback_depth = 1
+
+    if tracked { local.*.depth = local.*.depth + 1 }
+
+    @unsafe make null: ptr<any> = 0
+
+    if state.*.allocate == null {
+        result.data = memory_default_allocate(size)
+        result.deallocate = memory_default_free_address()
+        result.context = null
+    } else {
+        result.deallocate = state.*.deallocate
+        result.context = state.*.context
+        result.data = quip_memory_call_allocate(state.*.allocate, result.context, size)
+    }
+
+    if tracked { local.*.depth = local.*.depth - 1 }
+
+    local.*.callback_depth = 0
+    return result
+}
+
+@unsafe
+make memory_backend_free (buffer: ptr<any>, callback: ptr<any>, context: ptr<any>) -> void {
+    @unsafe make null: ptr<any> = 0
+
+    if buffer == null { return }
+
+    if callback == null { os::abort() }
+
+    make local = quip_memory_allocation_state()
+
+    if local.*.callback_depth != 0 { os::abort() }
+
+
+    local.*.callback_depth = 1
+    quip_memory_call_free(callback, context, buffer)
+    local.*.callback_depth = 0
+}
+
+@unsafe
+make memory_unlink (state: ptr<State>, header: ptr<Header>) -> void {
+    @unsafe make null: ptr<Header> = 0
+    make previous = header.*.previous
+    make next = header.*.next
+
+    if previous != null { previous.*.next = next }
+    else { state.*.head = next }
+
+    if next != null { next.*.previous = previous }
+}
+
+@unsafe
+make memory_release (state: ptr<State>, header: ptr<Header>) -> void {
+    make bytes: uint = header.*.bytes
+    @unsafe make callback: ptr<any> = header.*.deallocate
+    @unsafe make context: ptr<any> = header.*.context
+    @unsafe make null: ptr<any> = 0
+    memory_backend_free(header, callback, context)
+    state.*.freed = state.*.freed + 1
+    state.*.live_bytes = state.*.live_bytes - bytes
+}
+
+@pub @unsafe @export "__quip_set_global_allocator"
+make memory_set_allocator (context: ptr<any>, allocate: ptr<any>, deallocate: ptr<any>) -> void {
+    make state = quip_memory_state()
+    state.*.context = context
+    state.*.allocate = allocate
+    state.*.deallocate = deallocate
+
+}
+
+@pub @unsafe @export "quip_runtime_allocation_active"
+make memory_allocation_active () -> uint {
+    make state = quip_memory_allocation_state()
+    return state.*.depth
+}
+
+@pub @unsafe @export "quip_heap_alloc"
+make memory_allocate (bytes: uint) -> ptr<any> {
+    @unsafe make null: ptr<any> = 0
+    make size: uint = bytes
+
+    if size == 0 { size = 1 }
+
+    make overhead: uint = @sizeof Header
+
+    // No supported host can allocate a buffer larger than the signed address
+    // range. Reject the high bit before checking the metadata addition.
+    if (size & 9223372036854775807) != size { return null }
+
+    if size > 9223372036854775807 - overhead { return null }
+
+    make state = quip_memory_state()
+    make allocation = memory_backend_allocate(size + overhead, true)
+    @unsafe make raw: ptr<any> = allocation.data
+
+    if raw == null { return null }
+
+    @unsafe make header: ptr<Header> = raw
+    header.*.bytes = size
+    header.*.persistent = 0
+    header.*.alignment_padding = 0
+    header.*.deallocate = allocation.deallocate
+    header.*.context = allocation.context
+    state.*.allocated = state.*.allocated + 1
+    header.*.generation = state.*.allocated
+    @unsafe make empty: ptr<Header> = 0
+    header.*.previous = empty
+    header.*.next = state.*.head
+    make head = state.*.head
+
+    if head != empty { head.*.previous = header }
+
+    state.*.head = header
+    state.*.live_bytes = state.*.live_bytes + size
+
+    if state.*.live_bytes > state.*.peak_bytes { state.*.peak_bytes = state.*.live_bytes }
+
+    return header + 1
+}
+
+@pub @unsafe @export "quip_heap_free"
+make memory_free (buffer: ptr<any>) -> void {
+    @unsafe make null: ptr<any> = 0
+
+    if buffer == null { return }
+
+    @unsafe make header: ptr<Header> = buffer
+    header = header - 1
+    make state = quip_memory_state()
+    memory_unlink(state, header)
+    memory_release(state, header)
+}
+
+@pub @unsafe @export "quip_runtime_checkpoint"
+make memory_checkpoint () -> uint {
+    make state = quip_memory_state()
+    return state.*.allocated
+}
+
+@pub @unsafe @export "quip_runtime_release_since"
+make memory_release_since (mark: uint) -> void {
+    make state = quip_memory_state()
+    @unsafe make null: ptr<Header> = 0
+
+    while true {
+        make header = state.*.head
+
+        while header != null {
+            if header.*.generation > mark && header.*.persistent == 0 { break }
+
+            header = header.*.next
+        }
+
+        if header != null { memory_unlink(state, header) }
+
+
+        if header == null { break }
+
+        memory_release(state, header)
+        state.*.arena_releases = state.*.arena_releases + 1
+    }
+}
+
+@pub @unsafe @export "quip_runtime_live_allocations"
+make memory_live_allocations () -> uint {
+    make state = quip_memory_state()
+    return state.*.allocated - state.*.freed
+}
+
+@pub @unsafe @export "quip_runtime_live_bytes"
+make memory_live_bytes () -> uint {
+    make state = quip_memory_state()
+    return state.*.live_bytes
+}
+
+@pub @unsafe @export "quip_runtime_arena_keep"
+make memory_arena_keep (buffer: ptr<any>) -> void {
+    @unsafe make null: ptr<any> = 0
+    make state_local = quip_memory_allocation_state()
+
+    if buffer == null || state_local.*.retention_failed != 0 { return }
+
+    make local = quip_memory_retention_state()
+    @unsafe make absent: ptr<RetentionState> = 0
+
+    if local == absent { state_local.*.retention_failed = 1 return }
+
+    if local.*.failed != 0 { return }
+
+    if local.*.count == local.*.capacity {
+        make capacity: uint = local.*.capacity * 2
+
+        if capacity == 0 { capacity = 128 }
+
+        if capacity > 2305843009213693951 { local.*.failed = 1 return }
+
+        make allocation = memory_backend_allocate(capacity * 8, true)
+
+        if allocation.data == null { local.*.failed = 1 return }
+
+        @unsafe make retained: ptr<uint> = allocation.data
+        make old = local.*.retained
+        make i: uint = 0
+        while i < local.*.count { retained[i] = old[i] i = i + 1 }
+
+        memory_backend_free(old, local.*.retained_free, local.*.retained_context)
+        local.*.retained = retained
+        local.*.retained_free = allocation.deallocate
+        local.*.retained_context = allocation.context
+        local.*.capacity = capacity
+    }
+
+    make retained = local.*.retained
+    @unsafe make address: uint = buffer
+    retained[local.*.count] = address
+    local.*.count = local.*.count + 1
+}
+
+@unsafe
+make memory_sift (data: ptr<uint>, root: uint, count: uint) -> void {
+    make parent = root
+
+    while parent < count / 2 {
+        make child = parent * 2 + 1
+
+        if child + 1 < count && data[child] < data[child + 1] { child = child + 1 }
+
+        if data[parent] >= data[child] { return }
+
+        make value = data[parent]
+        data[parent] = data[child]
+        data[child] = value
+        parent = child
+    }
+}
+
+@unsafe
+make memory_sort (data: ptr<uint>, count: uint) -> void {
+    make root: uint = count / 2
+
+    while root > 0 { root = root - 1 memory_sift(data, root, count) }
+
+    make end: uint = count
+
+    while end > 1 {
+        end = end - 1
+        make value = data[0]
+        data[0] = data[end]
+        data[end] = value
+        memory_sift(data, 0, end)
+    }
+}
+
+@unsafe
+make memory_retained (data: ptr<uint>, count: uint, address: uint) -> bool {
+    make low: uint = 0
+    make high = count
+
+    while low < high {
+        make middle = low + (high - low) / 2
+
+        if data[middle] < address { low = middle + 1 }
+        else { high = middle }
+    }
+
+    return low < count && data[low] == address
+}
+
+@pub @unsafe @export "quip_runtime_arena_collect"
+make memory_arena_collect (mark: uint) -> void {
+    make state_local = quip_memory_allocation_state()
+
+    if state_local.*.retention_failed != 0 { state_local.*.retention_failed = 0 return }
+
+    make local = quip_memory_retention_state()
+    @unsafe make absent: ptr<RetentionState> = 0
+    make count: uint = 0
+    @unsafe make retained: ptr<uint> = 0
+
+    if local != absent {
+        if local.*.failed != 0 { local.*.count = 0 local.*.failed = 0 return }
+
+        count = local.*.count
+        retained = local.*.retained
+    }
+
+    if count > 1 { memory_sort(retained, count) }
+
+    make state = quip_memory_state()
+    make header = state.*.head
+    @unsafe make null: ptr<Header> = 0
+
+    while header != null {
+        make next = header.*.next
+        @unsafe make address: uint = header + 1
+
+        if header.*.generation > mark && header.*.persistent == 0 && !memory_retained(retained, count, address) {
+            memory_unlink(state, header)
+            memory_release(state, header)
+            state.*.arena_releases = state.*.arena_releases + 1
+        }
+
+        header = next
+    }
+
+    if local != absent { local.*.count = 0 }
+}
+
+@pub @unsafe @export "quip_runtime_memory_dump"
+make memory_dump () -> void {
+    make state = quip_memory_state()
+    make allocated = state.*.allocated
+    make freed = state.*.freed
+    make live = state.*.live_bytes
+    make peak = state.*.peak_bytes
+    make releases = state.*.arena_releases
+    os::printf("Runtime allocations: %llu\n".data, allocated)
+    os::printf("Runtime frees: %llu\n".data, freed)
+    os::printf("Runtime outstanding allocations: %llu\n".data, allocated - freed)
+    os::printf("Runtime arena releases: %llu\n".data, releases)
+    os::printf("Runtime live bytes: %llu\n".data, live)
+    os::printf("Runtime peak live bytes: %llu\n".data, peak)
+}
+
+@pub @unsafe @export "quip_page_size"
+make memory_page_size () -> uint {
+    make size: int = os::getpagesize()
+
+    if size > 0 { return size }
+
+    return 4096
+}
+
+@pub @unsafe @export "quip_map_anon"
+make memory_map (size: uint) -> ptr<any> {
+    @unsafe make null: ptr<any> = 0
+
+    if size == 0 { return null }
+
+    make flags: i32 = os::MAP_PRIVATE | os::MAP_ANON
+    make address = os::mmap(null, size, 3, flags, -1, 0)
+    @unsafe make failed: ptr<any> = -1
+
+    if address == failed { return null }
+
+    return address
+}
+
+@pub @unsafe @export "quip_unmap"
+make memory_unmap (address: ptr<any>, size: uint) -> i32 {
+    @unsafe make null: ptr<any> = 0
+
+    if address == null || size == 0 { return 0 }
+
+    if os::munmap(address, size) == 0 { return 1 }
+
+    return 0
+}
+
+// owned<T> is allocated directly by the ambient allocator rather than through
+// tracked container headers. Recursive value operations preserve that contract.
+@pub @unsafe
+make memory_allocate_owned (size: uint) -> ptr<any> {
+    @unsafe make null: ptr<any> = 0
+
+    if size > 9223372036854775807 - (@sizeof OwnedHeader) { return null }
+
+    make allocation = memory_backend_allocate(size + (@sizeof OwnedHeader), false)
+
+    if allocation.data == null { return null }
+
+    @unsafe make header: ptr<OwnedHeader> = allocation.data
+    header.*.deallocate = allocation.deallocate
+    header.*.context = allocation.context
+    return header + 1
+}
+
+@pub @unsafe
+make memory_free_owned (buffer: ptr<any>) -> void {
+    @unsafe make null: ptr<any> = 0
+
+    if buffer == null { return }
+
+    @unsafe make header: ptr<OwnedHeader> = buffer
+    header = header - 1
+    memory_backend_free(header, header.*.deallocate, header.*.context)
+}
+
+// Persistent runtime state is still tracked and uses its recorded allocator,
+// but is explicitly owned rather than released by a compilation arena.
+@pub @unsafe @export "quip_runtime_memory_persist"
+make memory_persist (buffer: ptr<any>) -> void {
+    @unsafe make null: ptr<any> = 0
+
+    if buffer == null { return }
+
+    @unsafe make header: ptr<Header> = buffer
+    header = header - 1
+    header.*.persistent = 1
+}

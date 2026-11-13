@@ -1,33 +1,76 @@
 @pure @const {
+
+
     make p: unit = @import "path.quip"
-    make os: unit = @import "../os/pkg.quip"
+    make system: unit = @import "../os/pkg.quip"
+
+    @target "macos" {
+        make os: unit = @import "../os/macos.quip"
+    }
+
+    @weak make os: unit = @import "../os/pkg.quip"
 }
 
-// ====
-
-@pure @const {
-    make Path: Type = p::Path
-}
 
 
-
-// ====
-
+/// represents a file on the filesystem
 @pub
 make type File {
 
     @pub {
-        make path_abs: Path
-        make fd: int
-        make content: str
+        make path_abs: p::Path = .{}
+        make fd: int = -1
+        make content: str = ""
     }
 
+    /// opens an existing file
     @pub
-    make open (path: Path) -> !File {
+    make open (path: variant<p::Path, ref<p::Path>>, mode: str) -> !File {
+        make flags: i32 = File.switch_mode(mode) catch err { return err }
+        make filename: str = match path {
+            a: p::Path => a.get()
+            b: ref<p::Path> => b.*.get()
+        }
+
+        filename.push('\0')
+
+        make f: File = .{}
+        @target "macos" {
+            // libc expects NUL-terminated bytes, not a Quip string descriptor.
+            @unsafe f.fd = os::open(filename.data, flags)
+        }
+
+        @weak {
+            if flags != 0 { return error.UnsupportedMode }
+
+            f.fd = system::syscall::open(filename)
+        }
+
+        if f.fd < 0 { return error.IOError }
+
+        return f
+    }
+
+    /// creates new file
+    @pub
+    make create (path: variant<p::Path, ref<p::Path>>, mode: int) -> !File {
         make file: File = .{}
 
-        file.fd = os::syscall::open(path.get())
-        // file.path_abs = path.absolute()
+        make filename: str = match path {
+            a: p::Path => a.get()
+            b: ref<p::Path> => b.*.get()
+        }
+
+        // Both libc and the system-call wrapper expect a NUL-terminated path.
+        filename.push('\0')
+        @target "macos" {
+            @unsafe make permissions: u16 = mode
+            @unsafe file.fd = os::creat(filename.data, permissions)
+        }
+
+        // @target "linux" @unsafe {
+        //     file.fd = __syscall(2, filename.data, 577, mode)
+        // }
 
         if file.fd < 0 {
             return error.IOError
@@ -36,41 +79,79 @@ make type File {
         return file
     }
 
-    @pub
-    make create (path: Path, mode: int) -> !File {
-        make file: File = .{}
-
-        file.fd = os::syscall::create(path.get(), mode)
-
-        if file.fd < 0 {
-            return error.IOError
-        }
-
-        return file
-    }
-
+    /// reads the file content
     @pub @this
     make read () -> !void {
-        if os::syscall::quip_file_read_fd(this.fd, this.content.pin) < 0 {
-            return error.FailedToRead
+
+        make remaining: int = 0
+        @target "macos" {
+            make stat: os::stat_t = .{}
+
+            @unsafe
+            if os::fstat(this.fd, stat.pin) != 0 { return error.FailedToRead }
+
+            if stat.st_size < 0 { return error.FailedToRead }
+
+            remaining = stat.st_size
         }
+
+        make content: str = ""
+
+        // Keep one extra byte of read space so an unchanged regular file can
+        // reach EOF without growing and copying its entire contents first.
+        if remaining < 9223372036854775806 { remaining = remaining + 1 }
+
+        content.reserve(remaining) catch { return error.FailedToRead }
+
+        while true {
+            make length: int = content.length
+            make capacity: int = content.capacity
+
+            if capacity - length <= 1 {
+                content.reserve(65536) catch { return error.FailedToRead }
+                capacity = content.capacity
+            }
+
+            make request: int = capacity - length - 1
+
+            if request > 65536 { request = 65536 }
+
+            @unsafe {
+                make data: ptr<char> = content.data
+            @unsafe make temp = data + length
+                make count: int = os::read(this.fd, temp , request)
+
+                if count < 0 { return error.FailedToRead }
+
+                if count == 0 { break }
+
+                content.set_length(length + count) catch { return error.FailedToRead }
+            }
+        }
+
+        this.content = content
     }
 
+    /// writes passed 'data' to the file
     @pub @this
     make write (data: str) -> !void {
-        if os::syscall::write(this.fd, data.data, data.len()) < 0 {
+
+        @unsafe
+        if os::write(this.fd, data.data, data.len()) < 0 {
             return error.FailedToWrite
         }
     }
 
+    /// closes the file
     @pub @this
     make close () -> void {
-        os::syscall::close(this.fd)
+        @unsafe os::close(this.fd)
     }
 
+    /// opens a file, reads its content and returns it, closes the file
     @pub
-    make orc (path: Path) -> !str {
-        make file = File.open(path) catch err { return err }
+    make orc (path: p::Path) -> !str {
+        make file: File = File.open(path, "r") catch err { return err }
         file.read() catch err { return err }
         make result: str = file.content
         file.close()
@@ -78,4 +159,14 @@ make type File {
         return result
     }
 
+    /// switches the file mode
+    make switch_mode (mode: str) -> !i32 {
+        match mode {
+            "r" { return os::O_RDONLY }
+            "w" { return os::O_WRONLY }
+            "rw" { return os::O_RDWR }
+        }
+
+        return error.InvalidMode
+    }
 }

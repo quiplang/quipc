@@ -1,0 +1,60 @@
+/// Parses the bit pattern of a Quip integer literal.
+@pub
+make parse (s: str) -> !uint {
+    make base: uint = 10
+    make i: uint = 0
+
+    if s.len() >= 2 && s[0] == '0' {
+        if s[1] == 'x' || s[1] == 'X' {
+            base = 16
+            i = 2
+        } elif s[1] == 'b' || s[1] == 'B' {
+            base = 2
+            i = 2
+        }
+    }
+
+    make value: uint = 0
+    make found = false
+    make active = true
+
+    while i < s.len() && active {
+        make c = s[i]
+        make digit: uint = 0
+        make valid = false
+
+        if c >= '0' && c <= '9' {
+            @unsafe make raw: uint = c
+            digit = raw & 255
+            digit = digit - 48
+            valid = true
+        } elif base == 16 && c >= 'a' && c <= 'f' {
+            @unsafe make raw: uint = c
+            digit = raw & 255
+            digit = digit - 87
+            valid = true
+        } elif base == 16 && c >= 'A' && c <= 'F' {
+            @unsafe make raw: uint = c
+            digit = raw & 255
+            digit = digit - 55
+            valid = true
+        } elif c == '_' {
+            i = i + 1
+        } else {
+            active = false
+        }
+
+        if valid {
+            if digit >= base {
+                active = false
+            } else {
+                value = value * base + digit
+                found = true
+                i = i + 1
+            }
+        }
+    }
+
+    if !found { return error.InvalidIntegerLiteral }
+    return value
+}

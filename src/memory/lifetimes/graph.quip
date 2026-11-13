@@ -1,0 +1,722 @@
+// linear liveness graph built from MIR: birth index, last use, kill line,
+// storage death and pin intervals
+//
+// the linear index of an instruction is its position in `MirBody.stmts`;
+// terminators share the index of their block's last statement so that a pin used only by the
+// terminator is released before the successor's first statement
+
+@pure @const {
+    make mir = @import "../../mir/mir.quip"
+    make util = @import "../../util/pkg.quip"
+}
+
+// small growable list of instruction/local indices; used by the dataflow passes to
+// bucket work per block without relying on nested arrays (`uint[][]`)
+@pub
+make type IdList {
+    @pub make ids: uint[] = []
+}
+
+@pub
+make type PinEvent {
+    @pub make holder: uint = 0
+    @pub make src: uint = 0
+    @pub make index: uint = 0     // linear index of the pin
+    make end: uint = 0       // linear index immediately after the holder's final use
+    @pub make block: uint = 0     // block containing the pin
+    @pub make scope_lifetime: bool = false // loop iterator borrow lasts through StorageDead
+    @pub make indirect: bool = false
+    @pub make field_path: str[] = []
+    make release_block: uint = 0  // block whose exit releases the pin
+    make release_at_block: uint = 0  // 1: release on block exit, 0: release after holder's last use
+    @pub make range: util::Range = .{}
+}
+
+/// records local uses, lifetimes, and pin events for a mir body.
+@pub
+make type LivenessGraph {
+    @pub make nlocals: uint = 0
+    @pub make nstmts: uint = 0
+    @pub make param_count: uint = 0
+
+    @pub make has_birth: uint[] = []
+    @pub make birth: uint[] = []
+    @pub make has_use: uint[] = []
+    @pub make last: uint[] = []
+    @pub make has_dead: uint[] = []
+    @pub make dead: uint[] = []
+    @pub make last_block: uint[] = []
+    @pub make last_in_term: uint[] = []
+    // The value whose later use extended this local's reference lifetime.
+    @pub make last_via: uint[] = []
+    make last_stmt: uint[] = []  // last statement index in each block (nstmts if empty)
+    @pub make ever_pinned: uint[] = []
+    @pub make return_pins: uint[] = []
+
+    @pub make pins: PinEvent[] = []
+
+    // linear index of every terminator, by block
+    @pub make term_index: uint[] = []
+
+    // pin releases after a statement (CSR): releases of statement `i` live in
+    // release_src[release_start[i] .. release_start[i + 1])
+    @pub make release_start: uint[] = []
+    @pub make release_src: uint[] = []
+
+    // pin releases on block exit (CSR): a pin whose holder was last used at the
+    // very end of block `b` is released before every successor of `b` is entered.
+    // releases of block `b` live in block_release_src[block_release_start[b] .. block_release_start[b + 1])
+    @pub make block_release_start: uint[] = []
+    @pub make block_release_src: uint[] = []
+}
+
+// index immediately after the final use of `local`, capped by its storage death
+/// returns the end position used for a local in the liveness graph.
+@pub
+make kill_line (g: ref<LivenessGraph>, local: uint) -> uint {
+    make d = g.*.nstmts
+
+    if g.*.has_dead[local] != 0 {
+        d = g.*.dead[local]
+    }
+
+    if g.*.has_use[local] != 0 {
+        make k = g.*.last[local] + 1
+
+        if k < d {
+            return k
+        }
+    }
+
+    return d
+}
+
+/// collects liveness and pin information from a mir body.
+@pub
+make build (body: ref<mir::MirBody>) -> LivenessGraph {
+    make g = LivenessGraph {}
+
+    g.nlocals = body.*.locals.len()
+    g.nstmts = body.*.stmts.len()
+    g.param_count = body.*.param_count
+
+    make i = 0
+
+    while i < body.*.terms.len() {
+        g.last_stmt.push(g.nstmts)
+        i = i + 1
+    }
+
+    i = 0
+
+    while i < g.nlocals {
+        g.has_birth.push(0)
+        g.birth.push(0)
+        g.has_use.push(0)
+        g.last.push(0)
+        g.has_dead.push(0)
+        g.dead.push(0)
+        g.last_block.push(0)
+        g.last_in_term.push(0)
+        g.last_via.push(g.nlocals)
+        g.ever_pinned.push(0)
+        i = i + 1
+    }
+
+    scan_stmts(body, g.pin)
+    scan_terms(body, g.pin)
+    extend_reference_uses(body, g.pin)
+    find_return_carriers(body, g.pin)
+    resolve_pins(g.pin)
+    build_releases(g.pin, body.*.terms.len())
+
+    return g
+}
+
+// Backward may-flow from return places. Whole-local writes kill the previous
+// value. Store block/local states in one flat array to avoid nested ownership.
+make find_return_carriers (body: ref<mir::MirBody>, g: ref<LivenessGraph>) -> void {
+    make entries: uint[] = []
+    make live: uint[] = []
+    make i = 0
+    while i < body.*.terms.len() * g.*.nlocals { entries.push(0) i = i + 1 }
+
+    i = 0
+
+    while i < g.*.nlocals { live.push(0) i = i + 1 }
+
+    i = 0
+
+    while i < g.*.pins.len() { g.*.return_pins.push(0) i = i + 1 }
+
+    make changed = true
+
+    while changed {
+        changed = false
+        make block = 0
+
+        while block < body.*.terms.len() {
+            make j = 0
+            while j < live.len() { live[j] = 0 j = j + 1 }
+
+            make term = body.*.terms[block].pin
+
+            if term.*.kind == mir::MirTermKind.Return && g.*.nlocals > 0 { live[0] = 1 }
+
+            if term.*.kind == mir::MirTermKind.Goto || term.*.kind == mir::MirTermKind.Call || term.*.kind == mir::MirTermKind.Branch {
+                if term.*.target < body.*.terms.len() { merge_return_live(live.pin, entries.pin, term.*.target * g.*.nlocals) }
+
+                if term.*.kind == mir::MirTermKind.Branch && term.*.other < body.*.terms.len() { merge_return_live(live.pin, entries.pin, term.*.other * g.*.nlocals) }
+            }
+
+            if term.*.kind == mir::MirTermKind.Call && term.*.dest.local < g.*.nlocals && live[term.*.dest.local] != 0 {
+                if term.*.dest.projs.len() == 0 { live[term.*.dest.local] = 0 }
+
+                j = 0
+
+                while j < term.*.args.len() {
+                    make arg = term.*.args[j].pin
+
+                    if call_returns_reference_arg(body, term, j) { mark_return_operand(live.pin, arg) }
+
+                    j = j + 1
+                }
+            }
+
+            make si = body.*.stmts.len()
+            while si > 0 {
+                si = si - 1
+                make stmt = body.*.stmts[si].pin
+
+                if stmt.*.block == block && stmt.*.kind == mir::MirStmtKind.Assign && stmt.*.place.local < g.*.nlocals && live[stmt.*.place.local] != 0 {
+                    if stmt.*.place.projs.len() == 0 { live[stmt.*.place.local] = 0 }
+
+                    make rv = stmt.*.rvalue.pin
+
+                    if rv.*.kind == mir::MirRvalueKind.Pin {
+                        j = 0
+
+                        while j < g.*.pins.len() {
+                            if g.*.pins[j].index == si { g.*.return_pins[j] = 1 }
+
+                            j = j + 1
+                        }
+
+                        // A reborrow carries the provenance of its base
+                        // reference through to the returned value.
+                        make src = rv.*.place.local
+
+                        if src < body.*.locals.len() && reference_type(body.*.locals[src].ty.copy()) { live[src] = 1 }
+                    } elif rv.*.kind == mir::MirRvalueKind.Use || rv.*.kind == mir::MirRvalueKind.OptionalPayload {
+                        if reference_type(body.*.locals[stmt.*.place.local].ty.copy()) {
+                            mark_return_field_operand(live.pin, rv.*.a.pin)
+                        } else { mark_return_operand(live.pin, rv.*.a.pin) }
+                    } elif rv.*.kind == mir::MirRvalueKind.Aggregate {
+                        j = 0
+
+                        while j < rv.*.ops.len() { mark_return_operand(live.pin, rv.*.ops[j].pin) j = j + 1 }
+                    }
+                } elif stmt.*.block == block && (stmt.*.kind == mir::MirStmtKind.StorageLive || stmt.*.kind == mir::MirStmtKind.StorageDead) && stmt.*.local < g.*.nlocals {
+                    live[stmt.*.local] = 0
+                }
+            }
+
+            j = 0
+
+            while j < live.len() {
+                make pos = block * g.*.nlocals + j
+
+                if entries[pos] != live[j] { entries[pos] = live[j] changed = true }
+
+                j = j + 1
+            }
+
+            block = block + 1
+        }
+    }
+
+}
+
+make merge_return_live (dst: ref<uint[]>, src: ref<uint[]>, offset: uint) -> void {
+    make i = 0
+    while i < dst.*.len() {
+        if src.*[offset + i] != 0 { dst.*[i] = 1 }
+
+        i = i + 1
+    }
+}
+
+make mark_return_operand (live: ref<uint[]>, op: ref<mir::MirOperand>) -> void {
+    if op.*.kind != mir::MirOperandKind.Copy && op.*.kind != mir::MirOperandKind.Move { return }
+
+    if op.*.place.projs.len() != 0 || op.*.place.local >= live.*.len() { return }
+
+    live.*[op.*.place.local] = 1
+}
+
+make mark_return_field_operand (live: ref<uint[]>, op: ref<mir::MirOperand>) -> void {
+    if op.*.kind != mir::MirOperandKind.Copy && op.*.kind != mir::MirOperandKind.Move { return }
+
+    if !field_place(op.*.place.pin) || op.*.place.local >= live.*.len() { return }
+
+    live.*[op.*.place.local] = 1
+}
+
+// A reference can be stored in an aggregate or copied into another local.
+// Its source remains pinned until the last use of any value carrying it.
+make extend_reference_uses (body: ref<mir::MirBody>, g: ref<LivenessGraph>) -> void {
+    make changed = true
+
+    while changed {
+        changed = false
+        make i = 0
+        while i < body.*.stmts.len() {
+            make s = body.*.stmts[i].pin
+
+            if s.*.kind == mir::MirStmtKind.Assign && field_place(s.*.place.pin) {
+                make dest = s.*.place.local
+
+                if dest < g.*.nlocals && g.*.has_use[dest] != 0 {
+                    make rv = s.*.rvalue.pin
+
+                    if rv.*.kind == mir::MirRvalueKind.Use {
+                        if extend_operand_use(g, rv.*.a.pin, dest, i) { changed = true }
+                    } elif rv.*.kind == mir::MirRvalueKind.Pin {
+                        // Reborrowing through a reference keeps the original
+                        // reference, and therefore its source, alive as well.
+                        make src = rv.*.place.local
+
+                        if src < body.*.locals.len() && reference_type(body.*.locals[src].ty.copy()) {
+                            if extend_local_use(g, src, dest, i) { changed = true }
+                        }
+                    } elif rv.*.kind == mir::MirRvalueKind.Aggregate {
+                        make j = 0
+                        while j < rv.*.ops.len() {
+                            if extend_operand_use(g, rv.*.ops[j].pin, dest, i) { changed = true }
+
+                            j = j + 1
+                        }
+                    }
+                }
+            }
+
+            i = i + 1
+        }
+
+        // Until interprocedural return summaries are available, a returned
+        // reference may originate from any reference argument. Keep each
+        // possible origin live through the returned reference's last use.
+        i = 0
+
+        while i < body.*.terms.len() {
+            make term = body.*.terms[i].pin
+
+            if term.*.kind == mir::MirTermKind.Call {
+                make dest = term.*.dest.local
+
+                if dest < g.*.nlocals && g.*.has_use[dest] != 0 {
+                    make j = 0
+                    while j < term.*.args.len() {
+                        make arg = term.*.args[j].pin
+
+                        if call_returns_reference_arg(body, term, j) {
+                            if extend_operand_use(g, arg, dest, g.*.term_index[i]) { changed = true }
+                        }
+
+                        j = j + 1
+                    }
+                }
+            }
+
+            i = i + 1
+        }
+    }
+}
+
+make reference_type (t: str) -> bool {
+    return t.len() >= 4 && t[0] == 'r' && t[1] == 'e' && t[2] == 'f' && t[3] == '<'
+}
+
+// Without a callee summary, retain every reference argument when a call
+// returns a reference, since any of them may be its origin.
+make call_returns_reference_arg (body: ref<mir::MirBody>, term: ref<mir::MirTerm>, arg_index: uint) -> bool {
+    if !reference_type(term.*.ret_ty.copy()) || arg_index >= term.*.args.len() { return false }
+
+    make arg = term.*.args[arg_index].pin
+
+    if arg.*.kind != mir::MirOperandKind.Copy && arg.*.kind != mir::MirOperandKind.Move { return false }
+
+    if reference_type(arg.*.ty.copy()) { return true }
+
+    if arg.*.place.local >= body.*.locals.len() { return false }
+
+    return reference_type(body.*.locals[arg.*.place.local].ty.copy())
+}
+
+make extend_operand_use (g: ref<LivenessGraph>, op: ref<mir::MirOperand>, dest: uint, at: uint) -> bool {
+    if op.*.kind != mir::MirOperandKind.Copy && op.*.kind != mir::MirOperandKind.Move { return false }
+
+    if !field_place(op.*.place.pin) { return false }
+
+    return extend_local_use(g, op.*.place.local, dest, at)
+}
+
+make field_place (place: ref<mir::MirPlace>) -> bool {
+    for projection : place.*.projs {
+        if projection.kind != mir::MirProjKind.Field { return false }
+    }
+
+    return true
+}
+
+make extend_local_use (g: ref<LivenessGraph>, src: uint, dest: uint, at: uint) -> bool {
+    if src >= g.*.nlocals || src == dest || g.*.last[dest] < at { return false }
+
+    if g.*.has_use[src] != 0 && (g.*.last[src] > g.*.last[dest] || (g.*.last[src] == g.*.last[dest] && g.*.last_in_term[src] >= g.*.last_in_term[dest])) { return false }
+
+    mark_use(g, src, g.*.last[dest], g.*.last_block[dest], g.*.last_in_term[dest])
+    g.*.last_via[src] = dest
+    return true
+}
+
+/// marks the use.
+make mark_use (g: ref<LivenessGraph>, local: uint, index: uint, block: uint, in_term: uint) -> void {
+    if local >= g.*.nlocals {
+        return
+    }
+
+    // Terminators are scanned after all statements; an earlier call must not
+    // shorten a value's lifetime past a later statement that still reads it.
+    if g.*.has_use[local] == 0 || index > g.*.last[local]
+        || (index == g.*.last[local] && in_term != 0) {
+        g.*.last[local] = index
+        g.*.last_block[local] = block
+        g.*.last_in_term[local] = in_term
+    }
+
+    g.*.has_use[local] = 1
+    return
+}
+
+// Index projections read their index temporaries as well as the base pointer.
+make scan_place (g: ref<LivenessGraph>, place: ref<mir::MirPlace>, index: uint, block: uint, in_term: uint) {
+    mark_use(g, place.*.local, index, block, in_term)
+
+    for projection : place.*.projs {
+        if projection.kind == mir::MirProjKind.Index { mark_use(g, projection.index, index, block, in_term) }
+    }
+}
+
+/// scans the operand.
+make scan_operand (g: ref<LivenessGraph>, op: ref<mir::MirOperand>, index: uint, block: uint, in_term: uint) -> void {
+    match op.*.kind {
+        mir::MirOperandKind.Copy { scan_place(g, op.*.place.pin, index, block, in_term) }
+
+        mir::MirOperandKind.Move { scan_place(g, op.*.place.pin, index, block, in_term) }
+        _ {}
+    }
+
+    return
+}
+
+/// scans the statements.
+make scan_stmts (body: ref<mir::MirBody>, g: ref<LivenessGraph>) -> void {
+    make i = 0
+
+    while i < g.*.nstmts {
+        make s = body.*.stmts[i].pin
+
+        if s.*.block < g.*.last_stmt.len() {
+            g.*.last_stmt[s.*.block] = i
+        }
+
+        match s.*.kind {
+            mir::MirStmtKind.StorageLive {
+                if s.*.local < g.*.nlocals {
+                    g.*.has_birth[s.*.local] = 1
+                    g.*.birth[s.*.local] = i
+                }
+            }
+
+            mir::MirStmtKind.StorageDead {
+                if s.*.local < g.*.nlocals {
+                    g.*.has_dead[s.*.local] = 1
+                    g.*.dead[s.*.local] = i
+                }
+            }
+
+            mir::MirStmtKind.Assign {
+                scan_place(g, s.*.place.pin, i, s.*.block, 0)
+
+                make rv = s.*.rvalue.pin
+
+                match rv.*.kind {
+                    mir::MirRvalueKind.Use { scan_operand(g, rv.*.a.pin, i, s.*.block, 0) }
+
+                    mir::MirRvalueKind.OptionalPayload {
+                        scan_operand(g, rv.*.a.pin, i, s.*.block, 0)
+                    }
+
+                    mir::MirRvalueKind.Binary {
+                        scan_operand(g, rv.*.a.pin, i, s.*.block, 0)
+                        scan_operand(g, rv.*.b.pin, i, s.*.block, 0)
+                    }
+
+                    mir::MirRvalueKind.Unary { scan_operand(g, rv.*.a.pin, i, s.*.block, 0) }
+
+                    mir::MirRvalueKind.Aggregate {
+                        make oi = 0
+
+                        while oi < rv.*.ops.len() {
+                            scan_operand(g, rv.*.ops[oi].pin, i, s.*.block, 0)
+                            oi = oi + 1
+                        }
+                    }
+
+                    mir::MirRvalueKind.Pin {
+                        make src = rv.*.place.local
+                        make holder = s.*.place.local
+
+                        scan_place(g, rv.*.place.pin, i, s.*.block, 0)
+
+                        if holder != 0 && src != holder && src < g.*.nlocals {
+                            g.*.ever_pinned[src] = 1
+
+                            make ev = PinEvent {}
+
+                            ev.holder = holder
+                            ev.src = src
+                            ev.index = i
+                            ev.block = s.*.block
+
+                            for projection : rv.*.place.projs {
+                                if projection.kind == mir::MirProjKind.Index { break }
+
+                                if projection.kind == mir::MirProjKind.Field { ev.field_path.push(projection.name.copy()) }
+                            }
+
+                            for projection : rv.*.place.projs {
+                                if projection.kind == mir::MirProjKind.Deref || projection.kind == mir::MirProjKind.Index { ev.indirect = true }
+                            }
+
+                            if holder < body.*.locals.len() && body.*.locals[holder].name == "$for.arr" { ev.scope_lifetime = true }
+
+                            ev.range = s.*.range !
+                            g.*.pins.push(ev)
+                        }
+                    }
+
+                    mir::MirRvalueKind.Unsupported {}
+                }
+            }
+
+            mir::MirStmtKind.Unsupported {}
+        }
+
+        i = i + 1
+    }
+
+    return
+}
+
+/// scans the terms.
+make scan_terms (body: ref<mir::MirBody>, g: ref<LivenessGraph>) -> void {
+    // a terminator shares the linear index of its block's last statement; blocks
+    // without statements reuse the cursor of the previous block
+    make cursor = 0
+    make has_cursor = false
+
+    make bi = 0
+
+    while bi < body.*.terms.len() {
+        make si = 0
+
+        while si < g.*.nstmts {
+            if body.*.stmts[si].block == bi {
+                cursor = si
+                has_cursor = true
+            }
+
+            si = si + 1
+        }
+
+        make idx = 0
+
+        if has_cursor {
+            idx = cursor
+        }
+
+        g.*.term_index.push(idx)
+
+        make t = body.*.terms[bi].pin
+
+        match t.*.kind {
+            mir::MirTermKind.Branch { scan_operand(g, t.*.cond.pin, idx, bi, 1) }
+
+            mir::MirTermKind.Call {
+                scan_operand(g, t.*.func.pin, idx, bi, 1)
+
+                make ai = 0
+
+                while ai < t.*.args.len() {
+                    scan_operand(g, t.*.args[ai].pin, idx, bi, 1)
+                    ai = ai + 1
+                }
+
+                scan_place(g, t.*.dest.pin, idx, bi, 1)
+            }
+
+            _ {}
+        }
+
+        bi = bi + 1
+    }
+
+    return
+}
+
+// a pin lives from its creation until the holder is killed or re-pins
+make resolve_pins (g: ref<LivenessGraph>) -> void {
+    make i = 0
+
+    while i < g.*.pins.len() {
+        make holder = g.*.pins[i].holder
+        make end = kill_line(g, holder)
+
+        if g.*.pins[i].scope_lifetime { end = g.*.nstmts }
+
+        make j = i + 1
+
+        while j < g.*.pins.len() {
+            if g.*.pins[j].holder == holder {
+                end = g.*.pins[j].index
+                break
+            }
+
+            j = j + 1
+        }
+
+        g.*.pins[i].end = end
+        i = i + 1
+    }
+
+    return
+}
+
+make build_releases (g: ref<LivenessGraph>, nblocks: uint) -> void {
+    // statement releases
+    make i = 0
+
+    while i <= g.*.nstmts {
+        g.*.release_start.push(0)
+        i = i + 1
+    }
+
+    i = 0
+
+    while i < g.*.pins.len() {
+        make end = g.*.pins[i].end
+
+        if g.*.pins[i].release_at_block == 0 && end < g.*.nstmts {
+            g.*.release_start[end + 1] = g.*.release_start[end + 1] + 1
+        }
+
+        i = i + 1
+    }
+
+    make k = 1
+
+    while k <= g.*.nstmts {
+        g.*.release_start[k] = g.*.release_start[k] + g.*.release_start[k - 1]
+        k = k + 1
+    }
+
+    make total = g.*.release_start[g.*.nstmts]
+    i = 0
+
+    while i < total {
+        g.*.release_src.push(0)
+        i = i + 1
+    }
+
+    make fill: uint[] = []
+    i = 0
+
+    while i <= g.*.nstmts {
+        fill.push(g.*.release_start[i])
+        i = i + 1
+    }
+
+    i = 0
+
+    while i < g.*.pins.len() {
+        make end = g.*.pins[i].end
+
+        if g.*.pins[i].release_at_block == 0 && end < g.*.nstmts {
+            make pos = fill[end]
+            g.*.release_src[pos] = g.*.pins[i].src
+            fill[end] = pos + 1
+        }
+
+        i = i + 1
+    }
+
+    // block-exit releases
+    i = 0
+
+    while i <= nblocks {
+        g.*.block_release_start.push(0)
+        i = i + 1
+    }
+
+    i = 0
+
+    while i < g.*.pins.len() {
+        make b = g.*.pins[i].release_block
+
+        if g.*.pins[i].release_at_block != 0 && b < nblocks {
+            g.*.block_release_start[b + 1] = g.*.block_release_start[b + 1] + 1
+        }
+
+        i = i + 1
+    }
+
+    k = 1
+
+    while k <= nblocks {
+        g.*.block_release_start[k] = g.*.block_release_start[k] + g.*.block_release_start[k - 1]
+        k = k + 1
+    }
+
+    total = g.*.block_release_start[nblocks]
+    i = 0
+
+    while i < total {
+        g.*.block_release_src.push(0)
+        i = i + 1
+    }
+
+    make bfill: uint[] = []
+    i = 0
+
+    while i <= nblocks {
+        bfill.push(g.*.block_release_start[i])
+        i = i + 1
+    }
+
+    i = 0
+
+    while i < g.*.pins.len() {
+        make b = g.*.pins[i].release_block
+
+        if g.*.pins[i].release_at_block != 0 && b < nblocks {
+            make pos = bfill[b]
+            g.*.block_release_src[pos] = g.*.pins[i].src
+            bfill[b] = pos + 1
+        }
+
+        i = i + 1
+    }
+
+    return
+}

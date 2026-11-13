@@ -1,0 +1,3 @@
+// module responible for running compile-time code tagged with `@pure`
+// some compile-time features like `@import` or `@target` are actively performed on compile-time during analysis
+// but custom functions or variables with `@pure` tag must be executed in this module.

@@ -1,0 +1,516 @@
+// Resolve nominal name collisions before type checking, then give attached
+// declarations module-scoped linker identities. Source fields/locals stay intact.
+@pure @const {
+    make hir = @import "../../hir/hir.quip"
+    make mono = @import "../../hir/mono.quip"
+    make mangle = @import "mangle.quip"
+    make std = @import "std"
+}
+
+
+make type TypeName {
+    make unit: uint
+    make source: str
+    make symbol: str
+}
+
+make type Qualifier {
+    make units: ref<mono::MonoUnit[]>
+    make names: TypeName[] = []
+
+    /// Resolves a nominal type through type aliases and imports.
+    @this
+    make alias_symbol (unit: uint, name: str, depth: uint) -> str {
+        if depth > 64 || unit >= this.units.*.len() { return "" }
+
+        for entry : this.names {
+            if entry.unit == unit && (entry.source == name || entry.symbol == name) { return entry.symbol ! }
+        }
+
+        make module = this.units.*[unit].module
+
+        for structure : module.*.structs {
+            if !structure.is_instance && structure.name == name { return structure.name.copy() }
+        }
+
+        for enumeration : module.*.enums {
+            if enumeration.name == name { return enumeration.name.copy() }
+        }
+
+        for alias : module.*.type_aliases {
+            if alias.name != name || !alias.has_target || alias.target >= alias.body.types.len() { continue }
+
+            make target = alias.body.types[alias.target].pin
+
+            if target.*.is_array || target.*.is_optional || target.*.is_fallible { continue }
+
+            make owner = unit
+            make member = target.*.name.copy()
+
+            if target.*.is_namespace {
+                if target.*.args.len() == 0 { continue }
+
+                make path = target.*.name.copy()
+                make i: uint = 0
+                while i + 1 < target.*.args.len() {
+                    path = path + "::" + alias.body.types[target.*.args[i]].name
+                    i = i + 1
+                }
+
+                owner = this.namespace_unit(unit, path)
+                member = alias.body.types[target.*.args[target.*.args.len() - 1]].name.copy()
+            } elif target.*.args.len() > 0 { continue }
+
+            make resolved = this.alias_symbol(owner, member, depth + 1)
+
+            if resolved.len() > 0 { return resolved }
+        }
+
+        return ""
+    }
+
+    /// Looks up the type identity in the imported unit, following its aliases.
+    @this
+    make lookup (unit: uint, name: str) -> str {
+        for entry : this.names {
+            if entry.unit == unit && entry.source == name { return entry.symbol ! }
+
+            if entry.unit == unit && entry.source + "[]" == name { return entry.symbol + "[]" }
+        }
+
+        make resolved = this.alias_symbol(unit, name.copy(), 0)
+
+        if resolved.len() > 0 { return resolved }
+
+        return name
+    }
+
+    /// finds a namespace’s target unit, returning the unit count when absent.
+    @this
+    make namespace_unit (unit: uint, path: str) -> uint {
+        for ns : this.units.*[unit].namespaces.* {
+            if ns.path == path { return ns.unit }
+        }
+
+        return this.units.*.len()
+    }
+
+    /// reconstructs a path from a hir expression.
+    @this
+    make path (body: ref<hir::HirBody>, index: uint) -> str {
+        if index >= body.*.exprs.len() { return "" }
+
+        make expression = body.*.exprs[index].pin
+
+        if expression.*.kind == hir::HirExprKind.Path { return expression.*.name ! }
+
+        if expression.*.kind == hir::HirExprKind.Field {
+            make base = this.path(body, expression.*.lhs)
+
+            if base.len() > 0 { return base + "::" + expression.*.name }
+        }
+
+        return ""
+    }
+
+    /// processes a constructor for the name.
+    @this
+    make constructor_name (unit: uint, name: str) -> str {
+        make split: uint = name.len()
+        make i: uint = 0
+
+        while i + 1 < name.len() {
+            if name[i] == ':' && name[i + 1] == ':' { split = i }
+
+            i = i + 1
+        }
+
+        if split == name.len() { return this.lookup(unit, name) }
+
+        make prefix: str = ""
+        i = 0
+
+        while i < split { prefix.push(name[i]) i = i + 1 }
+
+        make member: str = ""
+        i = split + 2
+
+        while i < name.len() { member.push(name[i]) i = i + 1 }
+
+        make target = this.namespace_unit(unit, prefix.copy())
+
+        if target >= this.units.*.len() { return name }
+
+        return prefix + "::" + this.lookup(target, member)
+    }
+
+    @this
+    make owner_name (unit: uint, name: str) -> str {
+        make split: uint = name.len()
+        make i: uint = 0
+        while i + 1 < name.len() {
+            if name[i] == ':' && name[i + 1] == ':' { split = i }
+
+            i = i + 1
+        }
+
+        if split == name.len() { return this.lookup(unit, name) }
+
+        make prefix: str = ""
+        i = 0
+
+        while i < split { prefix.push(name[i]) i = i + 1 }
+
+        make member: str = ""
+        i = split + 2
+
+        while i < name.len() { member.push(name[i]) i = i + 1 }
+
+        make target = this.namespace_unit(unit, prefix)
+
+        if target >= this.units.*.len() { return name }
+
+        return this.lookup(target, member)
+    }
+
+    /// qualifies names and types in a hir body.
+    @this
+    make body (unit: uint, body: ref<hir::HirBody>) {
+        // Namespace roots are appended after their member nodes. Visit roots
+        // first so an imported Parser cannot acquire the local Parser identity.
+        make i: uint = body.*.types.len()
+
+        while i > 0 {
+            i = i - 1
+            make node = body.*.types[i].pin
+
+            if node.*.is_namespace && node.*.args.len() > 0 {
+                make path = node.*.name !
+                make j: uint = 0
+
+                while j + 1 < node.*.args.len() {
+                    path = path + "::" + body.*.types[node.*.args[j]].name
+                    j = j + 1
+                }
+
+                make target = this.namespace_unit(unit, path)
+
+                if target < this.units.*.len() {
+                    make member = body.*.types[node.*.args[node.*.args.len() - 1]].pin
+                    member.*.name = this.lookup(target, member.*.name !)
+                }
+            } else {
+                node.*.name = this.lookup(unit, node.*.name !)
+            }
+        }
+
+        i = 0
+
+        while i < body.*.exprs.len() {
+            make expression = body.*.exprs[i].pin
+
+            if expression.*.kind == hir::HirExprKind.Constructor {
+                expression.*.name = this.constructor_name(unit, expression.*.name !)
+            } elif expression.*.kind == hir::HirExprKind.Path || expression.*.kind == hir::HirExprKind.EnumVariant {
+                // Alias names are local items. Keep their spelling so expression lookup can
+                // expand the alias to the qualified target during type checking.
+                make is_alias = false
+
+                for alias : this.units.*[unit].module.*.type_aliases {
+                    if alias.name == expression.*.name { is_alias = true }
+                }
+
+                if !is_alias { expression.*.name = this.lookup(unit, expression.*.name !) }
+            } elif expression.*.kind == hir::HirExprKind.Field {
+                make path = this.path(body, expression.*.lhs)
+                make target = this.namespace_unit(unit, path)
+
+                if target < this.units.*.len() {
+                    expression.*.name = this.lookup(target, expression.*.name !)
+                }
+            }
+
+            i = i + 1
+        }
+
+        i = 0
+
+        while i < body.*.cases.len() {
+            if body.*.cases[i].enum_name.len() > 0 { body.*.cases[i].enum_name = this.lookup(unit, body.*.cases[i].enum_name !) }
+
+            i = i + 1
+        }
+    }
+
+    /// updates a function’s name in the selected unit.
+    @this
+    make rename_function (unit: uint, old: str, symbol: str) {
+        make module = this.units.*[unit].module
+        make i: uint = 0
+
+        while i < module.*.items.len() {
+            if module.*.items[i].kind == hir::HirItemKind.Func && module.*.items[i].name == old {
+                module.*.items[i].name = symbol.copy()
+            }
+
+            i = i + 1
+        }
+
+        i = 0
+
+        while i < module.*.structs.len() {
+            make j: uint = 0
+
+            while j < module.*.structs[i].fields.len() {
+                if module.*.structs[i].fields[j].default_init == old {
+                    module.*.structs[i].fields[j].default_init = symbol.copy()
+                }
+
+                j = j + 1
+            }
+
+            i = i + 1
+        }
+
+        i = 0
+
+        while i < module.*.funcs.len() {
+            make body = module.*.funcs[i].body.pin
+            make j: uint = 0
+
+            while j < body.*.exprs.len() {
+                if body.*.exprs[j].kind == hir::HirExprKind.Path && body.*.exprs[j].name == old {
+                    body.*.exprs[j].name = symbol.copy()
+                }
+
+                j = j + 1
+            }
+
+            i = i + 1
+        }
+    }
+
+    @this
+    make run (only: ref<bool[]>, all: bool) {
+        // Only colliding nominal names need rewriting in HIR. Generic instance
+        // stubs have no struct declaration and retain their defining unit's name.
+        // `declaration_name` is stable across repeated passes, unlike `name`,
+        // which may already be mangled when only some units are lowered again.
+        make u: uint = 0
+
+        while u < this.units.*.len() {
+            make module = this.units.*[u].module
+
+            for structure : module.*.structs {
+                if !structure.is_instance {
+                    make source_name = structure.declaration_name.copy()
+
+                    if source_name.len() == 0 { source_name = structure.name.copy() }
+
+                    make count: uint = 0
+
+                    for other : this.units.* {
+                        for candidate : other.module.*.structs {
+                            if !candidate.is_instance {
+                                make candidate_name = candidate.declaration_name.copy()
+
+                                if candidate_name.len() == 0 { candidate_name = candidate.name.copy() }
+
+                                if candidate_name == source_name { count = count + 1 }
+                            }
+                        }
+
+                        for candidate : other.module.*.enums {
+                            make candidate_name = candidate.declaration_name.copy()
+
+                            if candidate_name.len() == 0 { candidate_name = candidate.name.copy() }
+
+                            if candidate_name == source_name { count = count + 1 }
+                        }
+                    }
+
+                    if count > 1 {
+                        this.names.push(TypeName {
+                            unit = u,
+                            source = source_name,
+                            symbol = mangle::type_symbol(this.units.*[u].module_name !, source_name.copy()),
+                        })
+                    }
+                }
+            }
+
+            for enumeration : module.*.enums {
+                make source_name = enumeration.declaration_name.copy()
+
+                if source_name.len() == 0 { source_name = enumeration.name.copy() }
+
+                make count: uint = 0
+
+                for other : this.units.* {
+                    for candidate : other.module.*.structs {
+                        if !candidate.is_instance {
+                            make candidate_name = candidate.declaration_name.copy()
+
+                            if candidate_name.len() == 0 { candidate_name = candidate.name.copy() }
+
+                            if candidate_name == source_name { count = count + 1 }
+                        }
+                    }
+
+                    for candidate : other.module.*.enums {
+                        make candidate_name = candidate.declaration_name.copy()
+
+                        if candidate_name.len() == 0 { candidate_name = candidate.name.copy() }
+
+                        if candidate_name == source_name { count = count + 1 }
+                    }
+                }
+
+                if count > 1 {
+                    this.names.push(TypeName { unit = u, source = source_name,
+                        symbol = mangle::type_symbol(this.units.*[u].module_name !, source_name.copy()) })
+                }
+            }
+
+            u = u + 1
+        }
+
+
+        u = 0
+
+        while u < this.units.*.len() {
+            make module = this.units.*[u].module
+
+            // Namespace exports are rebuilt by `resolve_all`, so they are always refreshed for
+            // every unit; this is cheap and keeps retained units consistent with their imports.
+            make ni: uint = 0
+
+            while ni < this.units.*[u].namespaces.*.len() {
+                make ns = this.units.*[u].namespaces.*[ni].pin
+                make j: uint = 0
+
+                while j < ns.*.exports.len() {
+                    if ns.*.exports[j].is_type {
+                        ns.*.exports[j].name = this.lookup(ns.*.unit, ns.*.exports[j].name !)
+                    }
+
+                    if ns.*.exports[j].global_type.len() > 0 {
+                        make target = ns.*.unit
+
+                        if ns.*.exports[j].global_type_namespace.len() > 0 {
+                            target = this.namespace_unit(ns.*.unit, ns.*.exports[j].global_type_namespace.copy())
+                        }
+
+                        if target < this.units.*.len() {
+                            ns.*.exports[j].global_type = this.lookup(target, ns.*.exports[j].global_type.copy())
+                        }
+                    }
+
+                    j = j + 1
+                }
+
+                ni = ni + 1
+            }
+
+            make selected = all
+
+            if !all { selected = u < only.*.len() && only.*[u] }
+
+            if selected {
+                make i: uint = 0
+
+                while i < module.*.structs.len() {
+                    this.body(u, module.*.structs[i].body.pin)
+
+                    if !module.*.structs[i].is_instance {
+                        module.*.structs[i].name = this.lookup(u, module.*.structs[i].name !)
+                    }
+
+                    i = i + 1
+                }
+
+                i = 0
+
+                while i < module.*.enums.len() {
+                    module.*.enums[i].name = this.lookup(u, module.*.enums[i].name !)
+                    i = i + 1
+                }
+
+                i = 0
+
+                while i < module.*.type_aliases.len() {
+                    this.body(u, module.*.type_aliases[i].body.pin)
+                    i = i + 1
+                }
+
+                i = 0
+
+                while i < module.*.items.len() {
+                    if module.*.items[i].kind == hir::HirItemKind.Type || module.*.items[i].kind == hir::HirItemKind.Enum {
+                        if module.*.items[i].display_name.len() == 0 { module.*.items[i].display_name = module.*.items[i].name.copy() }
+
+                        module.*.items[i].name = this.lookup(u, module.*.items[i].name !)
+                    }
+
+                    i = i + 1
+                }
+
+                i = 0
+
+                while i < module.*.funcs.len() {
+                    this.body(u, module.*.funcs[i].body.pin)
+                    i = i + 1
+                }
+
+                i = 0
+
+                while i < module.*.attached_funcs.len() {
+                    module.*.attached_funcs[i].type_name = this.owner_name(u, module.*.attached_funcs[i].type_name !)
+                    i = i + 1
+                }
+
+                i = 0
+
+                while i < module.*.funcs.len() {
+                    make function = module.*.funcs[i].pin
+
+                    if !function.*.is_lambda && function.*.declaration_id.len() == 0 {
+                        make module_key = this.units.*[u].module_name.copy()
+                        function.*.declaration_id = module_key.len().to_str() + ":" + module_key + function.*.name.len().to_str() + ":" + function.*.name
+                    }
+
+                    if function.*.is_attached && !function.*.is_external {
+                        make old = function.*.name !
+                        // The lowered spelling includes the owner and method; hash
+                        // that spelling with the declaration module, never the caller.
+                        make symbol = mangle::attached_link_symbol(this.units.*[u].module_name !, old !)
+                        this.rename_function(u, old, symbol !)
+                        function.*.name = symbol
+                    }
+
+                    i = i + 1
+                }
+
+            }
+
+            u = u + 1
+        }
+
+    }
+}
+
+@pub
+make run (units: ref<mono::MonoUnit[]>) {
+    make qualifier = Qualifier { units = units }
+    make no_selection: bool[] = []
+    qualifier.run(no_selection.pin, true)
+}
+
+// Re-qualify freshly lowered units only. Collision decisions still consider every unit so the
+// names match those produced by a full pass.
+@pub
+make run_for (units: ref<mono::MonoUnit[]>, dirty: ref<bool[]>) {
+    make qualifier = Qualifier { units = units }
+
+    qualifier.run(dirty, false)
+}

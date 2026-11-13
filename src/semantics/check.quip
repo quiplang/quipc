@@ -1,0 +1,337 @@
+@pure @const {
+    make context = @import "../diag/context.quip"
+    make facts = @import "../analysis/facts.quip"
+    make hir = @import "../hir/hir.quip"
+    make util = @import "../util/pkg.quip"
+    make ty = @import "../ty/ty.quip"
+    make diags = @import "../diag/diagnosis.quip"
+    make e = @import "../diag/err.quip"
+}
+
+
+
+@pub
+make block_exits (body: ref<hir::HirBody>, block: uint) -> bool {
+    make i: uint = 0
+
+    while i < body.*.blocks[block].stmts.len() {
+        make stmt = body.*.stmts[body.*.blocks[block].stmts[i]].pin
+
+        if stmt.*.kind == hir::HirStmtKind.Return || stmt.*.kind == hir::HirStmtKind.Break
+            || stmt.*.kind == hir::HirStmtKind.Continue { return true }
+
+        if stmt.*.kind == hir::HirStmtKind.Block && block_exits(body, stmt.*.then_block) { return true }
+
+        if stmt.*.kind == hir::HirStmtKind.If && stmt.*.has_else {
+            if block_exits(body, stmt.*.then_block) && block_exits(body, stmt.*.else_block) { return true }
+        }
+
+        if stmt.*.kind == hir::HirStmtKind.Match {
+            make all_exit = stmt.*.cases.len() > 0
+            make exhaustive = false
+            make ci: uint = 0
+
+            while ci < stmt.*.cases.len() {
+                make hc = body.*.cases[stmt.*.cases[ci]].pin
+
+                if hc.*.kind == hir::HirPatternKind.Wildcard || hc.*.kind == hir::HirPatternKind.Binding { exhaustive = true }
+
+                if !hc.*.has_body { all_exit = false }
+                elif !block_exits(body, hc.*.body) { all_exit = false }
+
+                ci = ci + 1
+            }
+
+            if exhaustive && all_exit { return true }
+        }
+
+        i = i + 1
+    }
+
+    return false
+}
+
+
+/// checks whether a hir function carries the unsafe tag.
+
+
+// A resolved use is recorded during type inference and checked in the semantic phase.
+
+
+
+
+
+
+
+
+
+
+@pub
+make check_uses (body: ref<hir::HirBody>, checks: ref<facts::UseCheck[]>, structs: ref<hir::HirStructSig[]>, diag: ref<diags::Diagnostic>) -> void {
+    for check : checks.* {
+        if check.kind == 0 {
+            make d = diags::Diag.err(e::Err.UnsafeRequired, check.range.copy(), "use of an @unsafe declaration requires an unsafe context")
+            d.help("use an @unsafe statement, block, or function; a safe wrapper must contain an explicit unsafe block")
+            diag.*.report(d)
+        } elif check.kind == 1 {
+            make d = diags::Diag.err(e::Err.UnsafeRequired, check.range.copy(), "call or reference to an @unsafe function requires an unsafe context")
+            d.attach(diags::Label.create(util::Range.of(check.span.start, check.span.end), "@unsafe function declared here"))
+            d.note("the caller is responsible for establishing this function's safety preconditions")
+            d.help("use an @unsafe statement/block/function, or provide a safe wrapper with an explicit unsafe block")
+            diag.*.report(d)
+        } elif check.kind == 2 {
+            make d = diags::Diag.err(e::Err.UnsafeRequired, check.range.copy(), "use of an @unsafe declaration requires an unsafe context")
+
+            if check.has_source && check.span.end > check.span.start {
+                d.attach(diags::Label.in_file(check.path.copy(), check.source.copy(), util::Range.of(check.span.start, check.span.end), "@unsafe declaration is here"))
+            }
+
+            d.note("the caller must establish the declaration's safety preconditions")
+            d.help("use an @unsafe statement/block/function, or a safe wrapper that performs the unsafe operation internally")
+            diag.*.report(d)
+        } elif check.kind == 3 {
+            make d = diags::Diag.err(e::Err.UnsafeRequired, check.range.copy(), "access to an @unsafe field requires an unsafe context")
+            d.label("unsafe field `" + check.name.copy() + "` accessed here")
+            context::attach_field_context(structs, d.*.pin, check.owner.copy(), check.name.copy())
+            d.help("establish the field's safety requirements in an @unsafe context or use a safe accessor")
+            diag.*.report(d)
+        } elif check.kind == 7 {
+            for structure : structs.* {
+                if structure.name == check.owner {
+                    for field : structure.fields {
+                        if field.name == check.name && !field.is_pub {
+                            private_field(structs, diag, check.owner.copy(), check.name.copy(), check.range.copy())
+                        }
+                    }
+                }
+            }
+        } elif check.kind == 5 && !block_exits(body, check.block) {
+            make d = diags::Diag.err(e::Err.TypeMismatch, check.range.copy(), "catch must exit when a success value is required")
+            d.help("return, break, or continue from the error handler")
+            diag.*.report(d)
+        } elif check.kind == 6 {
+            make d = diags::Diag.err(e::Err.InvalidSyntax, check.range.copy(), "match pattern must be a literal or enum variant")
+            diag.*.report(d)
+        } elif check.kind == 4 {
+            make d = diags::Diag.err(e::Err.UnsafeRequired, check.range.copy(), "call to `__syscall` requires an `@unsafe` block")
+            d.label("`__syscall` is an unsafe builtin")
+            d.help("wrap this call in an `@unsafe { ... }` block")
+            diag.*.report(d)
+        }
+    }
+}
+
+/// attaches the field context.
+
+
+/// attaches the origin.
+
+
+/// checks whether a resolved type is supported as a native export scalar.
+make native_export_scalar (tys: ref<ty::TyInterner>, resolved: uint) -> bool {
+    make kind = tys.*.kind_of(resolved)
+
+    return tys.*.is_numeric(resolved) || kind == ty::TyKind.Bool
+        || kind == ty::TyKind.Char || kind == ty::TyKind.Ptr || kind == ty::TyKind.Ref
+}
+
+@pub
+make check_native_intrinsic (tys: ref<ty::TyInterner>, diag: ref<diags::Diagnostic>, function: ref<hir::HirFunc>, params: ref<uint[]>, ret_ty: uint, resolved_ret: uint) {
+    make operation = function.*.intrinsic_name.copy()
+    make count = function.*.body.param_count
+    make valid = function.*.is_external && !function.*.is_variadic && !function.*.is_attached && function.*.export_name.len() == 0
+    make result = tys.*.kind_of(resolved_ret)
+    make address_intrinsic = operation.len() > 15
+    make prefix: str = "native_address:"
+    make pi: uint = 0
+
+    while pi < prefix.len() && address_intrinsic {
+        if operation[pi] != prefix[pi] { address_intrinsic = false }
+
+        pi = pi + 1
+    }
+
+    make constant_intrinsic = operation.len() >= 17
+    make constant_prefix: str = "constant_address:"
+    pi = 0
+
+    while pi < constant_prefix.len() && constant_intrinsic {
+        if operation[pi] != constant_prefix[pi] { constant_intrinsic = false }
+
+        pi = pi + 1
+    }
+
+    if constant_intrinsic {
+        if count != 0 || result != ty::TyKind.Ptr { valid = false }
+    } elif address_intrinsic {
+        if count != 0 || result != ty::TyKind.Ptr { valid = false }
+
+        pi = 15
+
+        while pi < operation.len() {
+            make c = operation[pi]
+            make letter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+
+            if !letter && (pi == 15 || c < '0' || c > '9') { valid = false }
+
+            pi = pi + 1
+        }
+    } elif operation == "global_address" {
+        if count != 0 || result != ty::TyKind.Ptr { valid = false }
+    } elif operation == "native_call" {
+        if count == 0 { valid = false }
+
+        make i: uint = 0
+
+        while i < count {
+            if !native_export_scalar(tys, params.*[i]) { valid = false }
+
+            if i == 0 && tys.*.kind_of(params.*[i]) != ty::TyKind.Ptr { valid = false }
+
+            i = i + 1
+        }
+
+        if ret_ty != ty::TY_VOID && !native_export_scalar(tys, resolved_ret) { valid = false }
+    } else { valid = false }
+
+    if !valid {
+        make d = diags::Diag.err(e::Err.TypeMismatch, function.*.range.copy(), "invalid runtime intrinsic signature")
+        d.help("storage intrinsics return a pointer; native_call takes a raw function pointer followed by scalar arguments")
+        diag.*.report(d)
+    }
+}
+
+@pub
+make check_native_export (module: ref<hir::HirModule>, tys: ref<ty::TyInterner>, diag: ref<diags::Diagnostic>, function: ref<hir::HirFunc>, params: ref<uint[]>, ret_ty: uint, resolved_ret: uint) {
+    make valid = !function.*.is_external && !function.*.is_attached && !function.*.is_lambda
+
+    for tag : function.*.tags {
+        if tag == "entry" || tag == "variadic" { valid = false }
+    }
+
+    if ret_ty != ty::TY_VOID && !native_export_scalar(tys, resolved_ret) { valid = false }
+
+    make i: uint = 0
+
+    while i < function.*.body.param_count {
+        if !native_export_scalar(tys, params.*[i]) { valid = false }
+
+        i = i + 1
+    }
+
+    make name = function.*.export_name.copy()
+    i = 0
+
+    while i < name.len() {
+        make c = name[i]
+        make letter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+
+        if !letter && (i == 0 || c < '0' || c > '9') { valid = false }
+
+        i = i + 1
+    }
+
+    for other : module.*.funcs {
+        if other.name != function.*.name && other.export_name == name { valid = false }
+    }
+
+    if !valid {
+        make d = diags::Diag.err(e::Err.TypeMismatch, function.*.range.copy(), "invalid native export")
+        d.help("use a unique C identifier on a free function with scalar or pointer parameters and a scalar, pointer or void result")
+        diag.*.report(d)
+    }
+}
+
+
+
+
+/// Checks declarations whose validity does not depend on inferred types.
+@pub
+make check_module (module: ref<hir::HirModule>, diag: ref<diags::Diagnostic>) -> void {
+    for item : module.*.items {
+        if item.kind == hir::HirItemKind.Alias && !item.is_pure {
+            make d = diags::Diag.err(e::Err.TypeAliasNotPure, item.range.copy(), "type alias must be '@pure'")
+            d.label("compile-time Type aliases are evaluated during compilation")
+            d.help("add the `@pure` tag to this declaration")
+            diag.*.report(d)
+        }
+    }
+}
+
+
+
+@pub
+make check_array_copy_return (function: ref<hir::HirFunc>, owner: str, returned: str, diag: ref<diags::Diagnostic>) -> void {
+    if returned == owner { return }
+
+    make d = diags::Diag.err(e::Err.TypeMismatch, function.*.range.copy(), "invalid array copy implementation")
+    d.label("`@copy` must take only its implicit receiver and return `" + owner + "`")
+    diag.*.report(d)
+}
+
+/// Checks array-copy declaration shape and uniqueness across the signature registry.
+@pub
+make check_array_copies (module: ref<hir::HirModule>, sigs: ref<hir::HirAttachedSig[]>, diag: ref<diags::Diagnostic>) -> void {
+    for method : module.*.attached_funcs {
+        if method.func < module.*.funcs.len() {
+            make function = module.*.funcs[method.func].pin
+            make owner = method.type_name.copy()
+
+            if facts::is_array_copy(function, owner.copy()) {
+                if !function.*.has_this || function.*.body.param_count != 1 || !function.*.has_ret_ty {
+                    make d = diags::Diag.err(e::Err.TypeMismatch, function.*.range.copy(), "invalid array copy implementation")
+                    d.label("`@copy` must take only its implicit receiver and return `" + owner.copy() + "`")
+                    diag.*.report(d)
+                }
+
+                for other : sigs.* {
+                    if other.is_copy_fn && other.type_name == owner && other.symbol != function.*.name {
+                        make d = diags::Diag.err(e::Err.DuplicateSymbol, function.*.range.copy(), "duplicate array copy implementation")
+                        d.label("`" + owner.copy() + "` has more than one `@copy` implementation")
+                        context::attach_origin(d.*.pin, other.path.copy(), other.source, other.name_span.copy(), "other implementation declared here")
+                        diag.*.report(d)
+                        break
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Checks function declarations after their parameter and return types are resolved.
+@pub
+make check_typed_function (module: ref<hir::HirModule>, index: uint, tys: ref<ty::TyInterner>, params: ref<uint[]>, ret_ty: uint, diag: ref<diags::Diagnostic>) -> void {
+    if index >= module.*.funcs.len() { return }
+
+    make function = module.*.funcs[index].pin
+
+    if function.*.export_name.len() > 0 { check_native_export(module, tys, diag, function, params, ret_ty, ret_ty) }
+
+    if function.*.intrinsic_name.len() > 0 { check_native_intrinsic(tys, diag, function, params, ret_ty, ret_ty) }
+
+}
+
+/// reports an attempt to access a private field from another module.
+@pub
+make private_field (structs: ref<hir::HirStructSig[]>, diag: ref<diags::Diagnostic>, owner: str, name: str, range: util::Range) {
+    make display = owner.copy()
+    make sid: uint = 0
+
+    while sid < structs.*.len() && structs.*[sid].name != owner { sid = sid + 1 }
+
+    if sid < structs.*.len() && structs.*[sid].display_name.len() > 0 { display = structs.*[sid].display_name.copy() }
+
+    make d = diags::Diag.err(e::Err.PrivateField, range, "field `" + name + "` of type `" + display + "` is private")
+    d.label("cannot access this field from another module")
+    context::attach_field_context(structs, d.*.pin, owner, name.copy())
+    d.note("@pub on a type does not make its fields public")
+    d.help("add @pub to `" + display + "." + name + "` if external access is intended, or use a public accessor")
+    diag.*.report(d)
+}
+
+
+
+
+
+
+// Record resolved imported field uses; visibility policy runs in check_uses.

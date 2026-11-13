@@ -1,9 +1,21 @@
 @pure @const {
-make heap: unit = @import "./heap.quip"
+    make heap: unit = @import "./heap.quip"
 }
 
-@pub @const {
-
-make debug: heap::Heap = heap::Heap.init()
-
+@pub @const @global_allocator @default_allocator {
+    make debug: heap::Heap = heap::Heap.init()
 }
+
+// Runtime buffers share the allocator; their lifetimes have separate counters.
+@pub @external make quip_runtime_memory_dump () -> void
+
+// Explicit phase arenas: every allocation after mark must be dead at release.
+@pub @external make quip_runtime_checkpoint () -> uint
+@pub @external make quip_runtime_release_since (mark: uint) -> void
+
+// Opt-in, single-threaded state arenas. After a request function returns, keep
+// every container buffer and nested owned buffer reachable from persistent
+// state, then collect. Unlisted buffers newer than mark become invalid. No
+// request-local reference or concurrent allocator activity may survive collect.
+@pub @external make quip_runtime_arena_keep (buffer: ptr<any>) -> void
+@pub @external make quip_runtime_arena_collect (mark: uint) -> void

@@ -1,45 +1,76 @@
-@pure @const make std = @import "stdlib.quip"
-// remember to check the stdlib path
+@pure @const {
+    make std = @import "../library/std/pkg.quip"
+}
 
-make type Person {
+make type BankAccount {
 
-    // quip is not OOP
-    // functions defined in Type with `@this` tag are regular functions with implicit `this: ptr<Person>` argument
-
-    make name: str
-    make age: int
-
-    @pub @this
-    make greet () {
-        std::io::println("My name is ".to_str() + this.name + " and I am ".to_str() + this.age.to_str())
+    @pub {
+        make owner_name: str
+        make balance: float = 0.0 // default value
     }
 
     @pub
-    make init (name: str, age: int) -> Person {
-        return Person {
-            name = name,
-            age = age
+    make create (o_name: str) -> BankAccount {
+        return BankAccount {
+            owner_name = o_name,
         }
     }
 
+    @pub @this
+    make deposit (amount: float) -> !void {
+        if amount < 0.0 {
+            return error.InvalidAmount
+        }
+
+        this.balance += amount
+    }
+
+    @pub @this
+    make withdraw (amount: float) -> !void {
+        if amount < 0.0 {
+            return error.InvalidAmount
+        }
+
+        if amount > this.balance {
+            return error.InsufficientFunds
+        }
+
+        this.balance -= amount
+    }
+
+    @pub @this
+    make print () -> void {
+        std::io::print("Balance for " + this.owner_name)
+        std::io::println(" : " + this.balance.to_str())
+    }
 }
 
 @pub @entry
-make main () {
-    make john = Person {
-        name = "John",
-        age = 30
+make main () -> int {
+    make account1 = BankAccount.create("John")
+    make account2 = BankAccount {
+        owner_name = "Kate",
     }
-    john.greet()
 
-    Person {
-        name = "Anna",
-        age = 28
-    }.greet()
+    account2.deposit(100.0) catch { err_neg_val() }
 
-    make tim = Person.init("Tim", 48)
-    tim.greet()
-    tim.greet()
+    account1.deposit(70.0) catch { err_neg_val() }
+    account1.withdraw(80.0) catch e {
+        match e {
+            error.InvalidAmount { err_neg_val() }
+
+            error.InsufficientFunds {
+                std::io::println("Withdraw failed becuase of insufficient funds")
+            }
+        }
+    }
+
+    account1.print()
+    account2.print()
 
     return 0
+}
+
+make err_neg_val () -> void {
+    std::io::println("Deposit failed because of negative amount")
 }

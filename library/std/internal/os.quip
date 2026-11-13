@@ -1,0 +1,83 @@
+@pure @const {
+    @target "macos" make os = @import "../os/macos.quip"
+    @target "linux" make os = @import "../os/linux.quip"
+}
+@pure @const { make errno = @import "errno.quip" }
+
+@pub @unsafe @export "quip_abort"
+make os_abort () -> void { os::abort() }
+@unsafe
+make cstring_length (value: ptr<char>) -> uint {
+    make length: uint = 0
+
+    while value[length] != '\0' { length = length + 1 }
+
+    return length
+}
+@pub @unsafe @export "quip_getcwd"
+make os_getcwd (output: ptr<str>) -> int {
+    make buffer: str = ""
+    buffer.reserve(1024) catch { return -1 }
+    @unsafe make null: ptr<char> = 0
+
+    while true {
+        make capacity: int = buffer.capacity
+        make data = buffer.data
+
+        if os::getcwd(data, capacity) != null {
+            make length = cstring_length(data)
+            buffer.set_length(length) catch { return -1 }
+            quip_runtime_string_free(output)
+            output.* = buffer
+            return 0
+        }
+
+        make code = errno::get()
+
+        if code.* != os::ERANGE { return -1 }
+
+        buffer.reserve(capacity) catch { return -1 }
+    }
+
+    return -1
+}
+@pub @unsafe @export "quip_getenv"
+make os_getenv (name: ptr<str>, output: ptr<str>) -> int {
+    make data = os::getenv(name.*.data)
+    @unsafe make null: ptr<char> = 0
+
+    if data == null { return -1 }
+
+    quip_runtime_string_from_static(output, data, cstring_length(data))
+    return 0
+}
+@pub @unsafe @export "quip_file_read_fd"
+make os_read_file (fd: int, output: ptr<str>) -> int {
+    quip_runtime_string_free(output)
+    @unsafe make native_fd: i32 = fd
+
+    while true {
+        make length: int = output.*.length
+        output.*.reserve(65536) catch { return -1 }
+        make capacity: int = output.*.capacity
+        make data = output.*.data
+        make count = os::read(native_fd, data + length, capacity - length - 1)
+
+        if count < 0 {
+            make code = errno::get()
+
+            if code.* == 4 { continue }
+
+            return -1
+        }
+
+        if count == 0 { return length }
+
+        output.*.set_length(length + count) catch { return -1 }
+    }
+
+    return -1
+}
+
+@unsafe @external make quip_runtime_string_free (value: ptr<str>) -> void
+@unsafe @external make quip_runtime_string_from_static (value: ptr<str>, data: ptr<char>, length: int) -> void

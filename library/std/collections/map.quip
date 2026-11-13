@@ -1,79 +1,138 @@
-make type MapEntry <V> {
-    make key: str
-    make value: V
+@pure @const {
+    make io: unit = @import "../io/pkg.quip"
+    make mem: unit = @import "../mem/pkg.quip"
 }
 
+
+make type MapEntry <V> {
+
+    make active: bool = false
+
+    @pub {
+        make key: str
+        make value: V
+    }
+
+    @pub @this
+    make is_active () -> bool { return this.active }
+
+    @pub @this
+    make set_active (a: bool) -> void { this.active = a }
+}
+
+/// map storing key-value pairs
+/// this implementation uses array for iteration, which is efficient for small maps
+/// use HashMap for large maps
 @pub
 make type Map <V> {
 
-    make entries: MapEntry<V>[]
+    make entries: MapEntry<V>[] = []
+    make count: uint = 0
 
+    /// initialize a new map
     @pub
     make create () -> Map <V> {
-        return Map <V> {
-            entries = []
-        }
+        return .{}
     }
 
+    /// push a key-value pair into the map
     @pub @this
-    make push (key: str, value: V) {
-        match this.get_index(key.pin) {
-            none { // insert a value
-                this.entries.push(.{
-                    key = key,
-                    value = value
-                })
+    make push (key: str, value: V) -> void {
+        make insert: bool = false
+
+        make index: uint = 0
+        for entry : this.entries {
+
+            if entry.is_active() {
+                if entry.key == key {
+                    insert = true
+                    break
+                }
+
+            } else { // value isn't acitve, can reuse its slot
+                insert = true
+                break
             }
 
-            some { // update
-                this.entries[some].value = value
-            }
+            index += 1
         }
+
+        if insert {
+            make entry = this.entries[index].pin
+
+            if entry.*.is_active() {
+                entry.*.value = value
+            } else { // value isn't acitve, can reuse its slot
+
+                this.count++
+                entry.*.key = key
+                entry.*.value = value
+                entry.*.set_active(true)
+            }
+
+            return
+        }
+
+        make e: MapEntry <V> = .{
+            key = key,
+            value = value
+        }
+
+        e.set_active(true)
+        this.entries.push(e)
+        this.count++
     }
 
+    /// remove a key-value pair from the map
     @pub @this
-    make remove (key: str) -> !V {
-        match this.get_index(key.pin) {
-            none { return error.NotFound }
+    make pop (key: str) -> !V {
 
-            some {
-                return this.entries.remove(some).value
+        for entry : this.entries {
+
+            if entry.is_active() {
+                if entry.key == key {
+                    entry.set_active(false)
+                    this.count--
+                    return entry.value
+                }
             }
         }
+
+        return error.KeyNotFound
     }
 
-    // @pub @this
-    // make get (key: str) -> !ref<V> {
-    // }
+    /// get the value associated with a key
+    @pub @this
+    make get (key: str) -> !V {
+        for entry : this.entries {
+            if entry.is_active() {
+                if entry.key == key {
+                    return entry.value
+                }
+            }
+        }
 
+        return error.KeyNotFound
+    }
+
+    /// check if the map contains a key
     @pub @this
     make contains (key: str) -> bool {
-        match this.get_index(key.pin) {
-            none { return false }
-            some { return true }
-        }
-    }
-
-    @pub @this
-    make len () -> int {
-        return this.entries.len()
-    }
-
-    // @pub @this
-    // make clear () {
-    // }
-
-    @this
-    make get_index (key: ref<str>) -> int? {
-        make i: int = 0
-        while i < this.entries.len() {
-            if this.entries[i].key == key.* {
-                return i
+        for entry : this.entries {
+            if entry.is_active() {
+                if entry.key == key {
+                    return true
+                }
             }
-
-            i = i + 1
         }
 
-        return none
+        return false
     }
+
+    /// get the number of key-value pairs in the map
+    @pub @this
+    make len () -> uint {
+        return this.count
+    }
+
 }

@@ -1,5 +1,5 @@
 @pure @const {
-    make std: unit = @import "std.quip"
+    make std: unit = @import "std"
 }
 
 @pub @entry

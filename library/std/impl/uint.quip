@@ -1,0 +1,30 @@
+@impl uint
+@static
+make max () -> uint {
+    return 0xffffffff
+}
+
+@impl u8
+@static
+make max () -> u8 {
+    return 0xff
+}
+
+@impl u16
+@static
+make max () -> u16 {
+    return 0xffff
+}
+
+
+@impl u32
+@static
+make max () -> u32 {
+    return 0xffffffff
+}
+
+@impl u64
+@static
+make max () -> u64 {
+    return 0xffffffffffffffff
+}

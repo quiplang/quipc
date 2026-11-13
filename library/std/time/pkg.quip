@@ -1,0 +1,193 @@
+// Monotonic elapsed time, whole-unit durations, sleeping and Unix timestamps.
+@external
+make quip_time_monotonic_ns (output: ref<uint>) -> int
+
+@external
+make quip_time_unix_seconds (output: ref<int>) -> int
+
+@external
+make quip_time_sleep_ns (nanoseconds: uint) -> int
+
+@pub
+make type Duration {
+
+    @pub {
+        make nanoseconds: uint = 0
+    }
+
+    @pub @this @copy
+    make copy () -> Duration {
+        return Duration.from_nanos(this.nanoseconds)
+    }
+
+    @pub
+    make from_nanos (value: uint) -> Duration {
+        return Duration {
+            nanoseconds = value,
+        }
+    }
+
+    @pub
+    make from_micros (value: uint) -> !Duration {
+        if value > 18446744073709551 {
+            return error.DurationOverflow
+        }
+
+        return Duration.from_nanos(value * 1000)
+    }
+
+    @pub
+    make from_millis (value: uint) -> !Duration {
+        if value > 18446744073709 {
+            return error.DurationOverflow
+        }
+
+        return Duration.from_nanos(value * 1000000)
+    }
+
+    @pub
+    make from_secs (value: uint) -> !Duration {
+        if value > 18446744073 {
+            return error.DurationOverflow
+        }
+
+        return Duration.from_nanos(value * 1000000000)
+    }
+
+    @pub @this
+    make as_nanos () -> uint {
+        return this.nanoseconds
+    }
+
+    @pub @this
+    make as_micros () -> uint {
+        return this.nanoseconds / 1000
+    }
+
+    @pub @this
+    make as_millis () -> uint {
+        return this.nanoseconds / 1000000
+    }
+
+    @pub @this
+    make as_secs () -> uint {
+        return this.nanoseconds / 1000000000
+    }
+}
+
+@pub
+make type Instant {
+
+    @pub {
+        make nanoseconds: uint = 0
+    }
+
+    @pub @this @copy
+    make copy () -> Instant {
+        return Instant {
+            nanoseconds = this.nanoseconds,
+        }
+    }
+
+    @pub
+    make now () -> !Instant {
+        make value: uint = 0
+
+        if quip_time_monotonic_ns(value.pin) != 0 {
+            return error.ClockFailed
+        }
+
+        return Instant {
+            nanoseconds = value,
+        }
+    }
+
+    @pub @this
+    make duration_since (earlier: Instant) -> !Duration {
+        if this.nanoseconds < earlier.nanoseconds {
+            return error.InstantOutOfOrder
+        }
+
+        return Duration.from_nanos(this.nanoseconds - earlier.nanoseconds)
+    }
+
+    @pub @this
+    make elapsed () -> !Duration {
+        make current = Instant.now() catch err {
+            return err
+        }
+
+        return current.duration_since(this.* !) catch err {
+            return err
+        }
+    }
+}
+
+@pub
+make type Timer {
+
+    @pub {
+        make started: Instant
+    }
+
+    @pub
+    make start () -> !Timer {
+        make instant = Instant.now() catch err {
+            return err
+        }
+
+        return Timer {
+            started = instant,
+        }
+    }
+
+    @pub @this
+    make read () -> !Duration {
+        return this.started.elapsed() catch err {
+            return err
+        }
+    }
+
+    @pub @this
+    make reset () -> !void {
+        this.started = Instant.now() catch err {
+            return err
+        }
+    }
+
+    // Return elapsed time and start the next interval at the same clock reading.
+    @pub @this
+    make lap () -> !Duration {
+        make current = Instant.now() catch err {
+            return err
+        }
+
+        make elapsed = current.duration_since(this.started !) catch err {
+            return err
+        }
+
+        this.started = current
+        return elapsed
+    }
+}
+
+@pub
+make sleep (duration: Duration) -> !void {
+    if quip_time_sleep_ns(duration.nanoseconds) != 0 {
+        return error.SleepFailed
+    }
+}
+
+// Wall-clock seconds since 1970-01-01 UTC. Use Instant/Timer for intervals.
+@pub
+make unix_timestamp () -> !int {
+    make value: int = 0
+
+    if quip_time_unix_seconds(value.pin) != 0 {
+        return error.ClockFailed
+    }
+
+    return value
+}
+
+@pure @const make native = @import "../internal/time.quip"

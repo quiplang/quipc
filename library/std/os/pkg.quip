@@ -1,44 +1,63 @@
 @pure @const {
+    make mem: unit = @import "../mem/pkg.quip"
+    make ffi: unit = @import "../ffi/c.quip"
+    make runtime: unit = @import "../../runtime/pkg.quip"
 
-make heap: unit = @import "../mem/pkg.quip"
+    make std: unit = @import "../pkg.quip"
 
+    @target "macos" make macos: unit = @import "macos.quip"
 }
 
 @pub @pure @const {
-
-make syscall: unit = @import "syscall.quip"
-
+    @target "macos" make platform: unit = @import "macos.quip"
+    @target "linux" make platform: unit = @import "linux.quip"
+    make syscall: unit = @import "syscall.quip"
 }
 
 
+
+// Copy libc's cwd buffer into Quip-owned storage, then release the libc allocation.
 @pub
-make getcwd() -> str {
+make getcwd () -> str {
 
-    @unsafe {
+    @target "macos" {
 
-        make result: str = ""
+        make buffer = mem::debug.alloc((@sizeof ffi::c_char) * macos::PATH_MAX).unwrap()
+        @unsafe make t: ptr<ffi::c_char> = macos::getcwd(buffer, macos::PATH_MAX)
 
-        if syscall::quip_getcwd(result.pin) < 0 {
-            return result
-        }
-
+        make result = ffi::to_str(t)
         return result
 
     }
+
+    @weak {
+        runtime::runtime_panic("unsupported platform".to_c_str(), "std/pkg.quip".to_c_str(), 32)
+    }
+
+    @unsafe if syscall::quip_getcwd(result.pin) < 0 { return result }
+
+    return result
 }
 
 @pub
-make getenv(name: str) -> str {
-
-    @unsafe {
-
+make getenv (name: str) -> str {
+    @target "macos" {
         make result: str = ""
+        make key = name.copy()
+        key.push('\0')
 
-        if syscall::quip_getenv(name.data, result.pin) < 0 {
-            return result
-        }
+        @unsafe make value = macos::getenv(key.data)
+        @unsafe make null: ptr<char> = 0x0
+
+        if value == null { return result }
+
+        make i: uint = 0
+        while value[i] != '\0' { result.push(value[i]) i = i + 1 }
 
         return result
+    }
 
+    @weak {
+        std::panic("unsupported platform", "std/os/pkg.quip", 61)
     }
 }

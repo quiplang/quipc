@@ -1,0 +1,94 @@
+// Linux LP64 libc bindings. Quip buffers must be released by their allocator.
+@target "linux" {
+    @pub @unsafe @external make strtod (text: ptr<char>, end: ptr<ptr<char>>) -> f64
+    @pub make type timespec { make tv_sec: i64 = 0 make tv_nsec: i64 = 0 }
+
+    @pub @const {
+        make MAP_PRIVATE: i32 = 2
+        make MAP_ANON: i32 = 32
+        make CLOCK_REALTIME: u32 = 0
+        make CLOCK_MONOTONIC: u32 = 1
+        make ERANGE: i32 = 34
+        make EOVERFLOW: i32 = 75
+        make F_DUPFD: i32 = 0
+    }
+
+    @pub @unsafe @external make getpagesize () -> i32
+
+    @pub @unsafe @external make mmap (address: ptr<any>, length: u64, protection: i32, flags: i32, descriptor: i32, offset: i64) -> ptr<any>
+
+    @pub @unsafe @external make munmap (address: ptr<any>, length: u64) -> i32
+
+    @pub @unsafe @external make clock_gettime (clock: u32, output: ptr<timespec>) -> i32
+
+    @pub @unsafe @external make nanosleep (requested: ptr<timespec>, remaining: ptr<timespec>) -> i32
+
+    @pub @unsafe @external make __errno_location () -> ptr<i32>
+
+    @pub @unsafe @external make fork () -> i32
+
+    @pub @unsafe @external make execvp (path: ptr<char>, arguments: ptr<ptr<char>>) -> i32
+
+    @pub @unsafe @external make waitpid (pid: i32, status: ptr<i32>, options: i32) -> i32
+
+    @pub @unsafe @external make kill (pid: i32, signal: i32) -> i32
+
+    @pub @unsafe @external make dup2 (source: i32, destination: i32) -> i32
+    @pub @unsafe @external @variadic make fcntl (fd: i32, command: i32) -> i32
+
+    @pub @unsafe @external make close (fd: i32) -> i32
+
+    @pub @unsafe @external make pipe (output: ptr<i32>) -> i32
+
+    @pub @unsafe @external make _exit (status: i32) -> void
+
+    @pub @unsafe @external make exit (status: i32) -> void
+
+    @pub @unsafe @external make abort () -> void
+
+    @pub @unsafe @external make strerror (code: i32) -> ptr<char>
+
+    @pub @unsafe @external make getcwd (buffer: ptr<char>, size: u64) -> ptr<char>
+
+    @pub @unsafe @external make getenv (name: ptr<char>) -> ptr<char>
+
+    @pub @unsafe @external make read (fd: i32, buffer: ptr<any>, size: u64) -> i64
+
+    @pub @unsafe @external @variadic make printf (format: ptr<char>) -> i32
+
+    @pub @unsafe @external @variadic make dprintf (fd: i32, format: ptr<char>) -> i32
+    @pub @unsafe @external @variadic make open (path: ptr<char>, flags: i32) -> i32
+    @pub @unsafe @external make fstat (fd: i32, buffer: ptr<any>) -> i32
+    @pub @unsafe @external make uname (buffer: ptr<any>) -> i32
+    @pub @unsafe @external make write (fd: i32, buffer: ptr<any>, size: u64) -> i64
+    @pub @unsafe @external make access (path: ptr<char>, mode: i32) -> i32
+    @pub @unsafe @external make mkstemp (template: ptr<char>) -> i32
+    @pub @unsafe @external make fsync (fd: i32) -> i32
+    @pub @unsafe @external make rename (source: ptr<char>, destination: ptr<char>) -> i32
+    @pub @unsafe @external make unlink (path: ptr<char>) -> i32
+    @pub @unsafe @external make readlink (path: ptr<char>, buffer: ptr<char>, size: u64) -> i64
+    @pub @unsafe @external make realpath (path: ptr<char>, resolved: ptr<char>) -> ptr<char>
+    @pub @unsafe @external make setenv (name: ptr<char>, value: ptr<char>, overwrite: i32) -> i32
+
+    @pub @pure @const make nfds_t: Type = u64
+    @pub @const {
+        make SIG_BLOCK: i32 = 0
+        make SIG_SETMASK: i32 = 2
+        make SIGTSTP: i32 = 20
+        make TIOCGWINSZ: u64 = 21523
+        make FD_CLOEXEC: i32 = 1
+    }
+    @pub @unsafe @external make sigemptyset (mask: ptr<any>) -> i32
+    @pub @unsafe @external make sigaddset (mask: ptr<any>, signal: i32) -> i32
+    @pub @unsafe @external make sigprocmask (operation: i32, mask: ptr<any>, previous: ptr<any>) -> i32
+    @pub @unsafe @external make sigaction (signal: i32, action: ptr<any>, previous: ptr<any>) -> i32
+    @pub @unsafe @external make signal (signal: i32, handler: ptr<any>) -> ptr<any>
+    @pub @unsafe @external make raise (signal: i32) -> i32
+    @pub @unsafe @external make atexit (callback: ptr<any>) -> i32
+    @pub @unsafe @external @variadic make ioctl (fd: i32, request: u64) -> i32
+    @pub @unsafe @external make poll (fds: ptr<any>, count: nfds_t, timeout: i32) -> i32
+    @pub @unsafe @external make isatty (fd: i32) -> i32
+    @pub @unsafe @external make strlen (text: ptr<char>) -> u64
+    @pub @unsafe @external make strcmp (left: ptr<char>, right: ptr<char>) -> i32
+    @pub @const make F_SETFD: i32 = 2
+}

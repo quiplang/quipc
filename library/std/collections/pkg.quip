@@ -6,19 +6,19 @@
     make io: unit = @import "../io/pkg.quip"
 
     make fmt: unit = @import "../fmt/pkg.quip"
+
 }
 
-@pub @const
+@pub @const @pure
 make Iterator<V>: Type = iterator::Iterator<V>
 
-@pub @const
+@pub @const @pure
 make HashMap<K, V>: Type = hashmap::HashMap<K, V>
 
-@pub @const
+@pub @const @pure
 make Map<V>: Type = map::Map<V>
 
 
-// ====
 
 @pub
 make split (buffer: variant<String, str, ptr<char>>, c: char) -> str[] {
@@ -46,6 +46,7 @@ make split (buffer: variant<String, str, ptr<char>>, c: char) -> str[] {
         } else {
             current = current + s[i]
         }
+
         i = i + 1
     }
 

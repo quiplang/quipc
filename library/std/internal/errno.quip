@@ -1,0 +1,12 @@
+@pure @const {
+    @target "macos" make os = @import "../os/macos.quip"
+    @target "linux" make os = @import "../os/linux.quip"
+}
+
+@pub @unsafe
+make get () -> ptr<i32> {
+    @target "macos" { return os::__error() }
+    @target "linux" { return os::__errno_location() }
+    @unsafe make null: ptr<i32> = 0
+    return null
+}

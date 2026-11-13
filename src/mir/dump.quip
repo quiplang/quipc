@@ -1,0 +1,251 @@
+// textual MIR, printed with `--emit-mir`
+//
+// a postfix copy (`!`) applies to the whole expression it ends, so copied strings are bound to a local
+// before they are concatenated
+
+@pure @const {
+make std = @import "std"
+
+make mir = @import "mir.quip"
+}
+
+/// prints a human-readable representation of a mir module.
+@pub
+make print (module: ref<mir::MirModule>) -> void {
+    make i = 0
+
+    while i < module.*.funcs.len() {
+        print_func(module.*.funcs[i].pin)
+        std::io::println("")
+        i = i + 1
+    }
+}
+
+make print_func (f: ref<mir::MirFunc>) -> void {
+    make body = f.*.body.pin
+
+    make name = f.*.name !
+    make sig: str = "fn " + name + "("
+
+    make pi: uint = 1
+
+    while pi <= body.*.param_count {
+        if pi > 1 { sig = sig + ", " }
+
+        make ty = body.*.locals[pi].ty !
+        sig = sig + local_str(pi) + ": " + ty
+        pi = pi + 1
+    }
+
+    sig = sig + ")"
+
+    if f.*.ret_ty.len() > 0 {
+        make ret = f.*.ret_ty !
+        sig = sig + " -> " + ret
+    }
+
+    std::io::println(sig + " {")
+
+    make li: uint = 0
+
+    while li < body.*.locals.len() {
+        std::io::println(local_decl_str(body.*.locals[li].pin, li))
+        li = li + 1
+    }
+
+    make bi: uint = 0
+
+    while bi < body.*.terms.len() {
+        std::io::println("")
+        std::io::println("    " + block_str(bi) + ": {")
+
+        make si = 0
+
+        while si < body.*.stmts.len() {
+            make s = body.*.stmts[si].pin
+
+            if s.*.block == bi {
+                std::io::println("        " + stmt_str(s))
+            }
+
+            si = si + 1
+        }
+
+        std::io::println("        " + term_str(body.*.terms[bi].pin))
+        std::io::println("    }")
+        bi = bi + 1
+    }
+
+    std::io::println("}")
+}
+
+/// gets the local for the declaration string.
+make local_decl_str (l: ref<mir::MirLocal>, id: uint) -> str {
+    make line: str = "    let " + local_str(id)
+
+    if l.*.ty.len() > 0 {
+        make ty = l.*.ty !
+        line = line + ": " + ty
+    }
+
+    make name = l.*.name !
+
+    if id == 0 {
+        line = line + "    // return place"
+    } elif l.*.is_temp {
+        line = line + "    // temp"
+    } elif l.*.is_param {
+        line = line + "    // param " + name
+    } else {
+        line = line + "    // " + name
+    }
+
+    return line
+}
+
+/// gets the local for the string.
+make local_str (local: uint) -> str {
+    return "_" + local.to_str()
+}
+
+/// processes the block for the string.
+make block_str (block: uint) -> str {
+    return "bb" + block.to_str()
+}
+
+/// processes the place for the string.
+make place_str (p: ref<mir::MirPlace>) -> str {
+    make s = local_str(p.*.local)
+
+    make i = 0
+
+    while i < p.*.projs.len() {
+        make proj = p.*.projs[i].pin
+
+        match proj.*.kind {
+            mir::MirProjKind.Field {
+                make field = proj.*.name !
+                s = s + "." + field
+            }
+
+            mir::MirProjKind.Deref { s = s + ".*" }
+
+            mir::MirProjKind.Index { s = s + "[" + local_str(proj.*.index) + "]" }
+        }
+
+        i = i + 1
+    }
+
+    return s
+}
+
+/// processes the operand for the string.
+make operand_str (op: ref<mir::MirOperand>) -> str {
+    match op.*.kind {
+        mir::MirOperandKind.Const {
+            make lit: str = op.*.lit.lexeme !
+
+            return "const " + lit
+        }
+
+        mir::MirOperandKind.Copy { return "copy " + place_str(op.*.place.pin) }
+
+        mir::MirOperandKind.Move { return "move " + place_str(op.*.place.pin) }
+
+        mir::MirOperandKind.Path {
+            make path = op.*.name !
+
+            return path
+        }
+    }
+
+    return ""
+}
+
+/// formats a comma-separated list of mir operands.
+make operands_str (ops: ref<mir::MirOperand[]>) -> str {
+    make s: str = ""
+    make i = 0
+
+    while i < ops.*.len() {
+        if i > 0 { s = s + ", " }
+
+        s = s + operand_str(ops.*[i].pin)
+        i = i + 1
+    }
+
+    return s
+}
+
+/// processes an rvalue for the string.
+make rvalue_str (rv: ref<mir::MirRvalue>) -> str {
+    make op = rv.*.op !
+
+    match rv.*.kind {
+        mir::MirRvalueKind.Use { return operand_str(rv.*.a.pin) }
+
+        mir::MirRvalueKind.OptionalPayload { return "payload(" + operand_str(rv.*.a.pin) + ")" }
+
+        mir::MirRvalueKind.Binary {
+            return operand_str(rv.*.a.pin) + " " + op + " " + operand_str(rv.*.b.pin)
+        }
+
+        mir::MirRvalueKind.Unary { return op + operand_str(rv.*.a.pin) }
+
+        mir::MirRvalueKind.Pin { return place_str(rv.*.place.pin) + ".pin" }
+
+        mir::MirRvalueKind.Aggregate { return "{ " + operands_str(rv.*.ops.pin) + " }" }
+
+        mir::MirRvalueKind.Unsupported {
+            make what = rv.*.name !
+
+            return "unsupported(" + what + ")"
+        }
+    }
+
+    return ""
+}
+
+/// processes the statement for the string.
+make stmt_str (s: ref<mir::MirStmt>) -> str {
+    match s.*.kind {
+        mir::MirStmtKind.Assign { return place_str(s.*.place.pin) + " = " + rvalue_str(s.*.rvalue.pin) }
+
+        mir::MirStmtKind.StorageLive { return "StorageLive(" + local_str(s.*.local) + ")" }
+
+        mir::MirStmtKind.StorageDead { return "StorageDead(" + local_str(s.*.local) + ")" }
+
+        mir::MirStmtKind.Unsupported {
+            make what = s.*.name !
+
+            return "unsupported(" + what + ")"
+        }
+    }
+
+    return ""
+}
+
+/// processes the terminator for the string.
+make term_str (t: ref<mir::MirTerm>) -> str {
+    match t.*.kind {
+        mir::MirTermKind.None { return "<unterminated>" }
+
+        mir::MirTermKind.Goto { return "goto -> " + block_str(t.*.target) }
+
+        mir::MirTermKind.Branch {
+            return "branch " + operand_str(t.*.cond.pin) + " -> [true: " + block_str(t.*.target)
+                + ", false: " + block_str(t.*.other) + "]"
+        }
+
+        mir::MirTermKind.Call {
+            return place_str(t.*.dest.pin) + " = call " + operand_str(t.*.func.pin) + "("
+                + operands_str(t.*.args.pin) + ") -> " + block_str(t.*.target)
+        }
+
+        mir::MirTermKind.Return { return "return" }
+
+        mir::MirTermKind.Unreachable { return "unreachable" }
+    }
+
+    return ""
+}

@@ -1,17 +1,49 @@
 @pure @const {
-make std = @import "../../library/std/pkg.quip"
+    make std = @import "std"
 
-make um = @import "unit_manager.quip"
-make configuration = @import "config.quip"
+    make um = @import "unit_manager.quip"
+    make configuration = @import "config.quip"
+
+    make llvm = @import "../llvm/pkg.quip"
+    make memr = @import "../memory/report.quip"
+    make mono = @import "../hir/mono.quip"
+    make qualify = @import "../semantics/symbol/qualify.quip"
+    make hashing = @import "fingerprint.quip"
 }
 
+/// create `path` and every missing parent directory, e.g. "target/debug" when "target" is absent.\
+/// `Dir.mkdir` is a single-level `mkdir(2)`, so nested build directories need each prefix first.
+make ensure_dir (path: str) {
+    make prefix: str = ""
+    make i: uint = 0
+
+    while i < path.len() {
+        make c = path[i]
+
+        if c == '/' {
+            if prefix.len() > 0 {
+                make parent = std::io::Path.create(prefix.copy())
+                std::io::Dir.mkdir(parent.pin, std::io::MODE_DIRECTORY) catch {}
+            }
+        }
+
+        prefix = prefix + c
+        i = i + 1
+    }
+
+    make final = std::io::Path.create(path)
+    std::io::Dir.mkdir(final.pin, std::io::MODE_DIRECTORY) catch {}
+}
+
+/// coordinates compilation, building, and execution for one configuration.
 @pub
 make type Driver {
 
-    make manager: um::UnitManager
-    make config: configuration::Config
-    // make pipeline: pipe::Pipeline
+    @pub make manager: um::UnitManager? = none
+    @pub make config: configuration::Config
 
+
+    /// initializes a new driver with default configuration
     @pub
     make init () -> Driver {
         return Driver {
@@ -19,65 +51,559 @@ make type Driver {
         }
     }
 
+    /// compiles and runs the project build script using the current compiler.
     @pub @this
     make build () -> !void {
 
-        make f = std::io::File.open(std::io::Path.create("./build.quip")) catch {
+        make f = std::io::File.open(std::io::Path.create("./build.quip"), "r") catch {
             return error.FileNotFound
         }
+
         f.close()
 
-        make b = std::Build.default()
-        b.entry_file = std::io::Path.create("./build.quip")
-        b.entry_point = "build"
+        make compiler = hashing::executable()
 
-        make exe = std::Executable.default()
-        exe.name = "build"
-        exe.path_build = std::io::Path.create("./.build")
-
-        b.executables.push(exe)
-        b.proceed() catch err {
-            return err
-        }
-
-        make cmd = std::process::Command.create("target/.build/build", [])
-
-        if std::process::Process.run(cmd) != 0 {
+        if compiler.len() == 0 {
+            std::progress::clear()
+            std::io::println("unable to locate the running compiler")
             return error.FailedToBuild
         }
+
+        make runner_path = this.profile_path() + "/intermediate/build/build"
+        make runner = Driver.init()
+        runner.config.input = std::io::Path.create("build.quip")
+        runner.config.output = std::io::Path.create(runner_path.copy())
+        runner.config.output_set = true
+        runner.config.mode = this.config.mode
+        runner.config.intermediate_directory = this.profile_path() + "/intermediate/build/files"
+        runner.config.package_names = this.config.package_names !
+
+        for path : this.config.package_paths.iter() { runner.config.package_paths.push(path.copy()) }
+
+        runner.config.keep_llvm = this.config.keep_llvm
+        runner.config.options.show_quipc_debug = this.config.options.show_quipc_debug
+        runner.config.progress = this.config.progress
+        // Accept either main/build (or another uniquely tagged entry function).
+        runner.config.entry = ""
+
+        if this.config.entry_set { runner.config.entry = this.config.entry ! }
+
+        runner.compile() catch {
+            std::progress::clear()
+            return error.FailedToBuild
+        }
+
+        std::progress::target("")
+
+        make args: str[] = ["--quip-build-args", compiler, this.config.build_step.copy()]
+        if this.config.mode == std::Mode.Release { args.push("--release") }
+        match this.config.optimization {
+            std::Optimization.Standard { args.push("-O2") }
+            std::Optimization.Aggressive { args.push("-O3") }
+            std::Optimization.Size { args.push("-Os") }
+            _ {}
+        }
+        if this.config.keep_llvm { args.push("--keep-llvm") }
+        if !this.config.progress { args.push("--no-progress") }
+        if this.config.options.show_quipc_debug { args.push("--verbose") }
+
+        make pi: uint = 0
+        while pi < this.config.package_names.len() {
+            args.push("--alias")
+            args.push(this.config.package_names[pi].copy())
+            args.push(this.config.package_paths[pi].get())
+            pi++
+        }
+        args.push("--")
+
+        for library : this.config.native_libraries.iter() {
+            args.push("--link")
+            args.push(library.copy())
+        }
+        for argument : this.config.build_args.iter() { args.push(argument.copy()) }
+
+        std::progress::phase("Run script", 0, 0, "build.quip")
+        std::progress::clear()
+        make cmd = std::process::Command.create("./" + runner_path, args)
+        make code = std::process::Process.run(cmd)
+
+        if code != 0 {
+            std::progress::clear()
+            std::io::println("build.quip failed with status " + code.to_str())
+            return error.FailedToBuild
+        }
+
+        return
     }
 
+    /// builds and runs the configured program, returning its exit status.
     @pub @this
-    make compile () -> !void {
-        make f = std::io::File.open(this.config.input) catch {
+    make run () -> !int {
+        if this.config.run_project && !this.config.entry_set && !this.config.output_set && file_exists("build.quip") {
+            this.build() catch err { return err }
+        } else {
+            this.compile() catch err { return err }
+        }
+
+        std::progress::finish(true)
+        make executable = this.executable_path()
+
+        if !file_exists(executable.copy()) {
+            std::io::println("built executable was not found: " + executable + "; use --name to select the build script's executable")
             return error.FileNotFound
         }
-        f.close()
 
-        // if the main file doesn't compile return an error
-        make manager = um::UnitManager.init(this.config.input) catch err {
-            return err
+        if executable.len() > 0 && executable[0] != '/' { executable = "./" + executable }
+
+        make command = std::process::Command.create(executable, this.config.run_args !)
+        make code = std::process::Process.run(command)
+
+        if code < 0 { return 128 - code }
+
+        return code
+    }
+
+    /// compiles the configured input and produces the requested output.
+    @pub @this
+    make compile () -> !void {
+        if this.config.platform_name.len() == 0 {
+            std::progress::clear()
+            std::io::println("unable to detect the native platform; specify --platform")
+            return error.CompilationAborted
         }
-        // manager.set_packages(this.config.package_names, this.config.package_paths)
-        this.manager = manager
 
-        for unit : this.manager.units.iter() {
+        std::progress::target(this.executable_path())
 
-            unit.proceed() catch  err {
-                match err {
+        // Host lowers `name: Type` as Binding (always-match). Bare `some` is the optional
+        // Some-pattern with a null check — required for large optionals like UnitManager?.
+        match this.config.input {
+            none {
+                std::progress::clear()
+                std::io::println("missing input file")
+                return error.CompilationAborted
+            }
 
-                    error.IdentifierTooLong {
-                        std::io::println("identifier too long")
+            some {
+                make f = std::io::File.open(some.pin, "r") catch {
+                    return error.FileNotFound
+                }
+
+                f.close()
+
+                // phase 1 (Declare): parse the entry file and everything it imports,
+                // recursively, building the dependency-ordered compilation stack
+                std::progress::phase("Discover", 0, 0, some.get())
+                make paths: std::io::Path[] = []
+
+                for path : this.config.package_paths.iter() { paths.push(path.copy()) }
+
+                make manager = um::UnitManager.init(some.copy(), this.config.package_names !,
+                    paths, this.config.options.hide_warnings) catch err { return err }
+
+                // phase 2 (Resolve): link every `@import` alias to its already-declared unit
+                manager.resolve_all()
+
+
+                this.manager = manager
+
+            }
+        }
+
+        // phase 3: register every unit, then typecheck. attached functions (`@impl`) are
+        // visible everywhere, so no unit may be checked until every unit has been lowered.
+        match this.manager {
+            none {}
+            some {
+                make mgr = some.pin
+
+                make cache = this.intermediate_path()
+                ensure_dir(cache + "/.llvm")
+                ensure_dir(cache + "/objects")
+                make build_dir = std::io::Path.create(cache.copy())
+                make ir_dir = build_dir.add(".llvm")
+                make object_dir = build_dir.add("objects")
+
+                if !this.config.emit_llvm && !this.config.emit_mem && !this.config.emit_mir {
+                    llvm::object::initialize()
+                }
+
+                make objs: str[] = []
+                make si: uint = 0
+
+                while si < mgr.*.compilation_stack.len() {
+                    make id = mgr.*.compilation_stack[si]
+                    std::progress::phase("Lower", si, mgr.*.compilation_stack.len(), mgr.*.units[id].path_rel.get())
+                    mgr.*.units[id].verbose = this.config.options.show_quipc_debug
+
+                    mgr.*.units[id].emit_mir = this.config.emit_mir
+                    mgr.*.units[id].emit_mem = this.config.emit_mem
+
+                    mgr.*.units[id].emit_llvm = true
+
+
+                    mgr.*.units[id].print_llvm = this.config.emit_llvm
+                    mgr.*.units[id].entry_name = this.config.entry !
+
+
+                    mgr.*.units[id].platform_name = this.config.platform_name !
+                    make object_name = "unit_" + hashing::digest(mgr.*.units[id].key !)
+                    mgr.*.units[id].llvm_ll = ir_dir.add(object_name.copy() + ".ll").get()
+                    mgr.*.units[id].llvm_out = object_dir.add(object_name + ".o").get()
+                    mgr.*.units[id].keep_llvm = this.config.keep_llvm
+                    match this.config.mode {
+                        std::Mode.Release {
+                            mgr.*.units[id].llvm_optimization = "-O2"
+                        }
+                        _ {}
+                    }
+
+                    match this.config.optimization {
+                        std::Optimization.Standard { mgr.*.units[id].llvm_optimization = "-O2" }
+
+                        std::Optimization.Aggressive { mgr.*.units[id].llvm_optimization = "-O3" }
+                        std::Optimization.Size { mgr.*.units[id].llvm_optimization = "-Os" }
+                        _ {}
+                    }
+
+                    mgr.*.units[id].lower() catch err {
+                        match err {
+                            error.IdentifierTooLong {
+                                std::progress::clear()
+                                std::io::println("identifier too long")
+                                return error.CompilationAborted
+                            }
+
+                            error.UnexpectedCharacter {
+                                std::progress::clear()
+                                std::io::println("unexpected character")
+                                return error.CompilationAborted
+                            }
+
+                            error.CompilationAborted {
+                                return error.CompilationAborted
+                            }
+
+                            _ {
+                                return error.Panic
+                            }
+                        }
+                    }
+
+                    si = si + 1
+                }
+
+                // instantiate generic types: every use of `Name<Args>` in any unit becomes a concrete
+                // type declared next to the template, before anything is type-checked
+                make mono_units: mono::MonoUnit[] = []
+                make mi: uint = 0
+
+                while mi < mgr.*.units.len() {
+                    make mu = mono::MonoUnit {
+                        module_name = mgr.*.units[mi].path_rel.get(),
+                        module = mgr.*.units[mi].hir_module.pin,
+                        program = mgr.*.units[mi].program.pin,
+                        namespaces = mgr.*.units[mi].hir_namespaces.pin,
+                        os = mgr.*.units[mi].platform_name !,
+                        diag = mgr.*.units[mi].diag.pin
+                    }
+
+                    mono_units.push(mu)
+                    mi = mi + 1
+                }
+
+                std::progress::phase("Generics", 0, 0, "instantiate types")
+                mono::run(mono_units.pin)
+                qualify::run(mono_units.pin)
+                mgr.*.build_signatures()
+
+                // Resolved allocator symbols from dependencies must be visible
+                // to every caller, including the normal CLI compilation path.
+                make memory_context = memr::MemContext {}
+                mi = 0
+                while mi < mgr.*.units.len() {
+                    memr::collect(mgr.*.units[mi].hir_module.pin, memory_context.pin)
+                    mi = mi + 1
+                }
+
+
+
+
+                mi = 0
+
+                while mi < mgr.*.units.len() {
+                    if mgr.*.units[mi].diag.has_errors() {
                         return error.CompilationAborted
                     }
 
-                    error.UnexpectedCharacter {
-                        std::io::println("unexpected character")
+                    mi = mi + 1
+                }
+
+                // typecheck only once every declaration, including `@impl`, is registered
+                si = 0
+
+                while si < mgr.*.compilation_stack.len() {
+                    make id = mgr.*.compilation_stack[si]
+                    std::progress::phase("Analyze", si, mgr.*.compilation_stack.len(), mgr.*.units[id].path_rel.get())
+                    mgr.*.units[id].mem_ctx = memory_context
+                    mgr.*.units[id].analyze(mgr.*.attached_sigs.pin, mgr.*.struct_sigs.pin, mgr.*.free_sigs.pin) catch err {
+                        match err {
+                            error.IdentifierTooLong {
+                                std::progress::clear()
+                                std::io::println("identifier too long")
+                                return error.CompilationAborted
+                            }
+
+                            error.UnexpectedCharacter {
+                                std::progress::clear()
+                                std::io::println("unexpected character")
+                                return error.CompilationAborted
+                            }
+
+                            error.CompilationAborted {
+                                return error.CompilationAborted
+                            }
+
+                            _ {
+                                return error.Panic
+                            }
+                        }
+                    }
+
+                    memory_context = mgr.*.units[id].mem_ctx
+                    objs.push(mgr.*.units[id].llvm_out !)
+                    si = si + 1
+                }
+
+                // assemble + link every unit into one executable (unless only dumping IR or memory report)
+                if !this.config.emit_llvm && !this.config.emit_mem && !this.config.emit_mir {
+                    make exe = this.executable_path()
+                    ensure_output_parent(exe.copy())
+                    std::progress::phase("Link", 0, 1, exe.copy())
+
+                    if this.config.options.show_quipc_debug {
+                        std::progress::clear()
+                        std::io::println("linking " + exe)
+                    }
+
+                    for library : this.config.native_libraries.iter() { objs.push(library !) }
+                    if llvm::link::link(objs !, exe.copy()) != 0 {
+                        std::progress::clear()
+                        std::io::println("linking failed for " + exe + "; see clang diagnostics above")
                         return error.CompilationAborted
+                    }
+
+                }
+
+                while objs.len() > 0 { make _ = objs.pop() }
+            }
+        }
+    }
+
+    @this
+    make intermediate_path () -> str {
+        if this.config.intermediate_directory.len() > 0 { return this.config.intermediate_directory ! }
+
+        // Keep intermediate files for each output in a separate directory.
+        make key = "output=" + this.executable_path()
+
+        return this.profile_path() + "/intermediate/targets/" + hashing::digest(key)
+    }
+
+    /// returns the target directory for the selected debug or release profile.
+    @this
+    make profile_path () -> str {
+        match this.config.mode {
+            std::Mode.Release { return "target/release" }
+            _ { return "target/debug" }
+        }
+    }
+
+    @this
+    make executable_path () -> str {
+        if this.config.output_set {
+            return this.config.output.get()
+        }
+
+        make build_dir = std::io::Path.create(this.profile_path())
+
+        if this.config.name.len() > 0 {
+            return build_dir.add(this.config.name !).get()
+        }
+
+        make stem = basename_stem(std::os::getcwd())
+
+        return build_dir.add(stem).get()
+    }
+
+
+
+    /// creates the project.
+    @pub @this
+    make new_project () -> !void {
+        make project_path = std::io::Path {}
+
+        match this.config.input {
+            none {
+                return error.InitAbort
+            }
+            some {
+                project_path = some.copy()
+            }
+        }
+
+        std::io::Dir.mkdir(project_path.pin, std::io::MODE_DIRECTORY) catch {
+            std::io::println("failed to create project directory: " + project_path.get())
+            return error.InitAbort
+        }
+
+        make git_ignore = std::io::File.create(project_path.add(".gitignore"), std::io::MODE_FILE) catch {
+            std::io::println("failed to create: '.gitignore'")
+            return error.InitAbort
+        }
+
+        git_ignore.write("target/").unwrap()
+        git_ignore.close()
+
+        make target_path = project_path.add("target")
+        std::io::Dir.mkdir(target_path.pin, std::io::MODE_DIRECTORY) catch {
+            std::io::println("failed to create 'target' directory: " + target_path.get())
+            return error.InitAbort
+        }
+
+        make src_path = project_path.add("src")
+        std::io::Dir.mkdir(src_path.pin, std::io::MODE_DIRECTORY) catch {
+            std::io::println("failed to create 'src' directory: " + src_path.get())
+            return error.InitAbort
+        }
+
+        // copy main.quip from templates into the project src directory
+        make src_main = std::io::File.create(src_path.add("main.quip"), std::io::MODE_FILE) catch {
+            std::io::println("failed to create: 'main.quip'")
+            return error.InitAbort
+        }
+        src_main.write(template_main_quip().unwrap()).unwrap()
+        src_main.close()
+
+        make src_build = std::io::File.create(project_path.add("build.quip"), std::io::MODE_FILE) catch {
+            std::io::println("failed to create: 'build.quip'")
+            return error.InitAbort
+        }
+        src_build.write(template_build_quip().unwrap()).unwrap()
+        src_build.close()
+
+        return
+    }
+}
+
+/// reads the installed project build-script template.
+make template_build_quip () -> !str {
+    make result = std::io::File.orc(std::io::Path.create("~/.quip/lib/templates/build.quip")) catch {
+        return error.FailedToReadTemplate
+    }
+
+    return result
+}
+
+/// reads the installed main template, falling back to the built-in template.
+make template_main_quip () -> !str {
+    make result = std::io::File.orc(std::io::Path.create("~/.quip/lib/templates/main.quip")) catch {
+        return error.FailedToReadTemplate
+    }
+
+    return result
+}
+
+@const
+make fallback_template_main_quip: String =
+"
+@pure @const {
+    make std: unit = @import \"std.quip\"
+}
+
+/// runs the program entry point.
+@pure @entry
+make main () -> int {
+    std::io::println(\"Hello, World!\")
+
+    return 0
+}
+"
+
+// drop a trailing ".quip" so `main.quip` becomes the executable name `main`
+make strip_quip (s: str) -> str {
+    make n: uint = s.len()
+
+    if n > 5 {
+        if s[n - 5] == '.' {
+            if s[n - 4] == 'q' {
+                if s[n - 3] == 'u' {
+                    if s[n - 2] == 'i' {
+                        if s[n - 1] == 'p' {
+                            make out: str = ""
+                            make i: uint = 0
+
+                            while i < n - 5 {
+                                out = out + s[i]
+                                i = i + 1
+                            }
+
+                            return out
+                        }
                     }
                 }
             }
         }
-
     }
+
+    return s
+}
+
+// last path component of `path`, without its ".quip" extension
+make basename_stem (path: str) -> str {
+    make start: uint = 0
+    make i: uint = 0
+
+    while i < path.len() {
+        if path[i] == '/' {
+            start = i + 1
+        }
+
+        i = i + 1
+    }
+
+    make out: str = ""
+    i = start
+
+    while i < path.len() {
+        out = out + path[i]
+        i = i + 1
+    }
+
+    return strip_quip(out)
+}
+
+/// ensures the output parent.
+make ensure_output_parent (path: str) {
+    make parent: str = ""
+    make pending: str = ""
+    make i: uint = 0
+
+    while i < path.len() {
+        pending = pending + path[i]
+
+        if path[i] == '/' { parent = pending.copy() }
+
+        i = i + 1
+    }
+
+    if parent.len() > 0 { ensure_dir(parent) }
+}
+
+make file_exists (path: str) -> bool {
+    make f = std::io::File.open(std::io::Path.create(path), "r") catch {
+        return false
+    }
+
+    f.close()
+    return true
 }

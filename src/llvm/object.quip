@@ -1,0 +1,180 @@
+@pure @const {
+    make std = @import "std"
+    make c = @import "../../library/std/ffi/c.quip"
+    make api = @import "bindings.quip"
+    make lower = @import "lower.quip"
+    make memory = @import "../memory/report.quip"
+    make mir = @import "../mir/mir.quip"
+    make link = @import "link.quip"
+}
+
+@const {
+    make ReturnStatus: i32 = 2
+    make RelocPIC: i32 = 2
+    make CodeModelDefault: i32 = 0
+    make ObjectFile: i32 = 1
+}
+
+@unsafe
+make report_message (message: ptr<char>) {
+    @unsafe make null: ptr<char> = 0
+    if message != null {
+        std::progress::clear()
+        std::io::println(c::to_str(message))
+    }
+}
+
+/// Registers targets once before generating objects for a compilation.
+@pub
+make initialize () {
+    @unsafe {
+        api::LLVMInitializeAArch64TargetInfo()
+        api::LLVMInitializeAArch64Target()
+        api::LLVMInitializeAArch64TargetMC()
+        api::LLVMInitializeAArch64AsmPrinter()
+        api::LLVMInitializeX86TargetInfo()
+        api::LLVMInitializeX86Target()
+        api::LLVMInitializeX86TargetMC()
+        api::LLVMInitializeX86AsmPrinter()
+    }
+}
+
+@unsafe
+make verify (module: ptr<any>) -> bool {
+    @unsafe make message: ptr<char> = 0
+    make invalid = api::LLVMVerifyModule(module, ReturnStatus, message.pin)
+    if invalid != 0 { report_message(message) }
+    api::LLVMDisposeMessage(message)
+    return invalid == 0
+}
+
+@unsafe
+make generate (module: ptr<any>, machine: ptr<any>, path: str, optimization: str) -> bool {
+    make layout = api::LLVMCreateTargetDataLayout(machine)
+    api::LLVMSetModuleDataLayout(module, layout)
+    api::LLVMDisposeTargetData(layout)
+
+    make passes: str = ""
+    if optimization == "-O2" { passes = "default<O2>" }
+    elif optimization == "-O3" { passes = "default<O3>" }
+    elif optimization == "-Os" { passes = "default<Os>" }
+
+    if passes.len() > 0 {
+        make options = api::LLVMCreatePassBuilderOptions()
+        make err = api::LLVMRunPasses(module, passes.data, machine, options)
+        api::LLVMDisposePassBuilderOptions(options)
+        @unsafe make null: ptr<any> = 0
+        if err != null {
+            make message = api::LLVMGetErrorMessage(err)
+            report_message(message)
+            api::LLVMDisposeErrorMessage(message)
+            return false
+        }
+    }
+
+    @unsafe make emit_message: ptr<char> = 0
+    make failed = api::LLVMTargetMachineEmitToFile(machine, module, path.data, ObjectFile, emit_message.pin)
+    if failed != 0 { report_message(emit_message) }
+    api::LLVMDisposeMessage(emit_message)
+    return failed == 0
+}
+
+@unsafe
+make target_triple () -> str {
+    make native = api::LLVMGetDefaultTargetTriple()
+    make triple = c::to_str(native)
+    api::LLVMDisposeMessage(native)
+
+    @target "macos" {
+        // LLVM's default Darwin triple can imply a deployment version higher
+        // than Clang's link SDK. Emit for a baseline macOS version, or use the
+        // same explicit deployment target as the Clang driver.
+        make arch: str = ""
+        make i: uint = 0
+        while i < triple.len() && triple[i] != '-' {
+            arch.push(triple[i])
+            i++
+        }
+
+        make minimum = std::os::getenv("MACOSX_DEPLOYMENT_TARGET")
+        if minimum.len() == 0 {
+            minimum = "10.15"
+            if arch == "arm64" || arch == "aarch64" { minimum = "11.0" }
+        }
+
+        return arch + "-apple-macosx" + minimum
+    }
+
+    return triple
+}
+
+@unsafe
+make compile_module (module: ptr<any>, path: str, optimization: str) -> bool {
+    make triple = target_triple()
+    @unsafe make target: ptr<any> = 0
+    @unsafe make message: ptr<char> = 0
+    make failed = api::LLVMGetTargetFromTriple(triple.data, target.pin, message.pin)
+    if failed != 0 {
+        report_message(message)
+        api::LLVMDisposeMessage(message)
+        return false
+    }
+
+    api::LLVMSetTarget(module, triple.data)
+    make level: i32 = 0
+    if optimization == "-O2" || optimization == "-Os" { level = 2 }
+    elif optimization == "-O3" { level = 3 }
+    make empty: str = ""
+    make machine = api::LLVMCreateTargetMachine(target, triple.data, empty.data, empty.data, level, RelocPIC, CodeModelDefault)
+    @unsafe make null: ptr<any> = 0
+    if machine == null { return false }
+
+    make success = generate(module, machine, path, optimization)
+    api::LLVMDisposeTargetMachine(machine)
+    return success
+}
+
+@unsafe
+make output_module (module: ptr<any>, path: str, optimization: str, print_ir: bool, dump_path: str) -> bool {
+    if !verify(module) { return false }
+
+    if print_ir || dump_path.len() > 0 {
+        make message = api::LLVMPrintModuleToString(module)
+        make ir = c::to_str(message)
+        api::LLVMDisposeMessage(message)
+        if print_ir {
+            std::io::println(ir)
+            return true
+        }
+
+        if !link::write_text(dump_path.copy(), ir) {
+            std::progress::clear()
+            std::io::println("failed to write LLVM IR: " + dump_path)
+            return false
+        }
+    }
+
+    return compile_module(module, path, optimization)
+}
+
+/// Builds and emits an LLVM module for one source unit.
+@pub
+make compile (mir_module: ref<mir::MirModule>, report: ref<memory::MemReport>, filename: str,
+    selected_entry: str, source: str, platform: str, path: str, optimization: str,
+    print_ir: bool, dump_path: str) -> bool {
+    @unsafe {
+        make context = api::LLVMContextCreate()
+        make module = api::LLVMModuleCreateWithNameInContext(filename.data, context)
+        api::LLVMSetSourceFileName(module, filename.data, filename.len())
+
+        make success = lower::build(context, module, mir_module, filename.copy(), selected_entry, source, platform, report)
+        if success {
+            if !print_ir { std::progress::phase("Generate object", 0, 0, filename) }
+            success = output_module(module, path, optimization, print_ir, dump_path)
+        }
+
+        api::LLVMDisposeModule(module)
+        api::LLVMContextDispose(context)
+        return success
+    }
+}

@@ -1,123 +1,1261 @@
-// Unit is responsible for representing single file
-// it contains pipeline, which shows the current state of the compilation process
-// tokens,
-// AST -> QAST
-// other internal data
-
-// The UnitManager is responsible for managing already imported files and mark the main file
-
 @pure @const {
-make std = @import "../../library/std/pkg.quip"
+    make sources = @import "sources.quip"
+    make profile = @import "analysis_profile.quip"
+    make std = @import "std"
 
-make lexer = @import "token.quip"
-make parser = @import "parser.quip"
-make qast = @import "../util/qast.quip"
+    make lexer = @import "token.quip"
+    make parser = @import "parser.quip"
+    make ast = @import "../util/ast.quip"
+    make util = @import "../util/pkg.quip"
 
-make diags = @import "../diag/diagnosis.quip"
+    make diags = @import "../diag/diagnosis.quip"
+    make e = @import "../diag/err.quip"
 
-make linemap = @import "../core/sourcemap.quip"
+    make linemap = @import "../core/sourcemap.quip"
 
-// the flattening is not working now, may giev compile errors
-make flattening = @import "../semantics/flattening.quip"
+    make hir = @import "../hir/hir.quip"
+    make hir_lower = @import "../hir/lower.quip"
+    make mir = @import "../mir/mir.quip"
+    make mir_build = @import "../mir/build.quip"
+    make mir_dump = @import "../mir/dump.quip"
+    make ty = @import "../ty/ty.quip"
+    make typeck = @import "../ty/check.quip"
+
+    make entry_point = @import "../semantics/entry_point.quip"
+    make symcheck = @import "../semantics/symbol/resolve.quip"
+    make semantics = @import "../semantics/check.quip"
+
+
+    make mem = @import "../memory/pkg.quip"
+    make memr = @import "../memory/report.quip"
+
+    make llvm = @import "../llvm/pkg.quip"
+
+
 }
 
+/// identifies the current stage or failure state of a compilation unit.
 @pub
 make enum UnitStatus {
     Unloaded,
     Lexing,
     Parsing,
+    Checking,
     PreAnalysis,
     Analysis,
     MemAnalysis,
     LLVM,
-    Done
+    Done,
+    Aborted     // stopped early, the compiler unwinds and cleans up
 }
 
 @pub
+make type ImportInfo {
+    @pub make alias: str = ""    // the name the importing file binds it to
+    @pub make path: str = ""     // the raw string literal, relative to the importing file
+    @pub make unit: uint = 0     // index into UnitManager.units; set by `resolve_all` (phase 2)
+    @pub make resolved: bool = false
+}
+
+/// holds a source file and the intermediate results of its compilation.
+@pub
 make type Unit {
-    make content: str
-    make map: linemap::LineMap
-    make tokens: lexer::Token[]
+    @pub {
+        make id: uint
 
-    make path_abs: std::io::Path
-    make program: owned<qast::QAST_Head>[]
+        make content: str
+        make map: linemap::LineMap
+        make tokens: lexer::Token[]
 
-    make status: UnitStatus
+        make path_rel: std::io::Path
+        make key: str = ""       // canonical absolute path, used to de-duplicate imports
 
-    make lsp_mode: bool
-    make diag: diags::Diagnostic
+        make program: owned<ast::AST_Head>[]
+        make hir_module: hir::HirModule = .{}
+        make symbols: symcheck::SymbolTable = .{}
+        make tys: ty::TyInterner = ty::TyInterner.create()
+        make checked: typeck::ModuleTypeck = .{}
+        make mir_module: mir::MirModule = .{}
+        make emit_mir: bool = false
+        make emit_mem: bool = false
+        make mem_ctx: memr::MemContext = .{}
+        make mem_report: memr::MemReport = .{}
+        make emit_llvm: bool = true    // enable LLVM codegen + object emission
+        make print_llvm: bool = false  // dump the textual IR to stdout (--emit-llvm)
+        make llvm_ll: str = ""         // path for the .ll output; set by the Driver
+        make keep_llvm: bool = false
+        make verbose: bool = false
+        make profile_analysis: bool = false
+        make llvm_optimization: str = "-O0"
+        make llvm_out: str = ""        // path for the .o output; set by the Driver
+        make entry_name: str = "main"  // entry point function; set by the Driver
+        make is_main: bool = false     // true for the entry file the user asked to compile
+        make platform_name: str = ""   // OS name for @target selection, set by the Driver
+
+        // populated by `parse_self`, during phase 1 (Declare)
+        make public_symbols: str[] = []
+        make imports: ImportInfo[] = []
+
+        // populated by `resolve_all` (phase 2): for each resolved import, the alias, the imported
+        // file's base name and its public exports. `proceed` hands these to the checker so that
+        // namespace-qualified references such as `posix::dup2` can be resolved.
+        make hir_imports: hir::HirImport[] = []
+
+        // populated by `resolve_all`: every namespace chain reachable from this unit's imports,
+        // flattened (direct aliases plus nested re-exports such as `os::syscall`)
+        make hir_namespaces: hir::HirNamespace[] = []
+
+        make status: UnitStatus
+
+
+        make diag: diags::Diagnostic
+    }
 
     @pub
-    make init (path: std::io::Path) -> !Unit {
+    make init (path: std::io::Path, id: uint, hide_warnings: bool) -> !Unit {
 
         make u = Unit {}
+
+        u.id = id
+        u.profile_analysis = std::os::getenv("QUIPC_PROFILE_ANALYSIS") == "1"
         u.diag = diags::Diagnostic.init()
-        u.lsp_mode = false
 
-        // u.path_abs = path.absolute()
+        u.diag.hide_warnings = hide_warnings
+        u.diag.path = path.get()
 
-        make f = std::io::File.open(path) catch {
-            std::io::println("File not found")
-            return error.UnableToInitUnit
+        make f = std::io::File.open(path.copy(), "r") catch {
+            u.diag.report(diags::Diag.panic(e::Err.Internal, "unable to open source file"))
+            return error.CompilationAborted
         }
 
         f.read() catch {
-            return error.UnableToInitUnit
+            f.close()
+            u.diag.report(diags::Diag.panic(e::Err.Internal, "unable to read source file"))
+            return error.CompilationAborted
         }
 
         u.content = f.content
+        f.close()
 
         u.map = linemap::LineMap.init(u.content.pin)
+        u.diag.set_source(path.get(), u.content !)
 
-        f.close()
         u.status = UnitStatus.Unloaded
+
+        u.path_rel = path
 
         return u
     }
 
+    /// tokenizes and parses this unit, collecting imports after a successful parse.
     @pub @this
-    make set_lsp_mode () {
-        this.lsp_mode = true
+    make parse_self () -> !void {
+        this.status = UnitStatus.Lexing
+        make failure_offset: uint = 0
+        make started: uint = 0
+
+        if this.profile_analysis { started = profile::now() }
+
+        this.tokens = lexer::tokenize_at(this.content, failure_offset.pin) catch err {
+            this.status = UnitStatus.Aborted
+            make message: str = "unexpected character while tokenizing source"
+
+            match err {
+                error.IdentifierTooLong { message = "identifier exceeds the tokenizer limit" }
+
+                error.UnexpectedEndOfFile { message = "unterminated literal" }
+                _ {}
+            }
+            make range = util::Range.of(failure_offset, failure_offset + 1)
+            make d = diags::Diag.err(e::Err.InvalidSyntax, range, message)
+
+            match err {
+                error.UnexpectedEndOfFile {
+                    d.*.code = e::err_code(e::Err.UnexpectedEndOfFile)
+                    d.label("literal starts here but has no matching closing quote")
+                    d.attach(diags::Label.create(util::Range.of(this.content.len(), this.content.len()), "end of file reached while reading this literal"))
+                    d.help("close the literal with the same quote character; escape quotes that belong in the value")
+                }
+
+                error.IdentifierTooLong {
+                    d.label("identifier exceeds the 255-character limit here")
+                    make start = failure_offset
+
+                    while start > 0 && (this.content[start - 1].is_alnum() || this.content[start - 1] == '_') { start = start - 1 }
+
+                    d.attach(diags::Label.create(util::Range.of(start, start + 1), "identifier starts here"))
+                    d.help("shorten this identifier or split a long qualified name into namespaces")
+                }
+                _ { d.label("this character cannot begin a valid token") d.help("remove the character or write a valid identifier, literal, or operator") }
+            }
+
+            this.diag.report(d)
+            return error.CompilationAborted
+        }
+
+        if this.profile_analysis { profile::record(true, started, "lex", this.path_rel.get()) }
+
+        if this.profile_analysis { started = profile::now() }
+
+        make p = parser::Parser.init(this.tokens.pin)
+        this.status = UnitStatus.Parsing
+        this.program = p.proceed(this)
+
+        if this.profile_analysis { profile::record(true, started, "parse", this.path_rel.get()) }
+
+        if this.diag.is_aborting() || this.diag.has_errors() {
+            this.status = UnitStatus.Aborted
+
+            return error.CompilationAborted
+        }
+
+        this.public_symbols = public_symbols_of(this.program.pin)
+        this.imports = collect_imports(this.program.pin)
+
+        return
     }
 
+    // translate the parsed program to HIR and resolve symbols. this is independent of every other
+    // unit, so the driver lowers all units before checking any of them: that way each unit's
+    // attached functions are known globally (they are visible without an import) before type
+    // checking begins.
+    /// lowers this unit to hir and validates its declarations and entry point.
     @pub @this
-    make proceed () -> !void {
-        // bootstrapping may not work correctly
+    make lower () -> !void {
+        // translate to HIR (honouring @target / @weak groups for the selected platform)
+        make started: uint = 0
 
-        this.status = UnitStatus.Lexing
-        this.tokens = lexer::tokenize(this.content) catch err {
+        if this.profile_analysis { started = profile::now() }
+
+        this.hir_module = hir_lower::lower(this.program.pin, this.platform_name, this.diag.pin)
+
+        if this.profile_analysis { profile::record(true, started, "hir", this.path_rel.get()) }
+
+        if this.profile_analysis { started = profile::now() }
+
+        // resolve symbols and reject duplicate declarations before anything consumes the module
+        this.symbols = symcheck::check(this.hir_module.pin, this.diag.pin)
+        semantics::check_module(this.hir_module.pin, this.diag.pin)
+
+        if this.profile_analysis { profile::record(true, started, "symbols", this.path_rel.get()) }
+
+        if this.diag.is_aborting() || this.diag.has_errors() {
+            this.status = UnitStatus.Aborted
+
+            return error.CompilationAborted
+        }
+
+        // validate the entry point of the file the user asked to compile.
+        // the error is handled here (its tag is lost once re-returned through another function)
+        if this.is_main {
+            if this.entry_name.len() == 0 {
+                make count: uint = 0
+                make i: uint = 0
+
+                while i < this.hir_module.funcs.len() {
+                    make f = this.hir_module.funcs[i].pin
+
+                    for tag : f.*.tags.iter() {
+                        if tag == "entry" {
+                            this.entry_name = f.*.name !
+                            count = count + 1
+                        }
+                    }
+
+                    i = i + 1
+                }
+
+                if count != 1 {
+                    make d = diags::Diag.panic(e::Err.MissingEntryPoint, "build script must have exactly one @entry function; use --entry <name> to select one")
+                    this.diag.report(d)
+                    return error.CompilationAborted
+                }
+            }
+
+            entry_point::check(this.hir_module.pin, this.entry_name) catch err {
+                this.status = UnitStatus.Aborted
+
+                match err {
+                    error.MissingEntryPoint {
+                        make d: owned<diags::Diag> = diags::Diag.panic(e::Err.MissingEntryPoint, "program is missing entry point tagged with @entry")
+                        this.diag.report(d)
+                    }
+
+                    error.EntryPointNotPublic {
+                        make d = diags::Diag.panic(e::Err.EntryPointNotPublic, "entry point '" + this.entry_name + "' is not tagged with @pub")
+                        this.diag.report(d)
+                    }
+
+                    _ {}
+                }
+
+                return error.CompilationAborted
+            }
+        }
+
+        return
+    }
+
+    /// type-checks, lowers to mir, checks memory, and optionally emits llvm for this unit.
+    @pub @this
+    make analyze (sigs: ref<hir::HirAttachedSig[]>, structs: ref<hir::HirStructSig[]>, funcs: ref<hir::HirFuncSig[]>) -> !void {
+        this.status = UnitStatus.Checking
+        semantics::check_array_copies(this.hir_module.pin, sigs, this.diag.pin)
+
+        if this.diag.is_aborting() || this.diag.has_errors() {
+            this.status = UnitStatus.Aborted
+            return error.CompilationAborted
+        }
+
+        std::progress::phase("Type check", 0, 0, this.path_rel.get())
+
+        make started: uint = 0
+
+        if this.profile_analysis { started = profile::now() }
+
+        this.checked = typeck::check(this.hir_module.pin, this.hir_imports.pin, this.hir_namespaces.pin, sigs, structs, funcs, this.tys.pin, this.diag.pin)
+
+        if this.profile_analysis { profile::record(true, started, "type", this.path_rel.get()) }
+
+        if this.diag.is_aborting() {
+            this.status = UnitStatus.Aborted
+
+            return error.CompilationAborted
+        }
+
+        // Array-copy return types are resolved by type checking and validated here.
+        make copy_index: uint = 0
+
+        while copy_index < this.checked.array_copy_funcs.len() {
+            make method = this.hir_module.attached_funcs[this.checked.array_copy_funcs[copy_index]].pin
+            semantics::check_array_copy_return(this.hir_module.funcs[method.*.func].pin, method.*.type_name.copy(), this.checked.array_copy_returns[copy_index].copy(), this.diag.pin)
+            copy_index = copy_index + 1
+        }
+
+        // Resolved uses remain checkable when an unrelated type could not be inferred.
+        make types_valid = !this.diag.has_errors()
+        make typed_index: uint = 0
+
+        while typed_index < this.checked.funcs.len() && typed_index < this.hir_module.funcs.len() {
+            make result = this.checked.funcs[typed_index].pin
+
+            if types_valid { semantics::check_typed_function(this.hir_module.pin, typed_index, this.tys.pin, result.*.local_tys.pin, result.*.ret_ty, this.diag.pin) }
+
+            semantics::check_uses(this.hir_module.funcs[typed_index].body.pin, result.*.semantic_checks.pin, structs, this.diag.pin)
+            typed_index = typed_index + 1
+        }
+
+        if this.diag.is_aborting() || this.diag.has_errors() {
+            this.status = UnitStatus.Aborted
+            return error.CompilationAborted
+        }
+
+        std::progress::phase("Lower MIR", 0, 0, this.path_rel.get())
+
+        // translate to MIR
+        if this.profile_analysis { started = profile::now() }
+
+        this.mir_module = mir_build::build(this.hir_module.pin, this.checked.pin, this.tys.pin, structs, sigs)
+
+        if this.profile_analysis { profile::record(true, started, "mir", this.path_rel.get()) }
+
+        if this.emit_mir {
+            mir_dump::print(this.mir_module.pin)
+        }
+
+        std::progress::phase("Memory check", 0, 0, this.path_rel.get())
+
+        // memory-rule validation
+        make memory_index: uint = 0
+
+        while memory_index < this.hir_module.funcs.len() && memory_index < this.checked.funcs.len() {
+            make function = this.hir_module.funcs[memory_index].pin
+            make result = this.checked.funcs[memory_index].pin
+            mem::check_closures(function, this.tys.pin, result.*.closure_checks.pin, result.*.closure_shapes.pin, result.*.closure_uses.pin, result.*.expr_tys.pin, this.diag.pin)
+            memory_index = memory_index + 1
+        }
+
+        memory_index = 0
+
+        while memory_index < this.hir_module.funcs.len() && memory_index < this.checked.funcs.len() {
+            mem::check_fields(this.hir_module.funcs[memory_index].body.pin, this.checked.funcs[memory_index].field_checks.pin, structs, this.diag.pin)
+            memory_index = memory_index + 1
+        }
+
+        if this.profile_analysis { started = profile::now() }
+
+        this.status = UnitStatus.MemAnalysis
+        memr::collect(this.hir_module.pin, this.mem_ctx.pin)
+        make previous = memr::MemReport {}
+        make reuse: bool[] = []
+        this.mem_report = mem::check_cached(this.mir_module.pin, this.diag.pin, this.mem_ctx.pin, this.path_rel.get(), previous.pin, reuse.pin, this.profile_analysis)
+
+        if this.profile_analysis { profile::record(true, started, "memory", this.path_rel.get()) }
+
+        if this.emit_mem {
+            make show = this.is_main || this.verbose
+
+            if !show {
+                make path_str = this.path_rel.get()
+
+                if !memr::is_library_path(path_str) {
+                    show = true
+                }
+            }
+
+            if show {
+                memr::print(this.mem_report.pin)
+            }
+        }
+
+        if this.diag.is_aborting() || this.diag.has_errors() {
+            this.status = UnitStatus.Aborted
+
+            return error.CompilationAborted
+        }
+
+        if this.emit_mem || (this.emit_mir && !this.print_llvm) { return }
+
+        // work with LLVM
+        if this.emit_llvm {
+            this.status = UnitStatus.LLVM
+            std::progress::phase("Generate IR", 0, 0, this.path_rel.get())
+
+            make dump_path: str = ""
+            if this.keep_llvm && !this.print_llvm { dump_path = this.llvm_ll.copy() }
+
+            if !llvm::object::compile(this.mir_module.pin, this.mem_report.pin, this.path_rel.get(),
+                this.entry_name !, this.content !, this.platform_name !, this.llvm_out !,
+                this.llvm_optimization !, this.print_llvm, dump_path) {
+                std::progress::clear()
+                std::io::println("LLVM generation failed for " + this.path_rel.get())
+                return error.CompilationAborted
+            }
+
+            if !this.print_llvm { std::progress::unit_done() }
+        }
+
+
+        return
+    }
+
+    // lower then analyse a single unit. kept for the dependency-ordered path.
+    @pub @this
+    make proceed (sigs: ref<hir::HirAttachedSig[]>, structs: ref<hir::HirStructSig[]>, funcs: ref<hir::HirFuncSig[]>) -> !void {
+        this.lower() catch err {
             return err
         }
 
-        make p = parser::Parser.init(this.tokens.pin)
-        this.program = p.proceed(this)
-        if this.diag.has_errors() {
-            std::process::abort()
+        this.analyze(sigs, structs, funcs) catch err {
+            return err
         }
 
-        flattening::run(this.program)
-
-        parser::debug_display(this.program)
         return
     }
 }
+// Read through `owned?` without permanently moving: match moves out, then we put it back.
+make pub_func_name (node: ptr<ast::AST_Head>) -> str {
+    match node.*.func {
+        none { return "" }
+        some {
+            make n = some.*.name.lexeme !
+            node.*.func = some
+            return n
+        }
+    }
+}
 
-@pub
-make type UnitManager {
+/// returns the variable name from an ast node, or an empty string.
+make pub_var_name (node: ptr<ast::AST_Head>) -> str {
+    match node.*.var {
+        none { return "" }
+        some {
+            make n = some.*.name.lexeme !
+            node.*.var = some
+            return n
+        }
+    }
 
-    make units: Unit[]
+}
 
-    @pub
-    make init (main: std::io::Path) -> !UnitManager {
+// `make Alias: Type = ...` is a compile-time type alias even though it is parsed as a variable
+make is_type_alias_var (node: ptr<ast::AST_Head>) -> bool {
+    make result = false
 
-        make unit: Unit = Unit.init(main) catch {
-            return error.MissingMainUnit
+    match node.*.var {
+        none {}
+
+        var_box: owned<ast::AST_Var> {
+            if var_box.*.sig_type != none {
+                @unsafe make sig: ptr<ast::AST_TypeSig> = var_box.*.sig_type.unwrap()
+
+                if sig.*.name.lexeme == "Type" {
+                    result = true
+                }
+            }
+
+            node.*.var = var_box
+        }
+    }
+
+    return result
+}
+
+/// returns the type name from an ast node, or an empty string.
+make pub_type_name (node: ptr<ast::AST_Head>) -> str {
+    match node.*.type_node {
+        none { return "" }
+        some {
+            make n = some.*.name.lexeme !
+            node.*.type_node = some
+            return n
+        }
+    }
+}
+
+/// returns the enum name from an ast node, or an empty string.
+make pub_enum_name (node: ptr<ast::AST_Head>) -> str {
+    match node.*.enum_node {
+        none { return "" }
+        some {
+            make n = some.*.name.lexeme !
+            node.*.enum_node = some
+            return n
+        }
+    }
+}
+
+/// collects names of public declarations from a parsed program.
+make public_symbols_of (program: ref<owned<ast::AST_Head>[]>) -> str[] {
+    make out: str[] = []
+
+    make i: uint = 0
+
+    while i < program.*.len() {
+        @unsafe make node: ptr<ast::AST_Head> = program.*[i].*.pin
+
+        make is_pub = false
+        make ti: uint = 0
+
+        while ti < node.*.tags.len() {
+            @unsafe make tag: ptr<ast::AST_Tag> = node.*.tags[ti].*.pin
+
+            if tag.*.name.lexeme == "pub" {
+                is_pub = true
+            }
+
+            ti = ti + 1
         }
 
+        if is_pub {
+            match node.*.kind {
+                ast::AST_Kind.Func {
+                    out.push(pub_func_name(node))
+                }
+
+                ast::AST_Kind.Var {
+                    out.push(pub_var_name(node))
+                }
+
+                ast::AST_Kind.Type {
+                    out.push(pub_type_name(node))
+                }
+
+                ast::AST_Kind.Enum {
+                    out.push(pub_enum_name(node))
+                }
+                _ {}
+            }
+        }
+
+        i = i + 1
+    }
+
+    return out
+}
+
+make collect_import_from_var (node: ptr<ast::AST_Head>, out: ref<ImportInfo[]>) {
+    match node.*.var {
+        none {}
+
+        var_box: owned<ast::AST_Var> {
+            if var_box.*.val != none {
+                match var_box.*.val {
+                    none {}
+
+                    val_box: owned<ast::AST_Head> {
+                        make is_import = false
+                        make ti: uint = 0
+
+                        while ti < val_box.*.tags.len() {
+                            @unsafe make tag: ptr<ast::AST_Tag> = val_box.*.tags[ti].*.pin
+
+                            if tag.*.name.lexeme == "import" {
+                                is_import = true
+                            }
+
+                            ti = ti + 1
+                        }
+
+                        ti = 0
+
+                        while ti < node.*.tags.len() {
+                            @unsafe make tag2: ptr<ast::AST_Tag> = node.*.tags[ti].*.pin
+
+                            if tag2.*.name.lexeme == "import" {
+                                is_import = true
+                            }
+
+                            ti = ti + 1
+                        }
+
+                        if is_import && val_box.*.expr != none {
+                            match val_box.*.expr {
+                                none {}
+
+                                expr_box: owned<ast::AST_Expr> {
+                                    if expr_box.*.kind == ast::ExprKind.Literal {
+                                        make info = ImportInfo {}
+
+                                        info.alias = var_box.*.name.lexeme !
+                                        info.path = expr_box.*.literal.lexeme !
+                                        out.*.push(info)
+                                    }
+
+                                    val_box.*.expr = expr_box
+                                }
+                            }
+                        }
+
+                        var_box.*.val = val_box
+                    }
+                }
+            }
+
+            node.*.var = var_box
+        }
+    }
+}
+
+make collect_imports (program: ref<owned<ast::AST_Head>[]>) -> ImportInfo[] {
+    make out: ImportInfo[] = []
+
+    make i: uint = 0
+
+    while i < program.*.len() {
+        @unsafe make node: ptr<ast::AST_Head> = program.*[i].*.pin
+
+        if node.*.var != none {
+            collect_import_from_var(node, out.pin)
+        }
+
+        i = i + 1
+    }
+
+    return out
+}
+
+// the last path segment of an import specifier, e.g. "./os/posix.quip" -> "posix.quip"
+make basename_of (import_path: str) -> str {
+    make out: str = ""
+    make i: uint = 0
+
+    while i < import_path.len() {
+        make c = import_path[i]
+
+        if c == '/' {
+            out = ""
+        } else {
+            out = out + c
+        }
+
+        i = i + 1
+    }
+
+    return out
+}
+
+/// collects unit-valued variable exports from an ast declaration.
+make export_unit_var (node: ptr<ast::AST_Head>, out: ref<hir::HirExport[]>) {
+    match node.*.var {
+        none {}
+
+        var_box: owned<ast::AST_Var> {
+            if var_box.*.val != none {
+                match var_box.*.val {
+                    none {}
+
+                    val_box: owned<ast::AST_Head> {
+                        make val_is_import = false
+                        make ti2: uint = 0
+
+                        while ti2 < val_box.*.tags.len() {
+                            @unsafe make tag: ptr<ast::AST_Tag> = val_box.*.tags[ti2].*.pin
+
+                            if tag.*.name.lexeme == "import" {
+                                val_is_import = true
+                            }
+
+                            ti2 = ti2 + 1
+                        }
+
+                        if val_is_import && val_box.*.expr != none {
+                            match val_box.*.expr {
+                                none {}
+
+                                expr_box: owned<ast::AST_Expr> {
+                                    if expr_box.*.kind == ast::ExprKind.Literal {
+                                        make ue = hir::HirExport {}
+
+                                        ue.name = var_box.*.name.lexeme !
+                                        ue.is_unit = true
+                                        ue.unit_basename = basename_of(expr_box.*.literal.lexeme !)
+                                        out.*.push(ue)
+                                    }
+
+                                    val_box.*.expr = expr_box
+                                }
+                            }
+                        }
+
+                        var_box.*.val = val_box
+                    }
+                }
+            }
+
+            node.*.var = var_box
+        }
+    }
+}
+
+// one `some` match per helper: the reference compiler rejects nested `some` binds
+// with the same name (E1117)
+make export_const_var (node: ptr<ast::AST_Head>, out: ref<hir::HirExport[]>) {
+    match node.*.var {
+        some {
+            @unsafe make v: ptr<ast::AST_Var> = some
+            export_const_val(v, out)
+        }
+        none {}
+    }
+}
+
+/// collects an export from the initializer of a constant variable.
+make export_const_val (v: ptr<ast::AST_Var>, out: ref<hir::HirExport[]>) {
+    match v.*.val {
+        some {
+            @unsafe make val: ptr<ast::AST_Head> = some
+            export_const_expr(val, v.*.name.lexeme !, out)
+        }
+        none {}
+    }
+}
+
+/// records supported constant expressions as hir exports.
+make export_const_expr (val: ptr<ast::AST_Head>, name: str, out: ref<hir::HirExport[]>) {
+    match val.*.expr {
+        some {
+            @unsafe make ve: ptr<ast::AST_Expr> = some
+
+            if ve.*.kind == ast::ExprKind.Literal {
+                make ex = hir::HirExport {}
+
+                ex.name = name.copy()
+                ex.lit = ve.*.literal !
+                ex.has_lit = true
+                out.*.push(ex)
+            }
+        }
+        none {}
+    }
+}
+
+// the `@pub` symbols declared at the top level of a program, with their `@external` flag
+make exports_of (program: ref<owned<ast::AST_Head>[]>) -> hir::HirExport[] {
+    make out: hir::HirExport[] = []
+
+    make i: uint = 0
+
+    while i < program.*.len() {
+        @unsafe make node: ptr<ast::AST_Head> = program.*[i].*.pin
+
+        make before = out.len()
+        make is_unsafe = false
+        make is_pub = false
+        make is_external = false
+        make ti: uint = 0
+
+        while ti < node.*.tags.len() {
+            @unsafe make tag: ptr<ast::AST_Tag> = node.*.tags[ti].*.pin
+
+
+            if tag.*.name.lexeme == "unsafe" { is_unsafe = true }
+
+            if tag.*.name.lexeme == "pub" {
+                is_pub = true
+            } elif tag.*.name.lexeme == "external" {
+                is_external = true
+            }
+
+            ti = ti + 1
+        }
+
+        if is_pub {
+            match node.*.kind {
+                ast::AST_Kind.Func {
+                    make ex = hir::HirExport {}
+
+                    ex.name = pub_func_name(node)
+                    ex.is_external = is_external
+                    out.push(ex)
+                }
+
+                ast::AST_Kind.Type {
+                    make ex = hir::HirExport {}
+
+                    ex.name = pub_type_name(node)
+                    ex.is_type = true
+                    out.push(ex)
+                }
+
+                ast::AST_Kind.Enum {
+                    make ex = hir::HirExport {}
+
+                    ex.name = pub_enum_name(node)
+                    ex.is_type = true
+                    ex.is_enum = true
+
+                    match node.*.enum_node {
+                        some {
+                            @unsafe make ee: ptr<ast::AST_Enum> = some
+                            make vi = 0
+
+                            while vi < ee.*.variants.len() {
+                                ex.variants.push(ee.*.variants[vi].lexeme !)
+                                vi = vi + 1
+                            }
+                        }
+                        none {}
+                    }
+
+                    out.push(ex)
+                }
+
+                // a `@pub` re-export of an imported unit makes that unit reachable as a nested
+                // namespace (`make syscall: unit = @import "syscall.quip"` -> `syscall::member`)
+                ast::AST_Kind.Var {
+                    export_unit_var(node, out.pin)
+                    make allocator = false
+                    make ai: uint = 0
+
+                    while ai < node.*.tags.len() {
+                        @unsafe make tag: ptr<ast::AST_Tag> = node.*.tags[ai].*.pin
+
+                        if tag.*.name.lexeme == "global_allocator" { allocator = true }
+
+                        ai = ai + 1
+                    }
+
+                    if allocator {
+                        @unsafe make variable: ptr<ast::AST_Var> = node.*.var.unwrap()
+
+                        if variable.*.sig_type != none {
+                            @unsafe make sig: ptr<ast::AST_TypeSig> = variable.*.sig_type.unwrap()
+                            make type_namespace: str = ""
+
+                            while sig.*.is_namespace && sig.*.inner.len() > 0 {
+                                @unsafe make prefix: ptr<ast::AST_TypeSig> = sig.*.inner[0].*.pin
+
+                                if type_namespace.len() > 0 { type_namespace = type_namespace + "::" }
+
+                                type_namespace = type_namespace + prefix.*.name.lexeme
+                                @unsafe make next: ptr<ast::AST_TypeSig> = sig.*.inner[sig.*.inner.len() - 1].*.pin
+                                sig = next
+                            }
+
+                            make ex = hir::HirExport {}
+
+                            ex.name = pub_var_name(node)
+                            ex.global_type = sig.*.name.lexeme.copy()
+                            ex.global_type_namespace = type_namespace
+                            out.push(ex)
+                        }
+                    }
+
+                    // compile-time type aliases are exported as types too, so importers can
+                    // resolve `pkg::Alias` to the type it names
+                    if is_type_alias_var(node) {
+                        make ex = hir::HirExport {}
+
+                        ex.name = pub_var_name(node)
+                        ex.is_type = true
+                        @unsafe make variable: ptr<ast::AST_Var> = node.*.var.unwrap()
+
+                        if variable.*.val != none {
+                            @unsafe make value: ptr<ast::AST_Head> = variable.*.val.unwrap()
+
+                            if value.*.expr != none {
+                                @unsafe make expression: ptr<ast::AST_Expr> = value.*.expr.unwrap()
+
+                                if expression.*.type_sig != none {
+                                    @unsafe make target: ptr<ast::AST_TypeSig> = expression.*.type_sig.unwrap()
+
+                                    if target.*.inner.len() == 0 && !target.*.is_array && !target.*.is_optional && !target.*.is_fallible && !target.*.is_namespace {
+                                        ex.alias_primitive = ty::TyInterner.prim(target.*.name.lexeme !)
+                                    }
+                                }
+                            }
+                        }
+
+                        out.push(ex)
+                    } else {
+                        // a literal constant (`STDOUT`, `MODE_FILE`, ...) is exported by value so
+                        // importers can inline `ns::NAME`
+                        export_const_var(node, out.pin)
+                    }
+                }
+
+                _ {}
+            }
+        }
+
+        if is_unsafe {
+            while before < out.len() { out[before].is_unsafe = true before = before + 1 }
+        }
+
+        i = i + 1
+    }
+
+    return out
+}
+
+// resolves an `@import` string relative to the directory of the file that contains it
+make resolve_import (from: std::io::Path, import_path: str) -> std::io::Path {
+    if import_path.len() > 0 {
+        if import_path[0] == '/' || import_path[0] == '~' { return std::io::Path.create(import_path) }
+    }
+
+    make base = from.copy()
+
+    if base.content.len() > 0 {
+        base.content.pop() // drop the file name, keep the directory
+    }
+
+    for part : std::collections::split(import_path, '/').iter() {
+        if part == "." {
+            // stay in the same directory
+        } elif part == ".." {
+            if base.content.len() > 0 {
+                base.content.pop()
+            }
+        } else {
+            base.content.push(part !)
+        }
+    }
+
+    return base
+}
+
+make can_open_import (path: ref<std::io::Path>) -> bool {
+    make file = std::io::File.open(path, "r") catch { return false }
+    file.close()
+    return true
+}
+
+/// manages source units, imports, and shared cross-unit analysis state.
+@pub
+make type UnitManager {
+    @pub make units: Unit[]
+    make package_names: str[]
+    make package_paths: std::io::Path[]
+
+    // indices into `units`, ordered so every unit appears after the units it imports
+    @pub make compilation_stack: uint[]
+
+    // Portable signatures shared by every unit. They live here instead of in each Unit so the
+    // global @impl/@type/free-function registry costs O(N) rather than O(N*N) memory and time.
+    @pub make attached_sigs: hir::HirAttachedSig[] = []
+    @pub make struct_sigs: hir::HirStructSig[] = []
+    @pub make free_sigs: hir::HirFuncSig[] = []
+
+    make hide_warnings: bool = false
+    make visited: bool[] = []
+
+
+    @pub
+    make init (main: std::io::Path, names: str[], paths: std::io::Path[], hide_warnings: bool) -> !UnitManager {
         make manager = UnitManager {}
-        manager.units.push(unit)
+        manager.hide_warnings = hide_warnings
+        manager.package_names = names
+        manager.package_paths = paths
+
+        manager.declare(main) catch err {
+            return err
+        }
+
+        // the entry file is always declared first, so it is unit 0
+        if manager.units.len() > 0 {
+            manager.units[0].is_main = true
+        }
 
         return manager
+    }
+
+    /// resolves aliases, file-relative imports, and installed library imports in that order.
+    @this
+    make import_path (from: std::io::Path, path: str) -> std::io::Path {
+        make name: str = ""
+        make end: uint = 0
+
+        while end < path.len() && path[end] != '/' { name.push(path[end]) end = end + 1 }
+
+        make i: uint = 0
+
+        while i < this.package_names.len() {
+            if name == this.package_names[i] {
+                make root = this.package_paths[i].copy()
+                if end == path.len() { return root }
+
+                make suffix: str = ""
+                end = end + 1
+
+                while end < path.len() { suffix.push(path[end]) end = end + 1 }
+
+                return resolve_import(root, suffix)
+            }
+
+            i = i + 1
+        }
+
+        make relative = resolve_import(from, path.copy())
+        if path.len() == 0 || path[0] == '/' || path[0] == '~' { return relative }
+        if can_open_import(relative.pin) { return relative }
+
+        make home = std::os::getenv("HOME")
+        if home.len() == 0 { return relative }
+
+        make installed = std::io::Path.create(home + "/.quip/current/lib/" + path)
+        if can_open_import(installed.pin) { return installed }
+
+        return relative
+    }
+
+    // key already used by a declared unit, or none
+    @this
+    make find_by_key (key: str) -> uint? {
+        make i: uint = 0
+
+        while i < this.units.len() {
+            if this.units[i].key == key {
+                return i
+            }
+
+            i = i + 1
+        }
+
+        return none
+    }
+
+    // parses `path` (unless a unit with the same canonical path was already declared) and
+    // recursively declares every file it imports; returns the unit's index
+    @this
+    make declare (path: std::io::Path) -> !uint {
+        make key = sources::canonical(path.get())
+
+        match this.find_by_key(key.copy()) {
+            none {}
+            some { return some }
+        }
+
+        make id: uint = this.units.len()
+        make u = Unit.init(std::io::Path.create(key.copy()), id, this.hide_warnings) catch err {
+            return err
+        }
+
+        u.key = key
+        this.units.push(u)
+
+        this.units[id].parse_self() catch err {
+            return err
+        }
+
+        // recurse into every import *before* pushing this unit onto the stack, so
+        // dependencies always end up earlier in `compilation_stack`
+        make ii: uint = 0
+
+        while ii < this.units[id].imports.len() {
+            make target = this.import_path(this.units[id].path_rel.copy(), this.units[id].imports[ii].path)
+            this.declare(target) catch err {
+                return err
+            }
+
+            ii = ii + 1
+        }
+
+        this.compilation_stack.push(id)
+
+        return id
+    }
+
+    @pub @this
+    make resolve_all () -> void {
+        make si: uint = 0
+
+        while si < this.compilation_stack.len() {
+            make id = this.compilation_stack[si]
+
+            // import bindings are rebuilt from scratch so units retained across checks do not
+            // accumulate stale or duplicate entries
+            this.units[id].hir_imports = []
+
+            make ii: uint = 0
+
+            while ii < this.units[id].imports.len() {
+                this.units[id].imports[ii].resolved = false
+                make target = this.import_path(this.units[id].path_rel.copy(), this.units[id].imports[ii].path !)
+                make key = sources::canonical(target.get())
+
+                match this.find_by_key(key) {
+                    none {}
+                    some {
+                        this.units[id].imports[ii].unit = some
+                        this.units[id].imports[ii].resolved = true
+
+                        make imp = hir::HirImport {}
+
+                        imp.alias = this.units[id].imports[ii].alias !
+                        imp.basename = basename_of(this.units[id].imports[ii].path !)
+                        imp.exports = exports_of(this.units[some].program.pin)
+                        this.units[id].hir_imports.push(imp)
+                    }
+                }
+
+                ii = ii + 1
+            }
+
+            si = si + 1
+        }
+
+        // flatten nested namespaces now that every import chain has been resolved
+        make fi: uint = 0
+
+        while fi < this.compilation_stack.len() {
+            make id = this.compilation_stack[fi]
+            this.units[id].hir_namespaces = []
+            make ii: uint = 0
+
+            while ii < this.units[id].imports.len() {
+                if this.units[id].imports[ii].resolved {
+                    make alias = this.units[id].imports[ii].alias !
+                    make target = this.units[id].imports[ii].unit
+                    this.add_namespace(id, alias, target)
+                }
+
+                ii = ii + 1
+            }
+
+            fi = fi + 1
+        }
+    }
+
+    // record `path` as a reachable namespace of unit `host` pointing at module `target`, then
+    // recurse into every unit that `target` re-exports with `@pub`
+    @this
+    make add_namespace (host: uint, path: str, target: uint) {
+        make exports = exports_of(this.units[target].program.pin)
+
+        // collect re-exported units before `exports` is moved into the namespace entry
+        make sub_names: str[] = []
+        make sub_units: uint[] = []
+        make ei: uint = 0
+
+        while ei < exports.len() {
+            if exports[ei].is_unit {
+                make sub = this.find_resolved_import(this.units[target].imports.pin, exports[ei].name !)
+
+                if sub < this.units.len() {
+                    sub_names.push(exports[ei].name !)
+                    sub_units.push(sub)
+                }
+            }
+
+            ei = ei + 1
+        }
+
+        make ns = hir::HirNamespace {}
+
+        ns.path = path.copy()
+        ns.module_name = this.units[target].path_rel.get()
+        ns.exports = exports
+        ns.unit = target
+        this.units[host].hir_namespaces.push(ns)
+
+        make sj: uint = 0
+
+        while sj < sub_names.len() {
+            this.add_namespace(host, path + "::" + sub_names[sj], sub_units[sj])
+            sj = sj + 1
+        }
+
+        while sub_names.len() > 0 { make _ = sub_names.pop() }
+
+        while sub_units.len() > 0 { make _ = sub_units.pop() }
+    }
+
+    // the unit a resolved import with this alias points at, or `units.len()` when there is none
+    @this
+    make find_resolved_import (imports: ref<ImportInfo[]>, alias: str) -> uint {
+        make i: uint = 0
+
+        while i < imports.*.len() {
+            if imports.*[i].alias == alias && imports.*[i].resolved {
+                return imports.*[i].unit
+            }
+
+            i = i + 1
+        }
+
+        return this.units.len()
+    }
+
+    // Rebuild the one global signature registry used by every unit's type checker. This must run
+    // after all units have been lowered and monomorphized.
+    @pub @this
+    make build_signatures () -> void {
+        this.attached_sigs = []
+        this.struct_sigs = []
+        this.free_sigs = []
+
+        // Collect every struct name in the compilation first. A signature's return type can be
+        // declared in a different unit than the function (e.g. `hir::lower` returns `HirModule`
+        // from `hir.quip`), so classification cannot look at the function's own module alone.
+        make struct_names: str[] = []
+        make si: uint = 0
+
+        while si < this.compilation_stack.len() {
+            make module = this.units[this.compilation_stack[si]].hir_module.pin
+            make mi: uint = 0
+
+            while mi < module.*.structs.len() {
+                make hs = module.*.structs[mi].pin
+                struct_names.push(hs.*.name !)
+                mi = mi + 1
+            }
+
+            si = si + 1
+        }
+
+        make i: uint = 0
+
+        while i < this.compilation_stack.len() {
+            make id = this.compilation_stack[i]
+            make module = this.units[id].hir_module.pin
+            make module_name = this.units[id].path_rel.get()
+            collect_sigs_into(this.attached_sigs.pin, module, module_name.copy(), this.units[id].content.pin, struct_names.pin)
+            collect_struct_sigs_into(this.struct_sigs.pin, module, module_name.copy(), this.units[id].content.pin)
+            collect_free_sigs_into(this.free_sigs.pin, module, module_name, this.units[id].content.pin, struct_names.pin)
+            i = i + 1
+        }
     }
 
     @pub @this
@@ -126,12 +1264,400 @@ make type UnitManager {
     }
 
     @pub @this
+    make has_errors () -> bool {
+        make i: uint = 0
+
+        while i < this.compilation_stack.len() {
+            if this.units[this.compilation_stack[i]].diag.has_errors() { return true }
+
+            i = i + 1
+        }
+
+        return false
+    }
+
+    @pub @this
     make proceed_all () -> !void {
-        for unit : this.units.iter() {
-            unit.proceed() catch err {
+        // lower every unit first so all attached functions are known
+        make li: uint = 0
+
+        while li < this.compilation_stack.len() {
+            make id = this.compilation_stack[li]
+            this.units[id].lower() catch err {
                 return err
             }
+
+            li = li + 1
+        }
+
+        this.build_signatures()
+
+        // then analyse them, dependencies first; allocator/deallocator names are visible downwards
+        make acc = memr::MemContext {}
+
+        make si: uint = 0
+
+        while si < this.compilation_stack.len() {
+            make id = this.compilation_stack[si]
+            this.units[id].mem_ctx = acc
+            this.units[id].analyze(this.attached_sigs.pin, this.struct_sigs.pin, this.free_sigs.pin) catch err {
+                return err
+            }
+
+            acc = this.units[id].mem_ctx
+            si = si + 1
+        }
+    }
+}
+
+// flatten a type from a HIR body into a portable shape, resolving namespace paths to their final
+// member so that it can be looked up by name in another unit
+make collect_type_sig (body: ref<hir::HirBody>, idx: uint) -> hir::HirTypeSig {
+    make out = hir::HirTypeSig {}
+
+    if idx >= body.*.types.len() {
+        return out
+    }
+
+    make ht = body.*.types[idx].pin
+    out.span = util::Span { start = ht.*.range.start.start, end = ht.*.range.end.end }
+    make node = ht
+
+    while node.*.is_namespace && node.*.args.len() > 0 {
+        node = body.*.types[node.*.args[node.*.args.len() - 1]].pin
+    }
+
+    make p = ty::TyInterner.prim(node.*.name !)
+
+    if p != ty::TY_ERROR {
+        out.prim = p
+    } else {
+        out.name = node.*.name !
+    }
+
+    make ai: uint = 0
+
+    while ai < node.*.args.len() {
+        out.args.push(collect_type_sig(body, node.*.args[ai]))
+        ai = ai + 1
+    }
+
+    out.is_ptr = ht.*.is_ptr
+    out.is_ref = ht.*.is_ref
+    out.is_array = ht.*.is_array
+    out.is_optional = ht.*.is_optional
+    out.is_fallible = ht.*.is_fallible
+
+    return out
+}
+
+/// renders a portable hir type signature as a source-level name.
+make portable_type_name (sig: ref<hir::HirTypeSig>) -> str {
+    make name = sig.*.name !
+
+    if sig.*.prim == ty::TY_VOID { name = "void" }
+
+    if sig.*.prim == ty::TY_BOOL { name = "bool" }
+
+    if sig.*.prim == ty::TY_I8 { name = "i8" }
+
+    if sig.*.prim == ty::TY_I16 { name = "i16" }
+
+    if sig.*.prim == ty::TY_I32 { name = "i32" }
+
+    if sig.*.prim == ty::TY_I64 { name = "i64" }
+
+    if sig.*.prim == ty::TY_U8 { name = "u8" }
+
+    if sig.*.prim == ty::TY_U16 { name = "u16" }
+
+    if sig.*.prim == ty::TY_U32 { name = "u32" }
+
+    if sig.*.prim == ty::TY_U64 { name = "u64" }
+
+    if sig.*.prim == ty::TY_INT { name = "int" }
+
+    if sig.*.prim == ty::TY_UINT { name = "uint" }
+
+    if sig.*.prim == ty::TY_F32 { name = "f32" }
+
+    if sig.*.prim == ty::TY_F64 { name = "f64" }
+
+    if sig.*.prim == ty::TY_FLOAT { name = "float" }
+
+    if sig.*.prim == ty::TY_STR { name = "str" }
+
+    if sig.*.prim == ty::TY_STRBUF { name = "String" }
+
+    if sig.*.prim == ty::TY_TEXT { name = "text" }
+
+    if sig.*.prim == ty::TY_CHAR { name = "char" }
+
+    if sig.*.args.len() > 0 {
+        name = name + "<"
+        make i = 0
+
+        while i < sig.*.args.len() {
+            if i > 0 { name = name + ", " }
+
+            name = name + portable_type_name(sig.*.args[i].pin)
+            i = i + 1
+        }
+
+        name = name + ">"
+    }
+
+    if sig.*.is_ptr { name = "ptr<" + name + ">" }
+
+    if sig.*.is_ref { name = "ref<" + name + ">" }
+
+    if sig.*.is_array { name = name + "[]" }
+
+    if sig.*.is_optional { name = name + "?" }
+
+    if sig.*.is_fallible { name = "!" + name }
+
+    return name
+}
+
+// flatten a module's attached functions into portable signatures (see `hir::HirAttachedSig`),
+// appending them to `out`. signatures are reconstructed here (rather than copied) because they
+// own strings.
+make collect_sigs_into (out: ref<hir::HirAttachedSig[]>, module: ref<hir::HirModule>, path: str, source: ref<str>, struct_names: ref<str[]>) {
+    make i: uint = 0
+
+    while i < module.*.attached_funcs.len() {
+        make m = module.*.attached_funcs[i].pin
+
+        if m.*.func < module.*.funcs.len() {
+            make f = module.*.funcs[m.*.func].pin
+
+            make sig = hir::HirAttachedSig {}
+
+            sig.path = path.copy()
+            sig.source = source
+            sig.name_span = f.*.name_span.copy()
+            sig.symbol = f.*.name !
+            sig.type_name = m.*.type_name !
+            sig.name = m.*.name !
+            sig.param_count = f.*.body.param_count
+            sig.has_this = f.*.has_this
+
+            for tag : f.*.tags {
+                if tag == "unsafe" { sig.is_unsafe = true }
+            }
+
+            make pi: uint = 0
+
+            while pi < sig.param_count {
+                if pi < f.*.body.locals.len() {
+                    make param = f.*.body.locals[pi].pin
+
+                    if param.*.has_ty && param.*.ty < f.*.body.types.len() {
+                        make param_ty = collect_type_sig(f.*.body.pin, param.*.ty)
+                        sig.param_aggs.push(portable_type_is_aggregate(param_ty.pin, struct_names))
+                        sig.param_tys.push(param_ty)
+                    } else {
+                        sig.param_aggs.push(false)
+                    sig.param_tys.push(hir::HirTypeSig {})
+                    }
+                } else {
+                    sig.param_aggs.push(false)
+                    sig.param_tys.push(hir::HirTypeSig {})
+                }
+
+                pi = pi + 1
+            }
+
+            make ti: uint = 0
+
+            while ti < f.*.tags.len() {
+                if f.*.tags[ti] == "copy" {
+                    sig.is_copy_fn = true
+                }
+
+                ti = ti + 1
+            }
+
+            if f.*.has_ret_ty && f.*.ret_ty < f.*.body.types.len() {
+                sig.has_ret = true
+                sig.ret_ty = collect_type_sig(f.*.body.pin, f.*.ret_ty)
+                sig.ret_agg = portable_type_is_aggregate(sig.ret_ty.pin, struct_names)
+            }
+
+            out.*.push(sig)
+        }
+
+        i = i + 1
+    }
+}
+
+/// checks whether a portable type uses aggregate representation.
+make portable_type_is_aggregate (sig: ref<hir::HirTypeSig>, struct_names: ref<str[]>) -> bool {
+    if sig.*.is_fallible { return true }
+
+    if sig.*.name == "variant" && !sig.*.is_ref && !sig.*.is_ptr { return true }
+
+    if sig.*.is_array || sig.*.is_optional {
+        return true
+    }
+
+    make result = false
+
+    if sig.*.prim == ty::TY_STR || sig.*.prim == ty::TY_STRBUF {
+        result = true
+    }
+
+    if sig.*.prim == ty::TY_ERROR && !sig.*.is_ptr && !sig.*.is_ref
+        && !sig.*.is_array && !sig.*.is_optional
+        && sig.*.name != "variant" {
+        // The declaration may live in another unit, so consult the compilation-wide struct
+        // registry rather than this module's items. Enums are not named here and stay scalars.
+        make i: uint = 0
+
+        while i < struct_names.*.len() {
+            if struct_names.*[i] == sig.*.name {
+                result = true
+            }
+
+            i = i + 1
         }
     }
 
+    return result
+}
+
+// flatten a module's struct declarations into portable field signatures (see
+// `hir::HirStructSig`), appending them to `out`. field types use the same primitive-id / base-name
+// representation as attached-function return types.
+make collect_struct_sigs_into (out: ref<hir::HirStructSig[]>, module: ref<hir::HirModule>, path: str, source: ref<str>) {
+    make si: uint = 0
+
+    while si < module.*.structs.len() {
+        make hs = module.*.structs[si].pin
+
+        make sig = hir::HirStructSig {}
+
+        sig.name = hs.*.name !
+        sig.path = path.copy()
+        sig.source = source
+        sig.display_name = hs.*.declaration_name.copy()
+        sig.name_span = hs.*.name_span.copy()
+
+        make fi: uint = 0
+
+        while fi < hs.*.fields.len() {
+            make hf = hs.*.fields[fi].pin
+
+            if hf.*.has_ty && hf.*.ty < hs.*.body.types.len() {
+                make ht = hs.*.body.types[hf.*.ty].pin
+
+                make fs = hir::HirFieldSig {}
+
+                fs.name_span = hf.*.name_span.copy()
+                fs.is_pub = hf.*.is_pub
+                fs.is_unsafe = hf.*.is_unsafe
+                fs.name = hf.*.name !
+                fs.default_init = hf.*.default_init.copy()
+                fs.has_default = hf.*.has_default
+
+                if hf.*.has_default && hf.*.default < hs.*.body.exprs.len() {
+                    make value = hs.*.body.exprs[hf.*.default].pin
+
+                    if value.*.kind == hir::HirExprKind.Literal {
+                        fs.default_lit.kind = value.*.lit.kind
+                        fs.default_lit.lexeme = value.*.lit.lexeme.copy()
+                        fs.default_lit.span = value.*.lit.span
+                        fs.has_default_lit = true
+                    }
+                }
+
+                fs.ty = collect_type_sig(hs.*.body.pin, hf.*.ty)
+                fs.type_name = portable_type_name(fs.ty.pin)
+                sig.fields.push(fs)
+            } else {
+                // Visibility exists even when a field has no written type.
+                make fs = hir::HirFieldSig {}
+
+                fs.name_span = hf.*.name_span.copy()
+                fs.name = hf.*.name.copy()
+                fs.is_pub = hf.*.is_pub
+                fs.is_unsafe = hf.*.is_unsafe
+                sig.fields.push(fs)
+            }
+
+            fi = fi + 1
+        }
+
+        out.*.push(sig)
+        si = si + 1
+    }
+}
+
+// flatten a module's free functions into portable signatures, appending them to `out`
+make collect_free_sigs_into (out: ref<hir::HirFuncSig[]>, module: ref<hir::HirModule>, module_name: str, source: ref<str>, struct_names: ref<str[]>) {
+    make fi: uint = 0
+
+    while fi < module.*.funcs.len() {
+        make attached = false
+        make ai: uint = 0
+
+        while ai < module.*.attached_funcs.len() {
+            if module.*.attached_funcs[ai].func == fi {
+                attached = true
+            }
+
+            ai = ai + 1
+        }
+
+        if !attached {
+            make f = module.*.funcs[fi].pin
+            make sig = hir::HirFuncSig {}
+
+            sig.path = module_name.copy()
+            sig.source = source
+            sig.name_span = f.*.name_span.copy()
+            sig.module = module_name.copy()
+            sig.name = f.*.name !
+            sig.is_variadic = f.*.is_variadic
+
+            for tag : f.*.tags {
+                if tag == "unsafe" {
+                    sig.is_unsafe = true
+                }
+            }
+
+            make pi: uint = 0
+
+            while pi < f.*.body.param_count {
+                if pi < f.*.body.locals.len() {
+                    make param = f.*.body.locals[pi].pin
+
+                    if param.*.has_ty && param.*.ty < f.*.body.types.len() {
+                        make param_ty = collect_type_sig(f.*.body.pin, param.*.ty)
+                        sig.param_aggs.push(portable_type_is_aggregate(param_ty.pin, struct_names))
+                        sig.param_tys.push(param_ty)
+                    } else {
+                        sig.param_aggs.push(false)
+                        sig.param_tys.push(hir::HirTypeSig {})
+                    }
+                } else {
+                    sig.param_aggs.push(false)
+                    sig.param_tys.push(hir::HirTypeSig {})
+                }
+
+                pi = pi + 1
+            }
+
+            if f.*.has_ret_ty && f.*.ret_ty < f.*.body.types.len() {
+                sig.has_ret = true
+                sig.ret_ty = collect_type_sig(f.*.body.pin, f.*.ret_ty)
+                sig.ret_agg = portable_type_is_aggregate(sig.ret_ty.pin, struct_names)
+            }
+
+            out.*.push(sig)
+        }
+
+        fi = fi + 1
+    }
 }

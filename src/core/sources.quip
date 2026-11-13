@@ -1,0 +1,60 @@
+@pure @const {
+    make std = @import "std"
+}
+
+@pub
+make lexical_path (text: str) -> str {
+    make full = text
+
+    if full.len() > 0 && full[0] != '/' { full = std::os::getcwd() + "/" + full }
+
+    make path = std::io::Path.create(full)
+    make normalized = std::io::Path {}
+
+    normalized.is_absolute = true
+
+    for part : path.content.iter() {
+        if part == "." { continue }
+
+        if part == ".." {
+            if normalized.content.len() > 0 { normalized.content.pop() }
+        } else { normalized.content.push(part.copy()) }
+    }
+
+    return normalized.get()
+}
+
+@pub
+make canonical (text: str) -> str {
+    return resolve_links(lexical_path(text))
+}
+
+// Resolve symlinks so the same file reached through different paths maps to one unit. Paths that
+// do not exist yet keep their lexical spelling.
+make resolve_links (path: str) -> str {
+    @unsafe {
+        make input = path.copy()
+        input.push('\0')
+
+        make buffer: str = ""
+        buffer.reserve(4096) catch { return path }
+        @unsafe make null: ptr<char> = 0
+
+        if std::os::platform::realpath(input.data, buffer.data) == null { return path }
+
+        return from_cstr(buffer.data)
+    }
+}
+
+make from_cstr (data: ptr<char>) -> str {
+    make result: str = ""
+    make i: uint = 0
+
+    while data[i] != '\0' {
+        result.push(data[i])
+        i = i + 1
+    }
+
+    return result
+}
+

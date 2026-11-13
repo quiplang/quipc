@@ -1,5 +1,5 @@
 @pure @const {
-make mem: unit = @import "../mem/pkg.quip"
+    make mem: unit = @import "../mem/pkg.quip"
 }
 
 @impl ptr<char>
@@ -9,11 +9,32 @@ make to_str () -> str {
     make i: int = 0
 
     @unsafe {
-        while this.deref[i] != '\0' {
-            result = result + this.deref[i]
+        make source: ptr<char> = this.*
+        make null: ptr<char> = 0
+
+        if source == null { return result }
+
+        while source[i] != '\0' {
+            result = result + source[i]
             i = i + 1
         }
     }
+
+    return result
+}
+
+
+@impl str
+make to_c_str () -> ptr<char> {
+    make result: ptr<char> = mem::debug.alloc((@sizeof char) * (this.len() + 1)).unwrap()
+
+    make i = 0
+    for c : this.* {
+        @unsafe result[i] = c
+        i++
+    }
+
+    result[this.len()] = '\0'
 
     return result
 }

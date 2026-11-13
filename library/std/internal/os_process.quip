@@ -1,0 +1,19 @@
+@pure @const {
+    @target "macos" make os = @import "../os/macos.quip"
+    @target "linux" make os = @import "../os/linux.quip"
+}
+
+@pub @unsafe @export "quip_fork"
+make process_fork () -> int { return os::fork() }
+
+@pub @unsafe @export "quip_sys_pipe"
+make process_pipe (output: ptr<int>) -> int {
+    make storage: uint = 0
+    @unsafe make descriptors: ptr<i32> = storage.pin
+
+    if os::pipe(descriptors) != 0 { return -1 }
+
+    output[0] = descriptors[0]
+    output[1] = descriptors[1]
+    return 0
+}

@@ -1,0 +1,41 @@
+// LLVM IR dumps and native executable linking.
+
+@pure @const {
+    make std = @import "std"
+
+}
+
+// write `text` to `path`, creating/truncating the file. returns false on IO error.
+/// writes generated text to a file, returning false if writing fails.
+@pub
+make write_text (path: str, text: str) -> bool {
+    make f = std::io::File.create(std::io::Path.create(path), std::io::MODE_FILE) catch err {
+        return false
+    }
+
+    f.write(text) catch err {
+        f.close()
+        return false
+    }
+
+    f.close()
+    return true
+}
+
+// spawn `name args...`, wait for it and return its exit code (-1 on spawn failure)
+@pub
+make run (name: str, args: str[]) -> int {
+    return std::progress::run(name, args)
+}
+
+/// Links native objects into an executable.
+@pub
+make link (objs: str[], out: str) -> int {
+    make args: str[] = ["-lm"]
+
+    for object : objs { args.push(object !) }
+
+    args.push("-o")
+    args.push(out)
+    return run("clang", args)
+}

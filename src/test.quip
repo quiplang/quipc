@@ -1,8 +1,9 @@
 @pure @const {
-make std = @import "../library/std/pkg.quip"
+    make std = @import "std"
 }
 
 
+/// runs the test.
 @pub
 make run_test () -> int {
 

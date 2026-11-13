@@ -1,0 +1,3463 @@
+// Lower MIR into an LLVM module through the LLVM C API.
+@pure @const {
+    make std: unit = @import "std"
+    make api = @import "bindings.quip"
+    make native = @import "native.quip"
+    make descriptors = @import "descriptors.quip"
+    make mir = @import "../mir/mir.quip"
+    make integer = @import "integer.quip"
+    make floating = @import "floating.quip"
+    make entry = @import "entry.quip"
+    make strings = @import "strings.quip"
+    make drops = @import "cleanup.quip"
+    make globals = @import "globals.quip"
+    make adapters = @import "adapters.quip"
+    make scalar = @import "scalar.quip"
+    make slots = @import "slots.quip"
+    make layouts = @import "structs.quip"
+    make lexer = @import "../core/token.quip"
+    make mangle = @import "../semantics/symbol/mangle.quip"
+    make memr = @import "../memory/report.quip"
+    make closures = @import "../memory/closures.quip"
+}
+
+make type ScalarFunction {
+    @pub make symbol: str = ""
+    @pub make index: uint = 0
+    @pub make slots: slots::SlotPlan = .{}
+    @pub make calls: str[] = []
+}
+
+/// Lowers a MIR unit into a module owned by the caller.
+@pub @unsafe
+make build (context: ptr<any>, module: ptr<any>, m: ref<mir::MirModule>, module_name: str,
+    selected_entry: str, source: str, platform: str, report: ref<memr::MemReport>) -> bool {
+    make builder = api::LLVMCreateBuilderInContext(context)
+    @unsafe make null: ptr<any> = 0
+    make e = Emitter {
+        context = context, module = module, builder = builder, null = null,
+        module_name = module_name, entry = selected_entry, source = source, platform = platform,
+        mem_report = report, word = api::LLVMInt64TypeInContext(context),
+        byte = api::LLVMInt8TypeInContext(context), pointer = api::LLVMPointerTypeInContext(context, 0),
+        void_type = api::LLVMVoidTypeInContext(context), c_int = api::LLVMInt32TypeInContext(context),
+        conversion = native::Conversion.create(context, builder),
+        floats = floating::Lowering.create(context, builder),
+    }
+    e.emit(m)
+    api::LLVMDisposeBuilder(builder)
+    for function : e.scalar_functions {
+        scalar::build(context, module, function.symbol.copy(), m.*.funcs[function.index].body.pin,
+            m.*.funcs[function.index].is_lambda, function.slots.pin, function.calls.pin, e.builder_layouts.pin)
+    }
+    descriptors::build(context, module, e.descriptors.pin)
+    strings::build(context, module)
+    globals::build(context, module, e.global_plans.pin)
+    if !adapters::build(context, module, e.adapters.pin, m) { return false }
+    return entry::build(context, module, e.entry_plan.pin)
+}
+
+make type Emitter {
+    make context: ptr<any>
+    make module: ptr<any>
+    make builder: ptr<any>
+    make null: ptr<any>
+    make word: ptr<any>
+    make byte: ptr<any>
+    make pointer: ptr<any>
+    make void_type: ptr<any>
+    make c_int: ptr<any>
+    make conversion: native::Conversion
+    make floats: floating::Lowering
+    make unnamed: str = ""
+    make module_name: str = ""
+    make entry: str = "main"
+    make entry_plan: entry::Plan = .{}
+    make global_plans: globals::Plan[] = []
+    make adapters: adapters::Plan[] = []
+    make names: str[] = []
+    make native_exports: str[] = []
+    make declared: str[] = []
+
+    // definition-name -> emitted-symbol maps for the functions defined in this module
+    make local_src: str[] = []
+    make local_sym: str[] = []
+
+    // struct layouts carried through by the MIR builder, and the functions in this module (used to
+    // resolve call signatures for aggregate argument/return conventions)
+    make structs: ref<mir::MirStruct>[] = []
+    make fns: ref<mir::MirFunc>[] = []
+    make schema_names: str[] = []
+    make descriptors: descriptors::RuntimeDescriptor[] = []
+    make scalar_functions: ScalarFunction[] = []
+    make builder_layouts: layouts::Layout[] = []
+    make managed_names: str[] = []
+    make managed_flags: bool[] = []
+    make environment_names: str[] = []
+    make capture_indices: uint[] = []
+
+    // per-function state, reset by `gen_func`
+    make local_tys: str[] = []      // rendered type of every local (index 0 is the return place)
+    make local_slots: uint[] = []
+    make storage: ptr<any>[] = []
+    make captures: ptr<any>[] = []
+    make owners: ptr<any>[] = []
+    make blocks: ptr<any>[] = []
+    make string_result: ptr<any>
+    make raw_store: ptr<any>
+    make return_buffer: ptr<any>
+    make function: ptr<any>
+    make local_cleanup: drops::Local[] = []
+    make move_temps: bool[] = []
+    make cur_ret_ty: str = ""
+    make cur_sret: bool = false
+    make platform: str = "macos"
+    make mem_report: ref<memr::MemReport>
+
+    // the unit's source text (to turn a byte offset into a line for runtime panics) and the module-level
+    // Source text maps runtime panic offsets to line numbers.
+    make source: str = ""
+
+    @this @unsafe
+    make word_value (value: uint) -> ptr<any> {
+        return api::LLVMConstInt(this.word, value, 0)
+    }
+
+    @this @unsafe
+    make signature (result: ptr<any>, parameters: ptr<any>[], variadic: bool) -> ptr<any> {
+        @unsafe make first: ptr<ptr<any>> = 0
+        if parameters.len() > 0 { @unsafe first = parameters[0].pin }
+        @unsafe make count: u32 = parameters.len()
+        make vararg: i32 = 0
+        if variadic { vararg = 1 }
+        return api::LLVMFunctionType(result, first, count, vararg)
+    }
+
+    @this @unsafe
+    make named (name: str) -> ptr<any> {
+        return api::LLVMGetNamedFunction(this.module, name.data)
+    }
+
+    @this @unsafe
+    make declare (name: str, result: ptr<any>, parameters: ptr<any>[], variadic: bool) -> ptr<any> {
+        make previous = this.named(name.copy())
+        if previous != this.null { return previous }
+        return api::LLVMAddFunction(this.module, name.data, this.signature(result, parameters, variadic))
+    }
+
+    @this @unsafe
+    make call (callee: ptr<any>, signature: ptr<any>, arguments: ptr<any>[]) -> ptr<any> {
+        @unsafe make first: ptr<ptr<any>> = 0
+        if arguments.len() > 0 { @unsafe first = arguments[0].pin }
+        @unsafe make count: u32 = arguments.len()
+        return api::LLVMBuildCall2(this.builder, signature, callee, first, count, this.unnamed.data)
+    }
+
+    @this @unsafe
+    make call_named (name: str, arguments: ptr<any>[]) -> ptr<any> {
+        make callee = this.named(name)
+        return this.call(callee, api::LLVMGlobalGetValueType(callee), arguments)
+    }
+
+    @this @unsafe
+    make trap () {
+        this.call_named("llvm.trap", [])
+    }
+
+    @this @unsafe
+    make allocate (size: uint) -> ptr<any> {
+        make address = api::LLVMBuildArrayAlloca(this.builder, this.byte, this.word_value(size), this.unnamed.data)
+        api::LLVMSetAlignment(address, 8)
+        return address
+    }
+
+    @this @unsafe
+    make load (address: ptr<any>, ty: ptr<any>, alignment: u32) -> ptr<any> {
+        make value = api::LLVMBuildLoad2(this.builder, ty, address, this.unnamed.data)
+        api::LLVMSetAlignment(value, alignment)
+        return value
+    }
+
+    @this @unsafe
+    make store (value: ptr<any>, address: ptr<any>, alignment: u32) {
+        api::LLVMSetAlignment(api::LLVMBuildStore(this.builder, value, address), alignment)
+    }
+
+    @this @unsafe
+    make go_to (target: uint) {
+        api::LLVMBuildBr(this.builder, this.blocks[target])
+    }
+
+    @this @unsafe
+    make block (function: ptr<any>, name: str) -> ptr<any> {
+        return api::LLVMAppendBasicBlockInContext(this.context, function, name.data)
+    }
+
+    /// replaces characters that cannot be used directly in an emitted symbol.
+    @this
+    make sanitize (name: str) -> str {
+        make out: str = ""
+        make i: uint = 0
+
+        while i < name.len() {
+            make c = name[i]
+
+            if c == '.' || c == ':' {
+                out = out + "_"
+            } else {
+                out = out + c
+            }
+
+            i = i + 1
+        }
+
+        return out
+    }
+
+    // emitted symbol for a function defined in this module: module-mangled for ordinary free
+    // functions, plain for attached (`@impl`) functions and `@external` FFI declarations, and
+    // `__quip_user_main` for the entry point
+    /// chooses the emitted symbol for a function definition.
+    @this
+    make emit_symbol (f: ref<mir::MirFunc>) -> str {
+        if f.*.name == this.entry {
+            return "__quip_user_main"
+        }
+
+        if f.*.is_attached || (f.*.is_external) {
+            return this.sanitize(f.*.name !)
+        }
+
+        return mangle::free_symbol(this.module_name !, f.*.name !)
+    }
+
+    // emitted symbol for a call target: resolved through this module's definition map (so calls
+    // to local free functions use their mangled name); already-resolved symbols pass through
+    /// resolves a source name to its emitted symbol.
+    @this
+    make symbol_of (name: str) -> str {
+        make i: uint = 0
+
+        while i < this.local_src.len() {
+            if this.local_src[i] == name {
+                return (this.local_sym[i] !).copy()
+            }
+
+            i = i + 1
+        }
+
+        return this.sanitize(name)
+    }
+
+    /// checks whether the symbol names a function defined in this module.
+    @this
+    make is_local (ir_name: str) -> bool {
+        make i: uint = 0
+
+        while i < this.names.len() {
+            if this.names[i] == ir_name {
+                return true
+            }
+
+            i = i + 1
+        }
+
+        return false
+    }
+
+    @this @unsafe
+    make parse_int (s: str) -> ptr<any> {
+        make value = integer::parse(s) catch {
+            this.trap()
+            return this.word_value(0)
+        }
+        return this.word_value(value)
+    }
+
+    @this
+    make is_float_ty (ty: str) -> bool {
+        return ty == "float" || ty == "f32" || ty == "f64"
+    }
+
+    @this
+    make is_optional (ty: str) -> bool {
+        return this.ends_with(this.strip_bang(ty !), "?")
+    }
+
+    /// extracts the payload type name from an optional type.
+    @this
+    make optional_payload (ty: str) -> str {
+        make t = this.strip_bang(ty !)
+
+        if this.ends_with(t !, "?") {
+            return this.unparen(this.slice(t !, 0, t.len() - 1))
+        }
+
+        return ""
+    }
+
+    /// emits initialization of a scalar or aggregate value to zero.
+    @this @unsafe
+    make zero_value (addr: ptr<any>, ty: str) {
+        if this.is_agg(ty.copy()) {
+            api::LLVMBuildMemSet(this.builder, addr, api::LLVMConstInt(this.byte, 0, 0),
+                this.word_value(this.size_of(ty)), 1)
+        } else {
+            this.store_i64(this.word_value(0), addr)
+        }
+    }
+
+    /// Builds the word representation of a floating-point literal.
+    @this @unsafe
+    make const_float (op: ref<mir::MirOperand>) -> ptr<any> {
+        return this.floats.constant(op.*.lit.lexeme.copy(), op.*.ty == "f32")
+    }
+
+    /// formats a constant operand for llvm emission.
+    @this @unsafe
+    make const_operand (op: ref<mir::MirOperand>) -> ptr<any> {
+        if op.*.is_sizeof { return this.word_value(this.size_of(op.*.name.copy())) }
+
+        make tk = op.*.lit.kind
+        if tk == lexer::TokenKind.Identifier {
+            make getter = op.*.lit.lexeme.copy()
+            this.declare(getter.copy(), this.pointer, [], false)
+            return this.ptrtoint(this.call_named(getter, []))
+        }
+        if tk == lexer::TokenKind.KeyError {
+            make name = "__quip_error_" + this.sanitize(op.*.lit.lexeme.copy())
+            return this.ptrtoint(globals::error_identity(this.context, this.module, name))
+        }
+        if tk == lexer::TokenKind.KeyTrue { return this.word_value(1) }
+        if tk == lexer::TokenKind.KeyFalse || tk == lexer::TokenKind.KeyNone { return this.word_value(0) }
+        if tk == lexer::TokenKind.LiteralNum {
+            if this.is_float_ty(op.*.ty.copy()) { return this.const_float(op) }
+            return this.parse_int(op.*.lit.lexeme !)
+        }
+        if tk == lexer::TokenKind.LiteralChar && op.*.lit.lexeme.len() > 0 {
+            @unsafe make value: uint = op.*.lit.lexeme[0]
+            return this.word_value(value & 255)
+        }
+        if tk == lexer::TokenKind.LiteralString {
+            make text = op.*.lit.lexeme !
+            make raw = this.string_global(text.copy())
+            return this.ptrtoint(strings::literal_header(this.context, this.module, raw, text.len()))
+        }
+        this.trap()
+        return this.word_value(0)
+    }
+
+    // type / layout helpers
+    //
+    // types are represented by source-like names ("Heap", "ptr<Block>?", "int[]").
+    // nominal structs, arrays, strings, and tagged optionals use in-place storage; other values
+    // are held in an i64 slot.
+
+    @this
+    make first_at (s: str, target: char) -> uint {
+        make i = 0
+
+        while i < s.len() {
+            if s[i] == target { return i }
+
+            i = i + 1
+        }
+
+        return s.len()
+    }
+
+    @this
+    make last_at (s: str, target: char) -> uint {
+        make i = s.len()
+
+        while i > 0 {
+            i = i - 1
+
+            if s[i] == target { return i }
+        }
+
+        return s.len()
+    }
+
+    /// copies the requested range from a string.
+    @this
+    make slice (s: str, a: uint, b: uint) -> str {
+        make out: str = ""
+        make i = a
+
+        while i < b {
+            if i >= s.len() { return out }
+
+            out = out + s[i]
+            i = i + 1
+        }
+
+        return out
+    }
+
+    @this
+    make ends_with (s: str, suffix: str) -> bool {
+        if suffix.len() > s.len() { return false }
+
+        make off = s.len() - suffix.len()
+        make i = 0
+
+        while i < suffix.len() {
+            if s[off + i] != suffix[i] { return false }
+
+            i = i + 1
+        }
+
+        return true
+    }
+
+    @this
+    make strip_bang (s: str) -> str {
+        if s.len() > 0 {
+            if s[0] == '!' { return this.slice(s !, 1, s.len()) }
+        }
+
+        return s
+    }
+
+    /// extracts the text between the outer angle brackets of a type name.
+    @this
+    make inner_of (s: str) -> str {
+        make open = this.first_at(s !, '<')
+        make close = this.last_at(s !, '>')
+
+        if open < close { return this.slice(s, open + 1, close) }
+
+        return ""
+    }
+
+    // the nominal struct name a type refers to, or "" when it is not a struct value
+    @this
+    make nominal (ty: str) -> str {
+        make t = this.strip_bang(ty)
+
+        if this.ends_with(t !, "[]") { return "" }
+
+        if this.ends_with(t !, "?") { return "" }
+
+        make lt = this.first_at(t !, '<')
+
+        if lt >= t.len() { return t }
+
+        make prefix = this.slice(t !, 0, lt)
+
+        if prefix == "ptr" { return "" }
+
+        if prefix == "ref" { return "" }
+
+        if prefix == "pin" { return "" }
+
+        if prefix == "owned" { return "" }
+
+        return this.nominal(this.inner_of(t))
+    }
+
+    /// extracts the pointee type from a pointer-like type name.
+    @this
+    make pointee (ty: str) -> str {
+        make t = this.strip_bang(ty)
+
+        if this.ends_with(t !, "[]") { return this.unparen(this.slice(t, 0, t.len() - 2)) }
+
+        make lt = this.first_at(t !, '<')
+
+        if lt < t.len() { return this.inner_of(t) }
+
+        if this.ends_with(t !, "?") { return this.pointee(this.slice(t, 0, t.len() - 1)) }
+
+        return ""
+    }
+
+    @this
+    make is_indirect (ty: str) -> bool {
+        make t = this.strip_bang(ty)
+
+        if this.ends_with(t !, "[]") { return false }
+
+        make lt = this.first_at(t !, '<')
+
+        if lt >= t.len() { return false }
+
+        make prefix = this.slice(t !, 0, lt)
+
+        return prefix == "ptr" || prefix == "ref" || prefix == "pin" || prefix == "owned"
+    }
+
+    @this
+    make is_ref (ty: str) -> bool {
+        make t = this.strip_bang(ty)
+        make lt = this.first_at(t !, '<')
+
+        if lt >= t.len() { return false }
+
+        return this.slice(t !, 0, lt) == "ref"
+    }
+
+    /// returns the type of a recognized string field, following indirect types.
+    @this
+    make string_field_type (ty: str, name: str) -> str {
+        if this.is_indirect(ty.copy()) {
+            return this.string_field_type(this.pointee(ty.copy()), name !)
+        }
+
+        if ty == "str" || ty == "String" {
+            if name == "data" { return "ptr<char>" }
+
+            if name == "length" || name == "len" || name == "capacity" || name == "cap" {
+                return "int"
+            }
+        }
+
+        return ""
+    }
+
+    /// finds a structure by name, returning the structure count when absent.
+    @this
+    make struct_index (name: str) -> uint {
+        make i = 0
+
+        while i < this.structs.len() {
+            if this.structs[i].*.name == name { return i }
+
+            i = i + 1
+        }
+
+        return i
+    }
+
+    /// removes an enclosing pair of parentheses from a type name.
+    @this
+    make unparen (ty: str) -> str {
+        if ty.len() > 1 && ty[0] == '(' && ty[ty.len() - 1] == ')' {
+            return this.slice(ty !, 1, ty.len() - 1)
+        }
+
+        return ty
+    }
+
+    @this
+    make is_fallible (ty: str) -> bool {
+        return ty.len() > 0 && ty[0] == '!'
+    }
+
+    @this @unsafe
+    make gen_fallible_assignment (value: ref<mir::MirRvalue>, dest: ptr<any>, dest_ty: str) {
+        if value.*.kind == mir::MirRvalueKind.Use {
+            if value.*.a.kind == mir::MirOperandKind.Const && value.*.a.lit.kind == lexer::TokenKind.KeyNone {
+                this.zero_value(dest, dest_ty)
+                return
+            }
+
+            make source_ty = this.operand_type(value.*.a.pin)
+
+            if this.is_fallible(source_ty.copy()) {
+                this.memcpy(dest, this.operand_addr(value.*.a.pin), this.size_of(dest_ty))
+                return
+            }
+
+            if source_ty == "error" {
+                make code = this.gen_operand(value.*.a.pin)
+                this.zero_value(dest, dest_ty)
+                this.store_i64(code, dest)
+                return
+            }
+        }
+
+        make payload_ty = this.strip_bang(dest_ty.copy())
+        make payload = this.allocate(this.size_of(payload_ty.copy()))
+
+        if this.has_closure(payload_ty.copy()) { this.zero_value(payload, payload_ty.copy()) }
+
+        this.gen_assignment(value, payload, payload_ty.copy())
+        this.zero_value(dest, dest_ty)
+        this.memcpy(this.gep(dest, 8), payload, this.size_of(payload_ty))
+    }
+
+    /// returns an address for a fallible argument, constructing a temporary when needed.
+    @this @unsafe
+    make fallible_arg_addr (value: ref<mir::MirOperand>, ty: str) -> ptr<any> {
+        if this.is_fallible(this.operand_type(value)) { return this.operand_addr(value) }
+
+        make dest = this.allocate(this.size_of(ty.copy()))
+        make rv = mir::MirRvalue {}
+
+        rv.kind = mir::MirRvalueKind.Use
+        rv.a.kind = value.*.kind
+        rv.a.place = value.*.place !
+        rv.a.lit.kind = value.*.lit.kind
+        rv.a.lit.lexeme = value.*.lit.lexeme.copy()
+        rv.a.name = value.*.name.copy()
+        rv.a.ty = value.*.ty.copy()
+        rv.a.is_sizeof = value.*.is_sizeof
+        this.gen_fallible_assignment(rv.pin, dest, ty)
+        return dest
+    }
+
+    @this
+    make is_variant (ty: str) -> bool {
+        if ty.len() < 9 { return false }
+
+        if ty[ty.len() - 1] != '>' { return false }
+
+        return this.slice(ty !, 0, 8) == "variant<"
+    }
+
+    /// splits a variant type into its top-level member type names.
+    @this
+    make variant_members (ty: str) -> str[] {
+        make members: str[] = []
+        make depth: uint = 0
+        make start: uint = 8
+        make i: uint = 8
+
+        while i < ty.len() {
+            make c = ty[i]
+
+            if (c == ',' && depth == 0) || (c == '>' && depth == 0) {
+                members.push(this.slice(ty !, start, i))
+                start = i + 1
+
+                while start < ty.len() && ty[start] == ' ' { start = start + 1 }
+            } elif c == '<' {
+                depth = depth + 1
+            } elif c == '>' {
+                depth = depth - 1
+            }
+
+            i = i + 1
+        }
+
+        return members
+    }
+
+    /// finds the index of a member type within a variant.
+    @this
+    make variant_index (ty: str, member: str) -> uint {
+        make members = this.variant_members(ty)
+        make i: uint = 0
+
+        while i < members.len() {
+            if members[i] == member { return i }
+
+            if this.is_indirect(member.copy()) && this.is_indirect(members[i].copy()) {
+                if this.pointee(member.copy()) == this.pointee(members[i].copy()) { return i }
+            }
+
+            i = i + 1
+        }
+
+        return i
+    }
+
+    // Internal variants are an i64 tag followed by an inline, eight-byte-aligned payload.
+    @this @unsafe
+    make variant_assign (dest: ptr<any>, ty: str, value: ref<mir::MirOperand>) {
+        make source_ty = this.operand_type(value)
+
+        if source_ty == ty {
+            this.memcpy(dest, this.operand_addr(value), this.size_of(ty))
+            return
+        }
+
+        make members = this.variant_members(ty.copy())
+
+        if this.is_variant(source_ty.copy()) {
+            // Compatible variants can list their members in a different order.
+            // Translate the discriminant instead of copying it unchanged.
+            make source_members = this.variant_members(source_ty.copy())
+            make source = this.operand_addr(value)
+            make source_tag = this.load_i64(source)
+            make mapped: ptr<any> = this.word_value(0)
+            make i: uint = 0
+
+            while i < source_members.len() {
+                make target_tag = this.variant_index(ty.copy(), source_members[i].copy())
+
+                if target_tag >= members.len() {
+                    this.trap()
+                    return
+                }
+
+                make equal = this.compare("==", source_tag, this.word_value(i), false)
+                mapped = api::LLVMBuildSelect(this.builder, equal, this.word_value(target_tag), mapped, this.unnamed.data)
+                i = i + 1
+            }
+
+            this.zero_value(dest, ty.copy())
+            this.store_i64(mapped, dest)
+            this.memcpy(this.gep(dest, 8), this.gep(source, 8), this.size_of(source_ty) - 8)
+            return
+        }
+
+        make tag = this.variant_index(ty.copy(), source_ty.copy())
+
+        if tag >= members.len() {
+            this.trap()
+            return
+        }
+
+        this.zero_value(dest, ty.copy())
+        this.store_i64(this.word_value(tag), dest)
+        if source_ty == "str" || source_ty == "String" {
+            this.assign_string_operand(this.gep(dest, 8), value)
+        } elif this.has_closure(source_ty.copy()) {
+            make prepared = this.prepare_value(value, source_ty.copy())
+            this.memcpy(this.gep(dest, 8), prepared, this.size_of(source_ty))
+        } elif this.is_agg(source_ty.copy()) {
+            this.memcpy(this.gep(dest, 8), this.operand_addr(value), this.size_of(source_ty))
+        } else {
+            this.store_i64(this.gen_operand(value), this.gep(dest, 8))
+        }
+    }
+
+    /// returns an address for a variant argument, creating a temporary when needed.
+    @this @unsafe
+    make variant_arg (value: ref<mir::MirOperand>, ty: str) -> ptr<any> {
+        if this.operand_type(value) == ty { return this.operand_addr(value) }
+
+        make addr = this.allocate(this.size_of(ty.copy()))
+        this.variant_assign(addr, ty, value)
+        return addr
+    }
+
+    @this
+    make is_function (ty: str) -> bool {
+        return ty == "fn" || (ty.len() > 3 && ty[0] == 'f' && ty[1] == 'n' && ty[2] == '<' && ty[ty.len() - 1] == '>')
+    }
+
+    /// checks for closure.
+    @this
+    make has_closure (ty: str) -> bool {
+        if this.is_function(ty.copy()) { return true }
+
+        if this.is_indirect(ty.copy()) { return false }
+
+        make i: uint = 0
+
+        while i < this.managed_names.len() {
+            if this.managed_names[i] == ty { return this.managed_flags[i] }
+
+            i = i + 1
+        }
+
+        make index = this.managed_names.len()
+        this.managed_names.push(ty.copy())
+        this.managed_flags.push(false)
+        make found = false
+
+        if this.ends_with(ty.copy(), "[]") { found = this.has_closure(this.pointee(ty.copy())) }
+        elif this.is_optional(ty.copy()) { found = this.has_closure(this.optional_payload(ty.copy())) }
+        elif this.is_fallible(ty.copy()) { found = this.has_closure(this.strip_bang(ty.copy())) }
+        elif this.is_variant(ty.copy()) {
+            for member : this.variant_members(ty.copy()) {
+                if this.has_closure(member) { found = true }
+            }
+        } else {
+            make si = this.struct_index(this.nominal(ty.copy()))
+
+            if si < this.structs.len() {
+                make fi: uint = 0
+
+                while fi < this.structs[si].*.fields.len() {
+                    if this.has_closure(this.structs[si].*.fields[fi].ty.copy()) { found = true }
+
+                    fi = fi + 1
+                }
+            }
+        }
+
+        this.managed_flags[index] = found
+        return found
+    }
+
+    /// builds the runtime memory-management schema for a type.
+    @this @unsafe
+    make schema (ty: str) -> str {
+        make i: uint = 0
+
+        while i < this.schema_names.len() {
+            if this.schema_names[i] == ty { return ".quip.schema." + i.to_str() }
+
+            i = i + 1
+        }
+
+        make index = this.schema_names.len()
+        this.schema_names.push(ty.copy())
+        make symbol = ".quip.schema." + index.to_str()
+        make descriptor = descriptors::RuntimeDescriptor { symbol = symbol.copy(), size = this.size_of(ty.copy()) }
+
+        if this.is_function(ty.copy()) { descriptor.kind = 4 }
+        elif ty == "str" || ty == "String" { descriptor.kind = 1 }
+        elif this.ends_with(ty.copy(), "[]") { descriptor.kind = 2 descriptor.element = this.schema(this.pointee(ty.copy())) }
+        elif this.is_optional(ty.copy()) { descriptor.kind = 5 descriptor.element = this.schema(this.optional_payload(ty.copy())) }
+        elif this.is_fallible(ty.copy()) { descriptor.kind = 6 descriptor.element = this.schema(this.strip_bang(ty.copy())) }
+        elif ty.len() > 6 && ty[0] == 'o' && ty[1] == 'w' && ty[2] == 'n' && ty[3] == 'e' && ty[4] == 'd' && ty[5] == '<' {
+            descriptor.kind = 7
+            descriptor.element = this.schema(this.pointee(ty.copy()))
+        } elif this.is_variant(ty.copy()) {
+            descriptor.kind = 8
+
+            for member : this.variant_members(ty.copy()) {
+                descriptor.fields.push(descriptors::DescriptorField { offset = 8, schema = this.schema(member) })
+            }
+        } else {
+            make si = this.struct_index(this.nominal(ty.copy()))
+
+            if si < this.structs.len() {
+                descriptor.kind = 3
+                make i: uint = 0
+
+                while i < this.structs[si].*.fields.len() {
+                    make child = this.schema(this.structs[si].*.fields[i].ty.copy())
+                    descriptor.fields.push(descriptors::DescriptorField { offset = this.field_off_at(si, i), schema = child })
+                    i++
+                }
+            }
+        }
+
+        this.declare_descriptor(descriptor)
+
+        return symbol
+    }
+
+    @this @unsafe
+    make global_address (name: str) -> ptr<any> {
+        return api::LLVMGetNamedGlobal(this.module, name.data)
+    }
+
+    @this @unsafe
+    make schema_address (ty: str) -> ptr<any> {
+        return this.global_address(this.schema(ty))
+    }
+
+    @this @unsafe
+    make declare_descriptor (descriptor: descriptors::RuntimeDescriptor) {
+        descriptors::declare(this.context, this.module, descriptor.symbol.copy())
+        this.descriptors.push(descriptor)
+    }
+
+    @this
+    make capture_layout (f: ref<mir::MirFunc>) -> closures::CaptureLayout {
+        make layout = closures::CaptureLayout {}
+        for local : f.*.body.capture_locals {
+            layout.add(local, this.size_of(f.*.body.locals[local].ty.copy()))
+        }
+        return layout
+    }
+
+    @this @unsafe
+    make capture_schema (f: ref<mir::MirFunc>, layout: ref<closures::CaptureLayout>) -> ptr<any> {
+        if layout.*.fields.len() == 0 { return api::LLVMConstNull(this.pointer) }
+
+        make symbol = this.emit_symbol(f) + ".environment"
+        // One descriptor per syntactic lambda, even when referenced repeatedly.
+        for name : this.environment_names {
+            if name == symbol { return this.global_address(symbol) }
+        }
+
+        make descriptor = descriptors::RuntimeDescriptor { symbol = symbol.copy(), kind = 3, size = layout.*.size }
+        for field : layout.*.fields {
+            make ty = f.*.body.locals[field.local].ty.copy()
+            descriptor.fields.push(descriptors::DescriptorField { offset = field.value_offset, schema = this.schema(ty) })
+        }
+
+        this.environment_names.push(symbol.copy())
+        this.declare_descriptor(descriptor)
+        return this.global_address(symbol)
+    }
+
+    @this
+    make is_capture (local: uint) -> bool {
+        for capture : this.capture_indices {
+            if capture == local { return true }
+        }
+
+        return false
+    }
+
+    @this @unsafe
+    make prepare_value (op: ref<mir::MirOperand>, ty: str) -> ptr<any> {
+        make destination = this.allocate(this.size_of(ty.copy()))
+
+        if op.*.kind == mir::MirOperandKind.Path || op.*.kind == mir::MirOperandKind.Const {
+            if this.is_agg(ty.copy()) {
+                this.call_named("__quip_value_copy", [destination, this.operand_addr(op), this.schema_address(ty)])
+            } else { this.store_i64(this.gen_operand(op), destination) }
+        } else {
+            make operation: str = "copy"
+
+            if op.*.kind == mir::MirOperandKind.Move && op.*.place.projs.len() == 0 { operation = "move" }
+
+            this.call_named("__quip_value_" + operation, [destination, this.operand_addr(op), this.schema_address(ty)])
+        }
+
+        return destination
+    }
+
+    /// emits creation of a closure and initializes its captured environment.
+    @this @unsafe
+    make closure_value (rv: ref<mir::MirRvalue>) -> ptr<any> {
+        make index = this.lookup_func(this.symbol_of(rv.*.name.copy()))
+
+        if index >= this.fns.len() { this.trap() return this.word_value(0) }
+
+        make f = this.fns[index]
+        make layout = this.capture_layout(f)
+        make code = this.ptrtoint(this.named(this.emit_symbol(f)))
+        make value = this.call_named("__quip_closure_new", [code, this.capture_schema(f, layout.pin)])
+        make env = this.call_named("__quip_closure_env", [value])
+        make address = this.inttoptr(env)
+        make i: uint = 0
+
+        while i < rv.*.ops.len() {
+            make field = layout.fields[i].pin
+            make ty = f.*.body.locals[field.*.local].ty.copy()
+            make temporary = this.prepare_value(rv.*.ops[i].pin, ty)
+            this.store_i64(this.word_value(1), this.gep(address, field.*.flag_offset))
+            this.memcpy(this.gep(address, field.*.value_offset), temporary, field.*.size)
+            i = i + 1
+        }
+
+        return value
+    }
+
+    @this @unsafe
+    make reserve_closure_adapter (code: str, symbol: str, ret: str, parameters: str[]) {
+        if this.named(code.copy()) != this.null { return }
+
+        make result = this.word
+        make target_types: ptr<any>[] = []
+        make wrapper_types: ptr<any>[] = []
+        make environment: uint = 0
+        if this.is_agg(ret) {
+            result = this.void_type
+            target_types.push(this.pointer)
+            wrapper_types.push(this.pointer)
+            environment = 1
+        }
+        wrapper_types.push(this.word)
+        for parameter : parameters {
+            make ty = this.word
+            if this.is_agg(parameter.copy()) { ty = this.pointer }
+            target_types.push(ty)
+            wrapper_types.push(ty)
+        }
+
+        this.declare(symbol.copy(), result, target_types, false)
+        this.declare(code.copy(), result, wrapper_types, false)
+        this.adapters.push(adapters::Plan {
+            kind = adapters::Kind.Closure, symbol = code, target = symbol, environment = environment,
+        })
+    }
+
+    @this @unsafe
+    make function_handle (symbol: str, ret: str, parameters: str[]) -> ptr<any> {
+        make index = this.lookup_func(symbol.copy())
+        make code = symbol.copy()
+
+        if index >= this.fns.len() {
+            if ret.len() == 0 { return this.ptrtoint(this.declare(symbol, this.word, [], false)) }
+            code = symbol.copy() + ".imported.closure"
+            this.reserve_closure_adapter(code.copy(), symbol, ret, parameters)
+        } else {
+            make f = this.fns[index]
+            if !f.*.is_lambda {
+                code = symbol.copy() + ".closure"
+                make types: str[] = []
+                make i: uint = 1
+                while i <= f.*.body.param_count {
+                    types.push(f.*.body.locals[i].ty.copy())
+                    i++
+                }
+                this.reserve_closure_adapter(code.copy(), symbol, f.*.ret_ty.copy(), types)
+            }
+        }
+
+        return this.call_named("__quip_closure_new", [this.ptrtoint(this.named(code)), api::LLVMConstNull(this.pointer)])
+    }
+
+    @this
+    make is_agg (ty: str) -> bool {
+        if this.is_fallible(ty.copy()) { return true }
+
+        make t = this.strip_bang(ty)
+
+        if this.is_variant(t.copy()) { return true }
+
+        if t == "str" || t == "String" { return true }
+
+        if this.ends_with(t !, "[]") { return true }
+
+        if this.ends_with(t !, "?") { return true }
+
+        make nm = this.nominal(t)
+
+        if nm.len() == 0 { return false }
+
+        return this.struct_index(nm) < this.structs.len()
+    }
+
+    /// returns the backend storage size for a rendered type.
+    @this
+    make size_of (ty: str) -> uint {
+        if this.is_fallible(ty.copy()) { return 8 + this.size_of(this.strip_bang(ty)) }
+
+        make t = this.strip_bang(ty)
+
+        if this.is_variant(t.copy()) {
+            make members = this.variant_members(t)
+            make payload: uint = 8
+            make i: uint = 0
+
+            while i < members.len() {
+                make size = this.size_of(members[i].copy())
+
+                if size > payload { payload = size }
+
+                i = i + 1
+            }
+
+            return 8 + payload
+        }
+
+        if t == "str" || t == "String" { return 24 }
+
+        if this.ends_with(t !, "[]") { return 24 }
+
+        if this.ends_with(t !, "?") { return 8 + this.size_of(this.optional_payload(t !)) }
+
+        make nm = this.nominal(t !)
+
+        if nm.len() == 0 { return 8 }
+
+        make sid = this.struct_index(nm)
+
+        if sid >= this.structs.len() { return 8 }
+
+        make total = 0
+        make fi = 0
+
+        while fi < this.structs[sid].*.fields.len() {
+            total = total + this.size_of((this.structs[sid].*.fields[fi].ty !).copy())
+            fi = fi + 1
+        }
+
+        if total < 8 { total = 8 }
+
+        return total
+    }
+
+    /// returns the offset of the named field.
+    @this
+    make field_offset (sid: uint, name: str) -> uint {
+        make off = 0
+        make i = 0
+
+        while i < this.structs[sid].*.fields.len() {
+            make f = this.structs[sid].*.fields[i].pin
+
+            if f.*.name == name { return off }
+
+            off = off + this.size_of((f.*.ty !).copy())
+            i = i + 1
+        }
+
+        return off
+    }
+
+    /// returns the type of the named field.
+    @this
+    make field_ty (sid: uint, name: str) -> str {
+        make i = 0
+
+        while i < this.structs[sid].*.fields.len() {
+            make f = this.structs[sid].*.fields[i].pin
+
+            if f.*.name == name { return (f.*.ty !).copy() }
+
+            i = i + 1
+        }
+
+        return ""
+    }
+
+    @this
+    make field_off_at (sid: uint, idx: uint) -> uint {
+        make off = 0
+        make i = 0
+
+        while i < this.structs[sid].*.fields.len() {
+            if i == idx { return off }
+
+            off = off + this.size_of((this.structs[sid].*.fields[i].ty !).copy())
+            i = i + 1
+        }
+
+        return off
+    }
+
+    @this
+    make field_ty_at (sid: uint, idx: uint) -> str {
+        make i = 0
+
+        while i < this.structs[sid].*.fields.len() {
+            if i == idx { return (this.structs[sid].*.fields[i].ty !).copy() }
+
+            i = i + 1
+        }
+
+        return ""
+    }
+
+    /// returns the type of the specified local.
+    @this
+    make local_ty (local: uint) -> str {
+        if local < this.local_tys.len() { return (this.local_tys[local] !).copy() }
+
+        return ""
+    }
+
+    // the type of a place: the root local's type with each projection applied
+    @this
+    make type_of_place (p: ref<mir::MirPlace>) -> str {
+        make ty = this.local_ty(p.*.local)
+        make i = 0
+
+        while i < p.*.projs.len() {
+            make pr = p.*.projs[i].pin
+
+            match pr.*.kind {
+                mir::MirProjKind.Field {
+                    make field_ty = this.string_field_type(ty !, pr.*.name !)
+
+                    if field_ty.len() > 0 {
+                        ty = field_ty
+                    } else {
+                        make base_ty = ty !
+
+                        if this.is_indirect(base_ty !) { base_ty = this.pointee(base_ty !) }
+
+                        make sid = this.struct_index(this.nominal(base_ty !))
+
+                        if sid < this.structs.len() {
+                            ty = this.field_ty(sid, pr.*.name !)
+                        } else {
+                            ty = ""
+                        }
+                    }
+                }
+
+                mir::MirProjKind.Deref { ty = this.pointee(ty) }
+
+                mir::MirProjKind.Index {
+                    make base_ty = ty !
+
+                    while this.is_indirect(base_ty !) {
+                        make lt = this.first_at(base_ty !, '<')
+                        make prefix = this.slice(base_ty !, 0, lt)
+
+                        if prefix == "ref" {
+                            base_ty = this.pointee(base_ty !)
+                        } else {
+                            break
+                        }
+                    }
+
+                    if base_ty == "str" || base_ty == "String" {
+                        ty = "char"
+                    } else {
+                        ty = this.pointee(base_ty !)
+                    }
+                }
+            }
+
+            i = i + 1
+        }
+
+        return ty
+    }
+
+    // address expression for a place, as an LLVM `ptr`
+    // Raw C pointers address packed scalar elements; Quip locals/arrays keep i64 slots.
+    @this
+    make c_element_size (ty: str) -> uint {
+        make width = native::size(this.strip_bang(ty.copy()))
+        if width < 8 { return width }
+
+        return this.size_of(ty)
+    }
+
+    /// checks whether a mir place refers to a raw scalar through projections.
+    @this
+    make raw_scalar_place (p: ref<mir::MirPlace>) -> bool {
+        if p.*.projs.len() == 0 { return false }
+
+        make before = mir::MirPlace {}
+
+        before.local = p.*.local
+        make i: uint = 0
+
+        while i + 1 < p.*.projs.len() {
+            make projection = mir::MirProj {}
+
+            projection.kind = p.*.projs[i].kind
+            projection.name = p.*.projs[i].name !
+            projection.index = p.*.projs[i].index
+            before.projs.push(projection)
+            i = i + 1
+        }
+
+        make last = p.*.projs[i].kind
+
+        if last != mir::MirProjKind.Index && last != mir::MirProjKind.Deref { return false }
+
+        make ty = this.type_of_place(before.pin)
+
+        if ty.len() > 4 { return this.slice(ty, 0, 4) == "ptr<" }
+
+        return false
+    }
+
+    /// computes the address of a mir place.
+    @this @unsafe
+    make place_addr (p: ref<mir::MirPlace>) -> ptr<any> {
+        make cur = this.local_slot(p.*.local)
+
+        if cur == this.null { return this.null }
+
+        make ty = this.local_ty(p.*.local)
+        make i = 0
+
+        while i < p.*.projs.len() {
+            make pr = p.*.projs[i].pin
+
+            match pr.*.kind {
+                mir::MirProjKind.Field {
+                    if this.is_indirect(ty !) {
+                        make v = this.load_i64(cur)
+                        cur = this.inttoptr(v)
+                        ty = this.pointee(ty !)
+                    }
+
+                    if ty == "str" || ty == "String" {
+                        make field = pr.*.name !
+
+                        if field == "data" {
+                            cur = this.gep(cur, 0)
+                            ty = "ptr<char>"
+                        } elif field == "length" || field == "len" {
+                            cur = this.gep(cur, 8)
+                            ty = "int"
+                        } elif field == "capacity" || field == "cap" {
+                            cur = this.gep(cur, 16)
+                            ty = "int"
+                        }
+                    } else {
+                        make sid = this.struct_index(this.nominal(ty !))
+
+                        if sid < this.structs.len() {
+                            cur = this.gep(cur, this.field_offset(sid, pr.*.name !))
+                            ty = this.field_ty(sid, pr.*.name !)
+                        }
+                    }
+                }
+
+                mir::MirProjKind.Deref {
+                    make v = this.load_i64(cur)
+                    cur = this.inttoptr(v)
+                    ty = this.pointee(ty)
+                }
+
+                mir::MirProjKind.Index {
+                    make base: ptr<any> = this.null
+                    make esz: uint = 1
+                    make raw_ptr = false
+
+                    while this.is_indirect(ty !) {
+                        make lt = this.first_at(ty !, '<')
+                        make prefix = this.slice(ty !, 0, lt)
+                        make v = this.load_i64(cur)
+
+                        if prefix == "ptr" {
+                            base = this.inttoptr(v)
+                            make elem_ty = this.pointee(ty !)
+                            esz = this.c_element_size(elem_ty !)
+                            raw_ptr = true
+                            break
+                        } else {
+                            cur = this.inttoptr(v)
+                            ty = this.pointee(ty !)
+                        }
+                    }
+
+                    if !raw_ptr {
+                        if ty == "str" || ty == "String" {
+                            make data = this.gep(cur, 0)
+                            make v = this.load_i64(data !)
+                            base = this.inttoptr(v)
+                        } else {
+                            make v = this.load_i64(cur)
+                            base = this.inttoptr(v)
+                            esz = this.size_of(this.pointee(ty !))
+                        }
+                    }
+
+                    make idx = this.load_i64(this.local_slot(pr.*.index))
+                    make scaled = this.gen_binop("*", idx, this.word_value(esz), false)
+                    cur = this.gep_dyn(base, scaled)
+                    ty = this.pointee(ty)
+                }
+            }
+
+            i = i + 1
+        }
+
+        return cur
+    }
+
+    // the address of an operand (for aggregate passing/copying)
+    /// computes the address of a mir operand.
+    @this @unsafe
+    make operand_addr (op: ref<mir::MirOperand>) -> ptr<any> {
+        if op.*.kind == mir::MirOperandKind.Copy || op.*.kind == mir::MirOperandKind.Move {
+            return this.place_addr(op.*.place.pin)
+        }
+
+        make v = this.gen_operand(op)
+
+        return this.inttoptr(v)
+    }
+
+    /// emits a pointer offset by a constant number of bytes.
+    @this @unsafe
+    make gep (base: ptr<any>, off: uint) -> ptr<any> {
+        return this.gep_dyn(base, this.word_value(off))
+    }
+
+    @this @unsafe
+    make gep_dyn (base: ptr<any>, off: ptr<any>) -> ptr<any> {
+        @unsafe make index: ptr<ptr<any>> = off.pin
+        return api::LLVMBuildGEP2(this.builder, this.byte, base, index, 1, this.unnamed.data)
+    }
+
+    /// emits an llvm conversion from an integer value to a pointer.
+    @this @unsafe
+    make inttoptr (value: ptr<any>) -> ptr<any> {
+        return api::LLVMBuildIntToPtr(this.builder, value, this.pointer, this.unnamed.data)
+    }
+
+    /// emits an llvm conversion from a pointer to an integer value.
+    @this @unsafe
+    make ptrtoint (value: ptr<any>) -> ptr<any> {
+        return api::LLVMBuildPtrToInt(this.builder, value, this.word, this.unnamed.data)
+    }
+
+    @this @unsafe
+    make load_i64 (addr: ptr<any>) -> ptr<any> {
+        return this.load(addr, this.word, 8)
+    }
+
+    @this @unsafe
+    make load_char (addr: ptr<any>) -> ptr<any> {
+        return this.conversion.widen(this.load(addr, this.byte, 1), this.byte, false)
+    }
+
+    @this @unsafe
+    make store_i64 (value: ptr<any>, addr: ptr<any>) {
+        this.store(value, addr, 8)
+    }
+
+    @this @unsafe
+    make store_char (value: ptr<any>, addr: ptr<any>) {
+        this.store(this.conversion.narrow(value, this.byte), addr, 1)
+    }
+
+    /// emits an llvm memmove for the supplied addresses and byte count.
+    @this @unsafe
+    make memcpy (dst: ptr<any>, src: ptr<any>, n: uint) {
+        api::LLVMBuildMemMove(this.builder, dst, 1, src, 1, this.word_value(n))
+    }
+
+    // index of the function whose emitted symbol is `sym`, or `this.fns.len()` when not found
+    @this
+    make lookup_func (sym: str) -> uint {
+        make i = 0
+
+        while i < this.fns.len() {
+            if this.emit_symbol(this.fns[i]) == sym { return i }
+
+            i = i + 1
+        }
+
+        return i
+    }
+
+    // module
+    @pub @this @unsafe
+    make emit (m: ref<mir::MirModule>) {
+
+        for function : m.*.funcs {
+            if function.export_name.len() > 0 { this.native_exports.push(function.export_name.copy()) }
+
+            if function.intrinsic_name.len() > 0 { this.native_exports.push(this.emit_symbol(function.pin)) }
+        }
+
+        this.declare("llvm.trap", this.void_type, [], false)
+        this.declare_native("__quip_dynamic_list_push", this.void_type, [this.pointer, this.pointer, this.word])
+        this.declare_native("__quip_set_global_allocator", this.void_type, [this.pointer, this.pointer, this.pointer])
+        this.declare_native("__quip_closure_new", this.word, [this.word, this.pointer])
+        this.declare_native("__quip_closure_code", this.word, [this.word])
+        this.declare_native("__quip_closure_env", this.word, [this.word])
+        this.declare_native("__quip_value_drop", this.void_type, [this.pointer, this.pointer])
+        this.declare_native("__quip_value_copy", this.void_type, [this.pointer, this.pointer, this.pointer])
+        this.declare_native("__quip_value_move", this.void_type, [this.pointer, this.pointer, this.pointer])
+        this.declare_native("__quip_str_concat", this.void_type, [this.pointer, this.pointer, this.pointer])
+        this.declare_native("__quip_str_add_char", this.void_type, [this.pointer, this.pointer, this.byte])
+        this.declare("memcmp", this.c_int, [this.pointer, this.pointer, this.word], false)
+        this.declared.push("memcmp")
+        this.declare("__quip_string_equal", this.word, [this.pointer, this.pointer], false)
+
+        make i: uint = 0
+
+        while i < m.*.funcs.len() {
+            make f = m.*.funcs[i].pin
+            make src_name = f.*.name !
+            make sym = this.emit_symbol(f)
+            this.local_src.push(src_name.copy())
+            this.local_sym.push(sym.copy())
+            this.fns.push(f)
+
+            // `@external` functions are provided at link time, so they are not "local" definitions
+            if !f.*.is_external {
+                this.names.push(sym.copy())
+            }
+
+            i = i + 1
+        }
+
+        i = 0
+
+        while i < m.*.structs.len() {
+            this.structs.push(m.*.structs[i].pin)
+            i = i + 1
+        }
+
+        this.builder_layouts = scalar::layouts(m)
+        make layout_index: uint = 0
+        while layout_index < this.builder_layouts.len() {
+            if this.builder_layouts[layout_index].managed {
+                make name = this.builder_layouts[layout_index].name.copy()
+                this.builder_layouts[layout_index].descriptor = this.schema(name)
+            }
+            layout_index++
+        }
+
+        for global : m.*.globals {
+            if global.initializer >= m.*.funcs.len() { continue }
+
+            make getter = mangle::variable_symbol(this.module_name.copy(), "__quip_global_" + global.name.copy())
+            this.declared.push(getter.copy())
+            this.declare(getter.copy(), this.pointer, [], false)
+            make plan = globals::Plan { getter = getter }
+            if global.is_default_allocator { plan.priority = 1001 }
+
+            if !global.is_external {
+                make init = m.*.funcs[global.initializer].pin
+                make owner_type = init.*.ret_ty.copy()
+                plan.initializer = this.emit_symbol(init)
+                plan.storage_size = this.size_of(owner_type.copy())
+                plan.allocate = owner_type.copy() + "__alloc"
+                plan.deallocate = owner_type.copy() + "__free"
+
+                for attached : m.*.attached_symbols {
+                    if attached.owner == owner_type {
+                        if attached.name == "alloc" { plan.allocate = attached.symbol.copy() }
+                        if attached.name == "free" { plan.deallocate = attached.symbol.copy() }
+                    }
+                }
+
+                if !this.is_declared(plan.allocate.copy()) && !this.is_local(plan.allocate.copy()) {
+                    this.declared.push(plan.allocate.copy())
+                    this.declare(plan.allocate.copy(), this.void_type, [this.pointer, this.word, this.word], false)
+                }
+
+                if !this.is_declared(plan.deallocate.copy()) && !this.is_local(plan.deallocate.copy()) {
+                    this.declared.push(plan.deallocate.copy())
+                    this.declare(plan.deallocate.copy(), this.word, [this.word, this.word], false)
+                }
+            }
+
+            this.global_plans.push(plan)
+        }
+
+        // declare every `@external` function the user wrote out explicitly
+        i = 0
+
+        while i < m.*.funcs.len() {
+            make f = m.*.funcs[i].pin
+
+            if f.*.is_external {
+                make arg_tys: str[] = []
+                make arg_aggs: bool[] = []
+                make ai: uint = 1
+
+                while ai <= f.*.body.param_count {
+                    if ai < f.*.body.locals.len() {
+                        make arg_ty = (f.*.body.locals[ai].ty !).copy()
+                        make arg_agg = this.is_agg(arg_ty.copy())
+                        arg_tys.push(arg_ty)
+                        arg_aggs.push(arg_agg)
+                    }
+
+                    ai = ai + 1
+                }
+
+                make ret_ty = (f.*.ret_ty !).copy()
+                make ret_agg = this.is_agg(ret_ty.copy())
+                this.declare_external(this.emit_symbol(f), arg_tys, arg_aggs, ret_ty, ret_agg, true, f.*.is_variadic)
+            }
+
+            i = i + 1
+        }
+
+        this.declare_native("__quip_str_copy", this.void_type, [this.pointer, this.pointer])
+        this.declare_native("__quip_str_assign", this.void_type, [this.pointer, this.pointer, this.pointer])
+        this.declare_native("__quip_str_drop", this.void_type, [this.pointer, this.pointer])
+        this.declare_native("__quip_str_make_owned", this.void_type, [this.pointer, this.pointer])
+        this.declare_externals(m)
+        this.plan_native_adapters(m)
+        this.plan_entry(m)
+
+        for function : m.*.funcs {
+            if !function.is_external { this.declare_function(function.pin) }
+        }
+
+        i = 0
+        while i < m.*.funcs.len() {
+            make f = m.*.funcs[i].pin
+            if !f.*.is_external && !this.declare_scalar_body(f, i) { this.gen_func(f, i) }
+            i++
+        }
+    }
+
+    @this @unsafe
+    make declare_function (f: ref<mir::MirFunc>) {
+        make result = this.word
+        make types: ptr<any>[] = []
+        if this.is_agg(f.*.ret_ty.copy()) {
+            result = this.void_type
+            types.push(this.pointer)
+        }
+        if f.*.is_lambda { types.push(this.word) }
+
+        make i: uint = 1
+        while i <= f.*.body.param_count {
+            make ty = this.word
+            if this.is_agg(f.*.body.locals[i].ty.copy()) { ty = this.pointer }
+            types.push(ty)
+            i++
+        }
+        this.declare(this.emit_symbol(f), result, types, false)
+    }
+
+    @this @unsafe
+    make declare_scalar_body (f: ref<mir::MirFunc>, index: uint) -> bool {
+        if !scalar::supports(f, this.builder_layouts.pin) { return false }
+
+        make local_index: uint = 0
+        for local : f.*.body.locals {
+            make index = layouts::find(this.builder_layouts.pin, local.ty.copy())
+            make string_result = local_index == 0 && (local.ty == "!str" || local.ty == "!String")
+            if index < this.builder_layouts.len() && this.builder_layouts[index].managed
+                && !string_result && !this.has_closure(local.ty.copy()) {
+                return false
+            }
+            local_index++
+        }
+
+        make calls: str[] = []
+        for term : f.*.body.terms {
+            if term.kind != mir::MirTermKind.Call {
+                calls.push("")
+                continue
+            }
+
+            if term.func.name == "syscall" || this.is_builtin(term.func.name.copy()) { return false }
+            if term.c_abi {
+                calls.push(term.func.name.copy())
+                continue
+            }
+            make symbol = this.symbol_of(term.func.name.copy())
+            make callee = this.lookup_func(symbol.copy())
+            if callee >= this.fns.len() { return false }
+            if !scalar::supports_call(term.pin, f.*.body.pin, this.fns[callee], this.builder_layouts.pin) { return false }
+            make target = this.fns[callee]
+            make result_type = target.*.ret_ty.copy()
+            make result_layout = layouts::find(this.builder_layouts.pin, result_type.copy())
+            if result_layout < this.builder_layouts.len() && this.builder_layouts[result_layout].managed
+                && !this.has_closure(result_type) { return false }
+            make parameter: uint = 1
+            while parameter <= target.*.body.param_count {
+                make ty = target.*.body.locals[parameter].ty.copy()
+                make index = layouts::find(this.builder_layouts.pin, ty.copy())
+                if index < this.builder_layouts.len() && this.builder_layouts[index].managed
+                    && !this.has_closure(ty) { return false }
+                parameter++
+            }
+            calls.push(symbol)
+        }
+
+        make symbol = this.emit_symbol(f)
+        this.scalar_functions.push(ScalarFunction {
+            symbol = symbol, index = index, calls = calls,
+            slots = slots::plan(f.*.body.locals.len(), this.mem_report, index),
+        })
+        return true
+    }
+
+    /// emits declarations needed for external functions used by the module.
+    @this @unsafe
+    make declare_externals (m: ref<mir::MirModule>) {
+        make si = 0
+
+        while si < this.structs.len() {
+            make fi = 0
+
+            while fi < this.structs[si].*.fields.len() {
+                make field = this.structs[si].*.fields[fi].pin
+
+                if field.*.default_init.len() > 0 {
+                    make sym = this.sanitize(field.*.default_init.copy())
+
+                    if this.lookup_func(sym.copy()) >= this.fns.len() {
+                        make arg_tys: str[] = []
+                        make arg_aggs: bool[] = []
+                        this.declare_external(sym, arg_tys, arg_aggs, field.*.ty.copy(), this.is_agg(field.*.ty.copy()), false, false)
+                    }
+                }
+
+                fi = fi + 1
+            }
+
+            si = si + 1
+        }
+
+        make i: uint = 0
+
+        while i < m.*.funcs.len() {
+            make f = m.*.funcs[i].pin
+            make ti: uint = 0
+
+            while ti < f.*.body.terms.len() {
+                make term = f.*.body.terms[ti].pin
+
+                if term.*.kind == mir::MirTermKind.Call {
+                    if term.*.func.kind == mir::MirOperandKind.Path && this.is_builtin(term.*.func.name !) {
+                        this.declare_builtins()
+                    } elif term.*.func.kind == mir::MirOperandKind.Path {
+                        make nm = term.*.func.name !
+                        make ir = this.symbol_of(nm !)
+
+                        if term.*.c_abi { ir = nm }
+
+                        if !this.is_local(ir !) {
+                            make tys: str[] = []
+                            make aggs: bool[] = []
+                            make count = term.*.arg_tys.len()
+
+                            if term.*.variadic_fixed >= 0 { @unsafe count = term.*.variadic_fixed }
+
+                            make ai: uint = 0
+
+                            while ai < count {
+                                tys.push(term.*.arg_tys[ai] !)
+                                aggs.push(term.*.arg_aggs[ai])
+                                ai = ai + 1
+                            }
+
+                            this.declare_external(ir, tys, aggs, term.*.ret_ty, term.*.ret_agg, term.*.c_abi, term.*.variadic_fixed >= 0)
+                        }
+                    }
+                }
+
+                ti = ti + 1
+            }
+
+            i = i + 1
+        }
+    }
+
+    @this
+    make is_declared (name: str) -> bool {
+        make i: uint = 0
+
+        while i < this.declared.len() {
+            if this.declared[i] == name {
+                return true
+            }
+
+            i = i + 1
+        }
+
+        return false
+    }
+
+    // Quip scalars live in i64 slots; C calls use the platform's scalar ABI.
+    @this @unsafe
+    make c_scalar_type (ty: str) -> ptr<any> {
+        make source = this.strip_bang(ty)
+        if this.is_indirect(source.copy()) { return this.pointer }
+        return native::type_of(this.context, source)
+    }
+
+    /// emits a function declaration unless it is already declared or exported locally.
+    @this @unsafe
+    make declare_external (name: str, arg_tys: str[], arg_aggs: bool[], ret_ty: str, ret_agg: bool, c_abi: bool, variadic: bool) {
+        if this.is_declared(name.copy()) || this.has_native_export(name.copy()) { return }
+
+        this.declared.push(name.copy())
+        if name == "syscall" {
+            make ty = this.word
+            if this.platform == "macos" { ty = this.c_int }
+            this.declare(name, ty, [ty], true)
+            return
+        }
+
+        make params: ptr<any>[] = []
+        make result = this.word
+        if ret_agg {
+            params.push(this.pointer)
+            result = this.void_type
+        } elif c_abi { result = this.c_scalar_type(ret_ty) }
+
+        make i: uint = 0
+        while i < arg_tys.len() {
+            make aggregate = this.is_agg(arg_tys[i].copy())
+            if i < arg_aggs.len() { aggregate = arg_aggs[i] }
+
+            if aggregate { params.push(this.pointer) }
+            elif c_abi { params.push(this.c_scalar_type(arg_tys[i].copy())) }
+            else { params.push(this.word) }
+            i++
+        }
+        this.declare(name, result, params, variadic)
+    }
+
+    // functions
+    /// Builds the body of a MIR function.
+    @this @unsafe
+    make gen_func (f: ref<mir::MirFunc>, report_index: uint) {
+        while this.capture_indices.len() > 0 { make _ = this.capture_indices.pop() }
+
+        for capture : f.*.body.capture_locals { this.capture_indices.push(capture) }
+
+        make name = this.emit_symbol(f)
+        make sret = this.is_agg((f.*.ret_ty !).copy())
+
+        while this.move_temps.len() > 0 { make _ = this.move_temps.pop() }
+
+        make ti = 0
+
+        while ti < f.*.body.locals.len() {
+            this.move_temps.push(f.*.body.locals[ti].is_temp)
+            ti = ti + 1
+        }
+
+        // snapshot local types for this function (index 0 is the aggregate/scalar return place)
+        while this.local_tys.len() > 0 {
+            make _ = this.local_tys.pop()
+        }
+
+        while this.local_slots.len() > 0 {
+            make _ = this.local_slots.pop()
+        }
+
+        if f.*.body.locals.len() > 0 {
+            this.local_tys.push((f.*.ret_ty !).copy())
+        }
+
+        make li0 = 1
+
+        while li0 < f.*.body.locals.len() {
+            this.local_tys.push((f.*.body.locals[li0].ty !).copy())
+            li0 = li0 + 1
+        }
+
+        this.cur_ret_ty = (f.*.ret_ty !).copy()
+        this.cur_sret = sret
+
+        make function = this.named(name)
+        this.function = function
+        api::LLVMPositionBuilderAtEnd(this.builder, this.block(function, "entry"))
+
+        this.blocks = []
+        make block_index: uint = 0
+        while block_index < f.*.body.terms.len() {
+            this.blocks.push(this.block(function, "bb" + block_index.to_str()))
+            block_index++
+        }
+
+        this.owners = []
+        this.captures = []
+        make li: uint = 0
+        while li < this.local_tys.len() {
+            this.owners.push(this.null)
+            this.captures.push(this.null)
+            li++
+        }
+
+        make parameter: u32 = 0
+        if sret {
+            this.return_buffer = api::LLVMGetParam(function, parameter)
+            parameter++
+        }
+        if f.*.is_lambda {
+            make environment = this.inttoptr(api::LLVMGetParam(function, parameter))
+            parameter++
+            make layout = this.capture_layout(f)
+            for field : layout.fields {
+                this.owners[field.local] = this.gep(environment, field.flag_offset)
+                this.captures[field.local] = this.gep(environment, field.value_offset)
+            }
+        }
+
+        make plan = slots::plan(f.*.body.locals.len(), this.mem_report, report_index)
+        make next_unplanned_slot = plan.next_slot
+        this.local_slots = plan.locals
+
+        li = 0
+        // Managed storage remains reserved until its emitted drop, beyond
+        // the planner's last read. Capture slots belong to the environment.
+        while this.local_cleanup.len() > 0 { make _ = this.local_cleanup.pop() }
+
+        while li < this.local_tys.len() {
+            make ty = this.local_ty(li)
+            make cleanup = drops::Local { in_environment = this.is_capture(li) }
+
+            if ty == "str" || ty == "String" { cleanup.kind = drops::Kind.String }
+            elif this.has_closure(ty.copy()) { cleanup.kind = drops::Kind.Descriptor }
+
+            if cleanup.kind != drops::Kind.None {
+                this.local_slots[li] = next_unplanned_slot
+                next_unplanned_slot++
+            }
+
+            this.local_cleanup.push(cleanup)
+            li++
+        }
+
+        make max_slot: uint = 0
+        li = 0
+
+        while li < this.local_slots.len() {
+            if this.local_slots[li] > max_slot { max_slot = this.local_slots[li] }
+
+            li = li + 1
+        }
+
+        make slot_sizes: uint[] = []
+        li = 0
+
+        while li <= max_slot {
+            slot_sizes.push(8)
+            li = li + 1
+        }
+
+        li = 0
+
+        while li < f.*.body.locals.len() {
+            make sid = this.local_slots[li]
+            make sz = this.size_of(this.local_ty(li))
+
+            if sz > slot_sizes[sid] { slot_sizes[sid] = sz }
+
+            li = li + 1
+        }
+
+        li = 0
+        // Imported call metadata may retain an inferred result. The resolved
+        // callee's hidden return buffer still needs its full native size.
+        make call_idx: uint = 0
+
+        while call_idx < f.*.body.terms.len() {
+            make call = f.*.body.terms[call_idx].pin
+
+            if call.*.kind == mir::MirTermKind.Call && call.*.dest.projs.len() == 0 {
+                make callee_idx: uint = 0
+
+                while callee_idx < this.fns.len() {
+                    if this.fns[callee_idx].*.name == call.*.name {
+                        make sid = this.local_slots[call.*.dest.local]
+                        make required = this.size_of(this.fns[callee_idx].*.ret_ty.copy())
+
+                        if required > slot_sizes[sid] { slot_sizes[sid] = required }
+                    }
+
+                    callee_idx = callee_idx + 1
+                }
+            }
+
+            call_idx = call_idx + 1
+        }
+
+        this.storage = []
+        for size : slot_sizes { this.storage.push(this.allocate(size)) }
+
+        this.string_result = this.allocate(24)
+        // Reuse conversion storage in raw byte-copy loops.
+        this.raw_store = this.allocate(8)
+        li = 0
+
+        while li < this.local_cleanup.len() {
+            make cleanup = this.local_cleanup[li].pin
+            if !cleanup.*.in_environment && cleanup.*.kind != drops::Kind.None {
+                if cleanup.*.kind == drops::Kind.String {
+                    this.owners[li] = this.allocate(8)
+                    this.store_i64(this.word_value(0), this.owners[li])
+                }
+
+                this.zero_value(this.local_slot(li), this.local_ty(li))
+            }
+
+            li++
+        }
+
+        make pi: uint = 1
+
+        while pi <= f.*.body.param_count {
+            if pi < this.local_tys.len() {
+                make slot = this.local_slot(pi)
+                make argument = api::LLVMGetParam(function, parameter)
+
+                if this.is_agg(this.local_ty(pi)) {
+                    this.memcpy(slot, argument, this.size_of(this.local_ty(pi)))
+                } else {
+                    this.store_i64(argument, slot)
+                }
+            }
+
+            parameter++
+            pi++
+        }
+
+        if this.is_fallible(this.cur_ret_ty.copy()) {
+            this.zero_value(this.local_slot(0), this.cur_ret_ty.copy())
+        }
+
+        this.go_to(0)
+
+        make b: uint = 0
+
+        while b < f.*.body.terms.len() {
+            api::LLVMPositionBuilderAtEnd(this.builder, this.blocks[b])
+
+            make si: uint = 0
+
+            while si < f.*.body.stmts.len() {
+                make stmt = f.*.body.stmts[si].pin
+
+                if stmt.*.block == b {
+                    this.gen_stmt(stmt)
+                }
+
+                si = si + 1
+            }
+
+            this.gen_term(f.*.body.terms[b].pin)
+            b = b + 1
+        }
+    }
+
+    @this
+    make plan_entry (m: ref<mir::MirModule>) {
+        for function : m.*.funcs {
+            if function.name != this.entry { continue }
+
+            make pc = function.body.param_count
+            make plan = entry::Plan { present = true, parameter_count = pc }
+            plan.valid = !function.is_external && !function.is_lambda && pc <= 2 && function.body.locals.len() > pc
+            if pc >= 1 && function.body.locals.len() > 1 && this.is_agg(function.body.locals[1].ty.copy()) {
+                plan.valid = false
+            }
+            if pc >= 2 && function.body.locals.len() > 2 {
+                make ty = function.body.locals[2].ty.copy()
+                plan.argv_array = this.ends_with(ty.copy(), "[]")
+                if !plan.argv_array && this.is_agg(ty) { plan.valid = false }
+            }
+
+            make result = function.ret_ty.copy()
+            if this.is_fallible(result.copy()) {
+                plan.result_size = this.size_of(result.copy())
+                plan.result_void = this.strip_bang(result) == "void"
+            } elif this.is_agg(result) {
+                plan.valid = false
+            }
+
+            this.entry_plan = plan
+        }
+    }
+
+    // statements
+    /// emits llvm ir for a mir statement.
+    @this @unsafe
+    make gen_stmt (stmt: ref<mir::MirStmt>) {
+        if stmt.*.kind == mir::MirStmtKind.Unsupported {
+            this.trap()
+            return
+        }
+
+        if stmt.*.kind == mir::MirStmtKind.StorageDead {
+            if stmt.*.local < this.local_cleanup.len() { this.drop_local(stmt.*.local, false) }
+            return
+        }
+
+        if stmt.*.kind == mir::MirStmtKind.StorageLive {
+            if stmt.*.local < this.local_tys.len() {
+                make ty = this.local_ty(stmt.*.local)
+                make addr = this.local_slot(stmt.*.local)
+
+                if this.ends_with(ty.copy(), "[]") {
+                    this.store_i64(this.word_value(0), addr)
+                    this.store_i64(this.word_value(0), this.gep(addr, 8))
+                    this.store_i64(this.word_value(0), this.gep(addr, 16))
+                } elif this.is_optional(ty.copy()) {
+                    this.zero_value(addr, ty.copy())
+                }
+            }
+
+            return
+        }
+
+        if stmt.*.kind == mir::MirStmtKind.Assign {
+            make dest_ty = this.type_of_place(stmt.*.place.pin)
+            make dest = this.place_addr(stmt.*.place.pin)
+
+            if dest == this.null {
+                this.trap()
+                return
+            }
+
+            if this.raw_scalar_place(stmt.*.place.pin) && this.c_element_size(dest_ty.copy()) < 8 {
+                make slot = this.raw_store
+                this.gen_assignment(stmt.*.rvalue.pin, slot, dest_ty.copy())
+                make kind = this.c_scalar_type(dest_ty.copy())
+                this.store(this.conversion.narrow(this.load_i64(slot), kind), dest, 1)
+            } else {
+                this.gen_assignment(stmt.*.rvalue.pin, dest, dest_ty)
+            }
+        }
+    }
+
+    /// finds the ownership flag associated with a string local’s address.
+    @this @unsafe
+    make string_owner (addr: ptr<any>) -> ptr<any> {
+        make i: uint = 0
+        while i < this.local_tys.len() {
+            if (this.local_ty(i) == "str" || this.local_ty(i) == "String") && this.local_slot(i) == addr {
+                return this.owners[i]
+            }
+            i++
+        }
+        return this.null
+    }
+
+    /// drops the string.
+    @this @unsafe
+    make drop_string (addr: ptr<any>) {
+        make owner = this.string_owner(addr)
+
+        if owner != this.null {
+            this.call_named("__quip_str_drop", [addr, owner])
+        }
+    }
+
+    @this @unsafe
+    make drop_managed (addr: ptr<any>, descriptor: ptr<any>) {
+        this.call_named("__quip_value_drop", [addr, descriptor])
+    }
+
+    @this @unsafe
+    make drop_local (local: uint, at_return: bool) {
+        make cleanup = this.local_cleanup[local].pin
+        if at_return && cleanup.*.in_environment { return }
+
+        if cleanup.*.kind == drops::Kind.Descriptor && !cleanup.*.in_environment {
+            this.drop_managed(this.local_slot(local), this.schema_address(this.local_ty(local)))
+        } elif cleanup.*.kind == drops::Kind.String {
+            make slot = this.local_slot(local)
+            if !at_return || slot != this.local_slot(0) { this.drop_string(slot) }
+        }
+    }
+
+    /// assigns the string operand.
+    @this @unsafe
+    make assign_string_operand (dest: ptr<any>, op: ref<mir::MirOperand>) {
+        make src = this.operand_addr(op)
+        make owner = api::LLVMConstNull(this.pointer)
+
+        // A compiler temporary has one consumer. Named places may still be
+        // borrowed elsewhere; copy those until MIR provides a proven last-use move.
+        if op.*.kind == mir::MirOperandKind.Move && op.*.place.projs.len() == 0
+            && op.*.place.local < this.move_temps.len() && this.move_temps[op.*.place.local] {
+            make flag = this.string_owner(src)
+            if flag != this.null { owner = flag }
+        }
+
+        this.call_named("__quip_str_assign", [dest, src, owner])
+    }
+
+    @this @unsafe
+    make gen_assignment (source: ref<mir::MirRvalue>, dest: ptr<any>, dest_ty: str) {
+        if this.has_closure(dest_ty.copy()) {
+            if source.*.kind == mir::MirRvalueKind.Use {
+                make actual = this.operand_type(source.*.a.pin)
+
+                if (this.is_optional(dest_ty.copy()) && !this.is_optional(actual.copy()))
+                    || (this.is_fallible(dest_ty.copy()) && !this.is_fallible(actual.copy()))
+                    || (this.is_variant(dest_ty.copy()) && actual != dest_ty) {
+                    this.drop_managed(dest, this.schema_address(dest_ty.copy()))
+                    this.gen_assignment_value(source, dest, dest_ty)
+                    return
+                }
+
+                if (source.*.a.kind == mir::MirOperandKind.Copy || source.*.a.kind == mir::MirOperandKind.Move) && this.operand_addr(source.*.a.pin) == dest { return }
+
+                make prepared = this.prepare_value(source.*.a.pin, dest_ty.copy())
+                this.drop_managed(dest, this.schema_address(dest_ty.copy()))
+                this.memcpy(dest, prepared, this.size_of(dest_ty))
+            } else {
+                this.drop_managed(dest, this.schema_address(dest_ty.copy()))
+
+                if this.is_function(dest_ty.copy()) && source.*.kind == mir::MirRvalueKind.Aggregate {
+                    this.store_i64(this.closure_value(source), dest)
+                } else { this.gen_assignment_value(source, dest, dest_ty) }
+            }
+
+            return
+        }
+
+        if dest_ty == "str" || dest_ty == "String" {
+            if source.*.kind == mir::MirRvalueKind.Binary && source.*.op == "+"
+                && this.operand_addr(source.*.a.pin) == dest {
+                make owner = this.string_owner(dest)
+
+                if owner != this.null {
+                    this.call_named("__quip_str_make_owned", [dest, owner])
+                    this.gen_assignment_value(source, dest, dest_ty)
+                    return
+                }
+            }
+
+            // Evaluate before releasing the destination: `s = s + suffix` and
+            // self-assignment may read the old buffer. The scratch lives in entry.
+            if source.*.kind == mir::MirRvalueKind.Use {
+                this.assign_string_operand(this.string_result, source.*.a.pin)
+            } else {
+                this.gen_assignment_value(source, this.string_result, dest_ty.copy())
+            }
+
+            this.drop_string(dest)
+            this.memcpy(dest, this.string_result, 24)
+            make owner = this.string_owner(dest)
+
+            if owner != this.null { this.store_i64(this.word_value(1), owner) }
+
+            return
+        }
+
+        this.gen_assignment_value(source, dest, dest_ty)
+    }
+
+    /// emits the value of a mir assignment into its destination.
+    @this @unsafe
+    make gen_assignment_value (source: ref<mir::MirRvalue>, dest: ptr<any>, dest_ty: str) {
+        if source.*.kind == mir::MirRvalueKind.Binary && source.*.op == "__zero" {
+            this.zero_value(dest, dest_ty)
+            return
+        }
+
+        if source.*.kind == mir::MirRvalueKind.OptionalPayload {
+            make src = this.operand_addr(source.*.a.pin)
+
+            if src == this.null {
+                this.trap()
+                return
+            }
+
+            make payload = this.gep(src, 8)
+
+            if this.has_closure(dest_ty.copy()) {
+                this.call_named("__quip_value_copy", [dest, payload, this.schema_address(dest_ty.copy())])
+            } elif dest_ty == "str" || dest_ty == "String" {
+                this.call_named("__quip_str_copy", [dest, payload])
+            } elif this.is_agg(dest_ty.copy()) {
+                this.memcpy(dest, payload, this.size_of(dest_ty.copy()))
+            } elif dest_ty == "char" {
+                make value = this.load_char(payload)
+                this.store_char(value, dest)
+            } else {
+                make value = this.load_i64(payload)
+                this.store_i64(value, dest)
+            }
+
+            return
+        }
+
+        if this.is_fallible(dest_ty.copy()) {
+            this.gen_fallible_assignment(source, dest, dest_ty)
+            return
+        }
+
+        if (dest_ty == "str" || dest_ty == "String")
+            && source.*.kind == mir::MirRvalueKind.Binary
+            && source.*.op == "+" {
+            make left_ty = this.operand_type(source.*.a.pin)
+            make right_ty = this.operand_type(source.*.b.pin)
+            make left = this.operand_addr(source.*.a.pin)
+
+            if left_ty == "str" || left_ty == "String" {
+                if right_ty == "char" {
+                    make value = this.gen_operand(source.*.b.pin)
+                    make byte = this.conversion.narrow(value, this.byte)
+                    this.call_named("__quip_str_add_char", [dest, left, byte])
+                    return
+                }
+
+                if right_ty == "str" || right_ty == "String" {
+                    make right = this.operand_addr(source.*.b.pin)
+                    make tag: uint = 0
+                    if right_ty == "String" { tag = 1 }
+                    // The runtime concat export receives the native variant layout.
+                    make types: ptr<any>[2] = [this.c_int, this.pointer]
+                    @unsafe make fields: ptr<ptr<any>> = types[0].pin
+                    make ty = api::LLVMStructTypeInContext(this.context, fields, 2, 0)
+                    make variant = api::LLVMBuildAlloca(this.builder, ty, this.unnamed.data)
+                    api::LLVMSetAlignment(variant, 8)
+                    make tag_ptr = api::LLVMBuildStructGEP2(this.builder, ty, variant, 0, this.unnamed.data)
+                    make payload_ptr = api::LLVMBuildStructGEP2(this.builder, ty, variant, 1, this.unnamed.data)
+                    this.store(api::LLVMConstInt(this.c_int, tag, 0), tag_ptr, 4)
+                    this.store(right, payload_ptr, 8)
+                    this.call_named("__quip_str_concat", [dest, left, variant])
+                    return
+                }
+            }
+        }
+
+        make dest_is_agg = this.is_agg(dest_ty !)
+
+        if dest_is_agg {
+            if this.is_variant(dest_ty.copy()) {
+                this.variant_assign(dest, dest_ty.copy(), source.*.a.pin)
+            } elif this.is_optional(dest_ty.copy()) {
+                this.gen_optional_assignment(source, dest, dest_ty.copy())
+            } elif source.*.kind == mir::MirRvalueKind.Aggregate
+                && this.ends_with(dest_ty !, "[]") {
+                this.gen_array(source, dest, dest_ty.copy())
+            } elif source.*.kind == mir::MirRvalueKind.Aggregate {
+                this.gen_aggregate(source, dest, dest_ty !)
+            } else {
+                make src = this.operand_addr(source.*.a.pin)
+
+                if src != this.null {
+                    this.memcpy(dest, src, this.size_of(dest_ty !))
+                } else {
+                    this.trap()
+                }
+            }
+        } else {
+            if source.*.kind == mir::MirRvalueKind.Use && source.*.a.kind == mir::MirOperandKind.Const
+                && source.*.a.lit.kind == lexer::TokenKind.LiteralNum && this.is_float_ty(dest_ty.copy()) {
+                source.*.a.ty = dest_ty.copy()
+            }
+
+            make rv = this.gen_rvalue(source)
+
+            if rv != this.null {
+                if dest_ty == "char" {
+                    this.store_char(rv, dest)
+                } else {
+                    this.store_i64(rv, dest)
+                }
+            }
+        }
+    }
+
+    @this
+    make operand_type (op: ref<mir::MirOperand>) -> str {
+        if op.*.kind == mir::MirOperandKind.Copy || op.*.kind == mir::MirOperandKind.Move {
+            return this.type_of_place(op.*.place.pin)
+        }
+
+        if op.*.kind == mir::MirOperandKind.Const {
+            if op.*.ty.len() > 0 { return op.*.ty.copy() }
+
+            if op.*.lit.kind == lexer::TokenKind.LiteralString { return "str" }
+
+            if op.*.lit.kind == lexer::TokenKind.LiteralChar { return "char" }
+
+            if op.*.lit.kind == lexer::TokenKind.LiteralNum { return "int" }
+
+            if op.*.lit.kind == lexer::TokenKind.KeyTrue || op.*.lit.kind == lexer::TokenKind.KeyFalse {
+                return "bool"
+            }
+        }
+
+        return ""
+    }
+
+    // write an aggregate rvalue in place: zero the scalar fields, then store the provided ones
+    @this @unsafe
+    make gen_aggregate (rv: ref<mir::MirRvalue>, dest: ptr<any>, dest_ty: str) {
+        make sid = this.struct_index(this.nominal(dest_ty !))
+
+        if sid >= this.structs.len() {
+            this.trap()
+            return
+        }
+
+        make zi = 0
+
+        while zi < this.structs[sid].*.fields.len() {
+            make zfty = (this.structs[sid].*.fields[zi].ty !).copy()
+            make field_addr = this.gep(dest, this.field_off_at(sid, zi))
+            this.zero_value(field_addr, zfty.copy())
+            make field = this.structs[sid].*.fields[zi].pin
+            make supplied = false
+            make oi = 0
+
+            while oi < rv.*.ops.len() {
+                if oi < rv.*.field_names.len() && rv.*.field_names[oi].len() > 0 {
+                    if rv.*.field_names[oi] == field.*.name { supplied = true }
+                } elif oi == zi {
+                    supplied = true
+                }
+
+                oi = oi + 1
+            }
+
+            if !supplied && field.*.default_init.len() > 0 {
+                make sym = this.sanitize(field.*.default_init.copy())
+                make agg = this.is_agg(zfty.copy())
+
+                if agg {
+                    this.call_named(sym, [field_addr])
+                } else {
+                    make value = this.call_named(sym, [])
+                    this.store_i64(value, field_addr)
+                }
+            } elif !supplied && field.*.has_default {
+                make value = mir::MirOperand {}
+
+                value.kind = mir::MirOperandKind.Const
+                value.ty = zfty.copy()
+                value.lit.kind = field.*.default_lit.kind
+                value.lit.lexeme = field.*.default_lit.lexeme.copy()
+                value.lit.span = field.*.default_lit.span
+
+                if this.is_fallible(zfty.copy()) {
+                    value.ty = this.strip_bang(zfty.copy())
+
+                    if value.lit.kind == lexer::TokenKind.KeyError { value.ty = "error" }
+
+                    make default_value = mir::MirRvalue {}
+
+                    default_value.kind = mir::MirRvalueKind.Use
+                    default_value.a = value
+                    this.gen_fallible_assignment(default_value.pin, field_addr, zfty.copy())
+                } elif this.is_variant(zfty.copy()) {
+                    // A literal default is a member value, not an aggregate address.
+                    value.ty = ""
+
+                    if value.lit.kind == lexer::TokenKind.LiteralNum {
+                        make ni: uint = 0
+
+                        while ni < value.lit.lexeme.len() {
+                            if value.lit.lexeme[ni] == '.' { value.ty = "float" }
+
+                            ni = ni + 1
+                        }
+                    }
+
+                    this.variant_assign(field_addr, zfty.copy(), value.pin)
+                } elif this.is_agg(zfty.copy()) {
+                    if field.*.default_lit.kind != lexer::TokenKind.KeyNone {
+                        this.memcpy(field_addr, this.operand_addr(value.pin), this.size_of(zfty.copy()))
+                    }
+                } elif zfty == "char" {
+                    this.store_char(this.gen_operand(value.pin), field_addr)
+                } else {
+                    this.store_i64(this.gen_operand(value.pin), field_addr)
+                }
+            }
+
+            zi = zi + 1
+        }
+
+        make i = 0
+
+        while i < rv.*.ops.len() {
+            make fname: str = ""
+
+            if i < rv.*.field_names.len() { fname = rv.*.field_names[i] ! }
+
+            make off = 0
+            make fty: str = ""
+
+            if fname.len() > 0 {
+                off = this.field_offset(sid, fname !)
+                fty = this.field_ty(sid, fname !)
+            } else {
+                off = this.field_off_at(sid, i)
+                fty = this.field_ty_at(sid, i)
+            }
+
+            make fp = this.gep(dest, off)
+            make f_is_agg = this.is_agg(fty !)
+
+            if this.has_closure(fty.copy()) {
+                make prepared = this.prepare_value(rv.*.ops[i].pin, fty.copy())
+                this.memcpy(fp, prepared, this.size_of(fty.copy()))
+            } elif this.is_fallible(fty.copy()) {
+                make src = this.fallible_arg_addr(rv.*.ops[i].pin, fty.copy())
+                this.memcpy(fp, src, this.size_of(fty.copy()))
+            } elif this.is_optional(fty.copy()) {
+                make src = this.optional_arg_addr(rv.*.ops[i].pin, fty.copy())
+                this.memcpy(fp, src, this.size_of(fty.copy()))
+            } elif this.is_variant(fty.copy()) {
+                this.variant_assign(fp, fty.copy(), rv.*.ops[i].pin)
+            } elif fty == "str" || fty == "String" {
+                this.assign_string_operand(fp, rv.*.ops[i].pin)
+            } elif f_is_agg {
+                make src = this.operand_addr(rv.*.ops[i].pin)
+
+                if src != this.null { this.memcpy(fp, src, this.size_of(fty !)) }
+            } else {
+                this.store_i64(this.gen_operand(rv.*.ops[i].pin), fp)
+            }
+
+            i = i + 1
+        }
+    }
+
+    @this @unsafe
+    make gen_array (rv: ref<mir::MirRvalue>, dest: ptr<any>, dest_ty: str) {
+        this.zero_value(dest, dest_ty.copy())
+        make elem_ty = this.pointee(dest_ty.copy())
+        make elem_size = this.size_of(elem_ty.copy())
+        make i: uint = 0
+
+        while i < rv.*.ops.len() {
+            make item: ptr<any> = this.null
+
+            if this.has_closure(elem_ty.copy()) {
+                item = this.prepare_value(rv.*.ops[i].pin, elem_ty.copy())
+            } elif this.is_fallible(elem_ty.copy()) {
+                item = this.fallible_arg_addr(rv.*.ops[i].pin, elem_ty.copy())
+            } elif this.is_optional(elem_ty.copy()) {
+                item = this.optional_arg_addr(rv.*.ops[i].pin, elem_ty.copy())
+            } elif elem_ty == "str" || elem_ty == "String" {
+                item = this.string_result
+                this.assign_string_operand(item, rv.*.ops[i].pin)
+            } elif this.is_agg(elem_ty.copy()) {
+                item = this.operand_addr(rv.*.ops[i].pin)
+            } else {
+                item = this.allocate(8)
+                this.store_i64(this.gen_operand(rv.*.ops[i].pin), item)
+            }
+
+            if item == this.null {
+                this.trap()
+            } else {
+                this.call_named("__quip_dynamic_list_push", [dest, item, this.word_value(elem_size)])
+            }
+
+            i = i + 1
+        }
+    }
+
+    @this @unsafe
+    make gen_optional_assignment (rv: ref<mir::MirRvalue>, dest: ptr<any>, dest_ty: str) {
+        make payload_ty = this.optional_payload(dest_ty.copy())
+
+        if rv.*.kind == mir::MirRvalueKind.Use {
+            if rv.*.a.kind == mir::MirOperandKind.Const
+                && rv.*.a.lit.kind == lexer::TokenKind.KeyNone {
+                this.zero_value(dest, dest_ty.copy())
+                return
+            }
+
+                make source_ty = this.operand_type(rv.*.a.pin)
+
+            if this.is_optional(source_ty.copy()) {
+                make src = this.operand_addr(rv.*.a.pin)
+
+                if src != this.null {
+                    this.memcpy(dest, src, this.size_of(dest_ty.copy()))
+                } else {
+                    this.trap()
+                }
+
+                return
+            }
+
+            this.zero_value(dest, dest_ty.copy())
+            this.store_i64(this.word_value(1), dest)
+            make payload = this.gep(dest, 8)
+
+            if payload_ty == "str" || payload_ty == "String" {
+                this.assign_string_operand(payload, rv.*.a.pin)
+            } elif this.has_closure(payload_ty.copy()) {
+                make prepared = this.prepare_value(rv.*.a.pin, payload_ty.copy())
+                this.memcpy(payload, prepared, this.size_of(payload_ty))
+            } elif this.is_variant(payload_ty.copy()) {
+                this.variant_assign(payload, payload_ty.copy(), rv.*.a.pin)
+            } elif this.is_agg(payload_ty.copy()) {
+                make src = this.operand_addr(rv.*.a.pin)
+
+                if src != this.null {
+                    this.memcpy(payload, src, this.size_of(payload_ty.copy()))
+                } else {
+                    this.trap()
+                }
+            } else {
+                this.store_i64(this.gen_operand(rv.*.a.pin), payload)
+            }
+
+            return
+        }
+
+        this.trap()
+    }
+
+    @this @unsafe
+    make gen_optional_compare (op: str, left: ref<mir::MirOperand>, right: ref<mir::MirOperand>,
+        left_ty: str, right_ty: str) -> ptr<any> {
+        make left_none = left.*.kind == mir::MirOperandKind.Const
+            && left.*.lit.kind == lexer::TokenKind.KeyNone
+        make right_none = right.*.kind == mir::MirOperandKind.Const
+            && right.*.lit.kind == lexer::TokenKind.KeyNone
+        make result: ptr<any> = this.null
+
+        if left_none && right_none {
+            result = this.word_value(1)
+        } elif left_none && this.is_optional(right_ty.copy()) {
+            make addr = this.operand_addr(right)
+            make tag = this.load_i64(addr)
+            result = this.gen_binop("==", tag, this.word_value(0), false)
+        } elif right_none && this.is_optional(left_ty.copy()) {
+            make addr = this.operand_addr(left)
+            make tag = this.load_i64(addr)
+            result = this.gen_binop("==", tag, this.word_value(0), false)
+        } elif this.is_optional(left_ty.copy()) && !this.is_optional(right_ty.copy()) {
+            make payload_ty = this.optional_payload(left_ty.copy())
+
+            if this.is_agg(payload_ty.copy()) {
+                this.trap()
+                return this.word_value(0)
+            }
+
+            make addr = this.operand_addr(left)
+            make tag = this.load_i64(addr)
+            make present = this.gen_binop("!=", tag, this.word_value(0), false)
+            make payload = this.load_i64(this.gep(addr, 8))
+            make value = this.gen_operand(right)
+            make payload_equal: ptr<any> = this.null
+
+            if this.is_float_ty(payload_ty.copy()) {
+                payload_equal = this.gen_float_binop("==", payload, value, payload_ty.copy())
+            } else {
+                payload_equal = this.gen_binop("==", payload, value, false)
+            }
+
+            result = this.gen_binop("&", present, payload_equal, false)
+        } elif this.is_optional(right_ty.copy()) && !this.is_optional(left_ty.copy()) {
+            make payload_ty = this.optional_payload(right_ty.copy())
+
+            if this.is_agg(payload_ty.copy()) {
+                this.trap()
+                return this.word_value(0)
+            }
+
+            make addr = this.operand_addr(right)
+            make tag = this.load_i64(addr)
+            make present = this.gen_binop("!=", tag, this.word_value(0), false)
+            make payload = this.load_i64(this.gep(addr, 8))
+            make value = this.gen_operand(left)
+            make payload_equal: ptr<any> = this.null
+
+            if this.is_float_ty(payload_ty.copy()) {
+                payload_equal = this.gen_float_binop("==", value, payload, payload_ty.copy())
+            } else {
+                payload_equal = this.gen_binop("==", value, payload, false)
+            }
+
+            result = this.gen_binop("&", present, payload_equal, false)
+        } elif this.is_optional(left_ty.copy()) && this.is_optional(right_ty.copy()) {
+            make payload_ty = this.optional_payload(left_ty.copy())
+
+            if this.is_agg(payload_ty.copy()) {
+                this.trap()
+                return this.word_value(0)
+            }
+
+            make left_addr = this.operand_addr(left)
+            make right_addr = this.operand_addr(right)
+            make left_tag = this.load_i64(left_addr)
+            make right_tag = this.load_i64(right_addr)
+            make same_tag = this.gen_binop("==", left_tag, right_tag, false)
+            make left_none_tag = this.gen_binop("==", left_tag, this.word_value(0), false)
+            make left_payload = this.load_i64(this.gep(left_addr, 8))
+            make right_payload = this.load_i64(this.gep(right_addr, 8))
+            make same_payload: ptr<any> = this.null
+
+            if this.is_float_ty(payload_ty.copy()) {
+                same_payload = this.gen_float_binop("==", left_payload, right_payload, payload_ty.copy())
+            } else {
+                same_payload = this.gen_binop("==", left_payload, right_payload, false)
+            }
+
+            make payload_equal_or_none = this.gen_binop("|", left_none_tag, same_payload, false)
+            result = this.gen_binop("&", same_tag, payload_equal_or_none, false)
+        } else {
+            this.trap()
+            return this.word_value(0)
+        }
+
+        if op == "!=" {
+            result = this.gen_binop("==", result, this.word_value(0), false)
+        }
+
+        return result
+    }
+
+    /// creates a temporary address containing an optional argument.
+    @this @unsafe
+    make optional_arg_addr (op: ref<mir::MirOperand>, optional_ty: str) -> ptr<any> {
+        make temp = this.allocate(this.size_of(optional_ty.copy()))
+        make value = mir::MirRvalue {}
+
+        value.kind = mir::MirRvalueKind.Use
+        value.a.kind = op.*.kind
+        value.a.place = op.*.place !
+        value.a.lit.kind = op.*.lit.kind
+        value.a.lit.lexeme = op.*.lit.lexeme.copy()
+        value.a.name = op.*.name.copy()
+        value.a.ty = op.*.ty.copy()
+        value.a.is_sizeof = op.*.is_sizeof
+        this.gen_optional_assignment(value.pin, temp, optional_ty.copy())
+        return temp
+    }
+
+    @this @unsafe
+    make local_slot (local: uint) -> ptr<any> {
+        if this.is_capture(local) { return this.captures[local] }
+        if local < this.local_slots.len() { return this.storage[this.local_slots[local]] }
+        return this.null
+    }
+
+    // rvalues / operands
+    /// emits the value of a mir rvalue.
+    @this @unsafe
+    make gen_rvalue (rv: ref<mir::MirRvalue>) -> ptr<any> {
+        if rv.*.kind == mir::MirRvalueKind.Use {
+            return this.gen_operand(rv.*.a.pin)
+        }
+
+        if rv.*.kind == mir::MirRvalueKind.Binary {
+            if rv.*.op == "__fallible_code" || rv.*.op == "__fallible_ok"
+                || rv.*.op == "__fallible_error" {
+                make code = this.load_i64(this.operand_addr(rv.*.a.pin))
+
+                if rv.*.op == "__fallible_code" { return code }
+
+                if rv.*.op == "__fallible_ok" { return this.gen_binop("==", code, this.word_value(0), false) }
+
+                return this.gen_binop("==", code, this.gen_operand(rv.*.b.pin), false)
+            }
+
+            if rv.*.op == "__variant_is" {
+                make ty = this.operand_type(rv.*.a.pin)
+                make tag = this.load_i64(this.operand_addr(rv.*.a.pin))
+                make index = this.variant_index(ty, rv.*.name.copy())
+
+                return this.gen_binop("==", tag, this.word_value(index), false)
+            }
+
+            if rv.*.op == "__optional_some" || rv.*.op == "__optional_none" {
+                make addr = this.operand_addr(rv.*.a.pin)
+                make tag = this.load_i64(addr)
+
+                if rv.*.op == "__optional_some" {
+                    return this.gen_binop("!=", tag, this.word_value(0), false)
+                }
+
+                return this.gen_binop("==", tag, this.word_value(0), false)
+            }
+
+            make left_ty = this.operand_type(rv.*.a.pin)
+            make right_ty = this.operand_type(rv.*.b.pin)
+            make cond_temp = (this.is_optional(left_ty.copy()) || this.is_optional(right_ty.copy()))
+            make cond2_temp = (rv.*.op == "==" || rv.*.op == "!=")
+
+            if cond_temp && cond2_temp {
+                return this.gen_optional_compare(rv.*.op, rv.*.a.pin, rv.*.b.pin,
+                    left_ty.copy(), right_ty.copy())
+            }
+
+            if cond2_temp && (left_ty == "str" || left_ty == "String")
+                && (right_ty == "str" || right_ty == "String") {
+                make left = this.operand_addr(rv.*.a.pin)
+                make right = this.operand_addr(rv.*.b.pin)
+                make result = this.call_named("__quip_string_equal", [left, right])
+
+                if rv.*.op == "!=" { return this.gen_binop("==", result, this.word_value(0), false) }
+
+                return result
+            }
+
+            make l = this.gen_operand(rv.*.a.pin)
+            make r = this.gen_operand(rv.*.b.pin)
+
+            if l == this.null || r == this.null {
+                this.trap()
+                return this.word_value(0)
+            }
+
+            if cond2_temp && this.is_fallible(left_ty.copy()) && right_ty == "error" {
+                make code = this.load_i64(this.operand_addr(rv.*.a.pin))
+
+                if rv.*.op == "==" { return this.gen_binop("==", code, r, false) }
+
+                return this.gen_binop("!=", code, r, false)
+            }
+
+            if cond2_temp && this.is_fallible(right_ty.copy()) && left_ty == "error" {
+                make code = this.load_i64(this.operand_addr(rv.*.b.pin))
+
+                if rv.*.op == "==" { return this.gen_binop("==", l, code, false) }
+
+                return this.gen_binop("!=", l, code, false)
+            }
+
+            if rv.*.op == "+" || rv.*.op == "-" {
+                if this.is_indirect(left_ty.copy()) && !this.is_indirect(right_ty.copy()) {
+                    make element = this.pointee(left_ty.copy())
+                    make size = this.c_element_size(element.copy())
+                    make offset = this.gen_binop("*", r, this.word_value(size), false)
+
+                    if rv.*.op == "+" { return this.gen_binop("+", l, offset, false) }
+
+                    return this.gen_binop("-", l, offset, false)
+                }
+
+                if rv.*.op == "+" && this.is_indirect(right_ty.copy()) && !this.is_indirect(left_ty.copy()) {
+                    make element = this.pointee(right_ty.copy())
+                    make size = this.c_element_size(element.copy())
+
+                    return this.gen_binop("+", r, this.gen_binop("*", l, this.word_value(size), false), false)
+                }
+            }
+
+            if this.is_float_ty(left_ty.copy()) || this.is_float_ty(right_ty.copy()) {
+                return this.gen_float_binop(rv.*.op, l, r, left_ty.copy())
+            }
+
+            make unsigned = left_ty == "uint" || left_ty == "u8" || left_ty == "u16" || left_ty == "u32" || left_ty == "u64"
+
+            return this.gen_binop(rv.*.op, l, r, unsigned)
+        }
+
+        if rv.*.kind == mir::MirRvalueKind.Unary {
+            make v = this.gen_operand(rv.*.a.pin)
+
+            if v == this.null {
+                this.trap()
+                return this.word_value(0)
+            }
+
+            if rv.*.op == "-" {
+                make vty = this.operand_type(rv.*.a.pin)
+                if this.is_float_ty(vty.copy()) { return this.floats.negate(v, vty == "f32") }
+                return this.gen_binop("-", this.word_value(0), v, false)
+            }
+
+            if rv.*.op == "!" {
+                return this.gen_binop("==", v, this.word_value(0), false)
+            }
+
+            this.trap()
+
+            return this.word_value(0)
+        }
+
+        if rv.*.kind == mir::MirRvalueKind.Pin {
+            make slot = this.place_addr(rv.*.place.pin)
+
+            if slot == this.null {
+                this.trap()
+
+                return this.word_value(0)
+            }
+
+            return this.ptrtoint(slot)
+        }
+
+        this.trap()
+
+        return this.word_value(0)
+    }
+
+    /// emits the value of a mir operand.
+    @this @unsafe
+    make gen_operand (op: ref<mir::MirOperand>) -> ptr<any> {
+        if op.*.kind == mir::MirOperandKind.Const {
+            return this.const_operand(op)
+        }
+
+        if op.*.kind == mir::MirOperandKind.Copy || op.*.kind == mir::MirOperandKind.Move {
+            make ty = this.type_of_place(op.*.place.pin)
+            make addr = this.place_addr(op.*.place.pin)
+
+            if addr == this.null {
+                this.trap()
+                return this.word_value(0)
+            }
+
+            // an aggregate operand reads as its address; a scalar operand is loaded
+            make op_is_agg = this.is_agg(ty !)
+
+            if op_is_agg {
+                return this.ptrtoint(addr)
+            }
+
+            if this.raw_scalar_place(op.*.place.pin) && this.c_element_size(ty.copy()) < 8 {
+                make kind = this.c_scalar_type(ty.copy())
+                return this.conversion.widen(this.load(addr, kind, 1), kind, native::signed_narrow(ty))
+            }
+
+            if ty == "char" {
+                return this.load_char(addr)
+            }
+
+            return this.load_i64(addr)
+        }
+
+        if op.*.kind == mir::MirOperandKind.Path {
+            return this.function_handle(this.symbol_of(op.*.name !), op.*.function_ret.copy(), op.*.function_args !)
+        }
+
+        this.trap()
+        return this.word_value(0)
+    }
+
+    @this @unsafe
+    make gen_binop (op: str, left: ptr<any>, right: ptr<any>, unsigned: bool) -> ptr<any> {
+        make opcode = scalar::opcode(op.copy(), unsigned)
+        if opcode != 0 { return api::LLVMBuildBinOp(this.builder, opcode, left, right, this.unnamed.data) }
+
+        if scalar::predicate(op.copy(), unsigned) != 0 {
+            return this.as_word(this.compare(op, left, right, unsigned))
+        }
+
+        this.trap()
+        return this.word_value(0)
+    }
+
+    @this @unsafe
+    make compare (op: str, left: ptr<any>, right: ptr<any>, unsigned: bool) -> ptr<any> {
+        return api::LLVMBuildICmp(this.builder, scalar::predicate(op, unsigned), left, right, this.unnamed.data)
+    }
+
+    @this @unsafe
+    make as_word (bit: ptr<any>) -> ptr<any> {
+        return api::LLVMBuildZExt(this.builder, bit, this.word, this.unnamed.data)
+    }
+
+    @this @unsafe
+    make gen_float_binop (op: str, left: ptr<any>, right: ptr<any>, ty: str) -> ptr<any> {
+        if floating::supports(op.copy()) { return this.floats.binary(op, left, right, ty == "f32") }
+        this.trap()
+        return this.word_value(0)
+    }
+
+    @this @unsafe
+    make gen_term (term: ref<mir::MirTerm>) {
+        if term.*.kind == mir::MirTermKind.Return {
+            // Return place owns the result; moved-from locals have cleared flags.
+            make li = 1
+
+            while li < this.local_cleanup.len() {
+                this.drop_local(li, true)
+                li++
+            }
+
+            if this.cur_sret {
+                // copy the return place into the caller-provided sret storage
+                if this.local_tys.len() > 0 {
+                    this.memcpy(this.return_buffer, this.local_slot(0), this.size_of((this.cur_ret_ty !).copy()))
+                }
+
+                api::LLVMBuildRetVoid(this.builder)
+                return
+            }
+
+            make v = this.load_ret()
+            api::LLVMBuildRet(this.builder, v)
+            return
+        }
+
+        if term.*.kind == mir::MirTermKind.Goto {
+            this.go_to(term.*.target)
+            return
+        }
+
+        if term.*.kind == mir::MirTermKind.Branch {
+            make c = this.gen_operand(term.*.cond.pin)
+            make bit = this.compare("!=", c, this.word_value(0), false)
+            api::LLVMBuildCondBr(this.builder, bit, this.blocks[term.*.target], this.blocks[term.*.other])
+            return
+        }
+
+        if term.*.kind == mir::MirTermKind.Call {
+            this.gen_call(term)
+            return
+        }
+
+        api::LLVMBuildUnreachable(this.builder)
+    }
+
+    @this @unsafe
+    make load_ret () -> ptr<any> {
+        if this.local_tys.len() == 0 { return this.word_value(0) }
+        return this.load_i64(this.local_slot(0))
+    }
+
+    // reserved symbols typeck records for the built-in attached functions of `str` and `T[]`
+    @this
+    make is_builtin (name: str) -> bool {
+        make prefix = "__quip_builtin."
+
+        if name.len() < prefix.len() { return false }
+
+        make i: uint = 0
+
+        while i < prefix.len() {
+            if name[i] != prefix[i] { return false }
+
+            i = i + 1
+        }
+
+        return true
+    }
+
+    /// emits the runtime declarations used by built-in operations.
+    @this @unsafe
+    make declare_builtins () {
+        if this.is_declared("__quip_builtins") {
+            return
+        }
+
+        this.declared.push("__quip_builtins")
+        this.declare_native("__quip_str_push_char", this.void_type, [this.pointer, this.byte])
+        this.declare_native("__quip_str_append", this.void_type, [this.pointer, this.pointer])
+        this.declare_native("__quip_dynamic_list_pop", this.void_type, [this.pointer])
+        this.declare_native("__quip_panic", this.void_type, [this.pointer, this.pointer, this.c_int])
+    }
+
+    /// checks for native export.
+    @this
+    make has_native_export (name: str) -> bool {
+        for exported : this.native_exports {
+            if exported == name { return true }
+        }
+
+        return false
+    }
+
+    /// emits a native declaration unless the module provides that export.
+    @this @unsafe
+    make declare_native (name: str, result: ptr<any>, parameters: ptr<any>[]) {
+        if !this.has_native_export(name.copy()) { this.declare(name, result, parameters, false) }
+    }
+
+    @this @unsafe
+    make declare_adapter (symbol: str, function: ref<mir::MirFunc>) {
+        make params: ptr<any>[] = []
+        make i: uint = 1
+        while i <= function.*.body.param_count {
+            params.push(this.c_scalar_type(function.*.body.locals[i].ty.copy()))
+            i++
+        }
+        this.declare(symbol, this.c_scalar_type(function.*.ret_ty.copy()), params, false)
+    }
+
+    @this @unsafe
+    make plan_native_adapters (module: ref<mir::MirModule>) {
+        make i: uint = 0
+        while i < module.*.funcs.len() {
+            make function = module.*.funcs[i].pin
+            make operation = function.*.intrinsic_name.copy()
+
+            if operation.len() > 0 {
+                make plan = adapters::Plan { symbol = this.emit_symbol(function), index = i }
+                if operation.len() > 15 && this.slice(operation.copy(), 0, 15) == "native_address:" {
+                    plan.kind = adapters::Kind.NativeAddress
+                    plan.target = this.slice(operation.copy(), 15, operation.len())
+                    if !this.has_native_export(plan.target.copy()) && !this.is_declared(plan.target.copy()) {
+                        this.declared.push(plan.target.copy())
+                        this.declare(plan.target.copy(), this.void_type, [], false)
+                    }
+                } elif operation.len() >= 17 && this.slice(operation.copy(), 0, 17) == "constant_address:" {
+                    plan.kind = adapters::Kind.ConstantAddress
+                    make literal = this.string_global(this.slice(operation.copy(), 17, operation.len()))
+                    // The adapter returns the constant's address.
+                    plan.constant = literal
+                } elif operation == "global_address" {
+                    plan.kind = adapters::Kind.GlobalAddress
+                    plan.storage_size = this.size_of(this.pointee(function.*.ret_ty.copy()))
+                } elif operation == "native_call" {
+                    plan.kind = adapters::Kind.NativeCall
+                }
+
+                this.declare_adapter(plan.symbol.copy(), function)
+                this.adapters.push(plan)
+            }
+
+            if function.*.export_name.len() > 0 {
+                this.declare_adapter(function.*.export_name.copy(), function)
+                this.adapters.push(adapters::Plan {
+                    kind = adapters::Kind.Export, symbol = function.*.export_name.copy(),
+                    target = this.symbol_of(function.*.name.copy()), index = i,
+                })
+            }
+
+            i++
+        }
+    }
+
+    // 1-based line of the byte offset `offset` in the unit's source
+    @this
+    make line_of (offset: uint) -> uint {
+        make ln: uint = 1
+        make i: uint = 0
+
+        while i < offset && i < this.source.len() {
+            if this.source[i] == '\n' {
+                ln = ln + 1
+            }
+
+            i = i + 1
+        }
+
+        return ln
+    }
+
+    @this @unsafe
+    make string_global (text: str) -> ptr<any> {
+        return strings::literal_bytes(this.context, this.module, text)
+    }
+
+    // Both wrappers have a tag/code followed by a payload; their success predicates differ.
+    @this @unsafe
+    make gen_unwrap (term: ref<mir::MirTerm>) {
+        make arg = term.*.args[0].pin
+        make arg_ty = this.operand_type(arg)
+        make is_optional_arg = this.is_optional(arg_ty.copy())
+        make is_fallible_arg = this.is_fallible(arg_ty.copy())
+        make v = this.gen_operand(arg)
+        make arg_addr: ptr<any> = this.null
+
+        if is_optional_arg || is_fallible_arg {
+            if arg.*.kind == mir::MirOperandKind.Const
+                && arg.*.lit.kind == lexer::TokenKind.KeyNone {
+                arg_addr = this.optional_arg_addr(arg, arg_ty.copy())
+            } else {
+                arg_addr = this.operand_addr(arg)
+            }
+        }
+
+        make is_none = this.compare("==", v, this.word_value(0), false)
+        if is_optional_arg || is_fallible_arg {
+            make tag = this.load_i64(arg_addr)
+            make op = "=="
+            if is_fallible_arg { op = "!=" }
+            is_none = this.compare(op, tag, this.word_value(0), false)
+        }
+
+        make fail = this.block(this.function, "unwrap_fail")
+        make ok = this.block(this.function, "unwrap_ok")
+        api::LLVMBuildCondBr(this.builder, is_none, fail, ok)
+
+        api::LLVMPositionBuilderAtEnd(this.builder, fail)
+        make message = "called `unwrap` on a `none` value"
+        if is_fallible_arg { message = "called `unwrap` on an error value" }
+
+        make msg = this.string_global(message)
+        make file = this.string_global(this.module_name.copy())
+        make at_line = this.line_of(term.*.range.start.start)
+        this.call_named("__quip_panic", [msg, file, api::LLVMConstInt(this.c_int, at_line, 0)])
+        api::LLVMBuildUnreachable(this.builder)
+        api::LLVMPositionBuilderAtEnd(this.builder, ok)
+
+        make dest = this.place_addr(term.*.dest.pin)
+
+        if dest != this.null {
+            make dty = this.type_of_place(term.*.dest.pin)
+
+            if is_optional_arg || is_fallible_arg {
+                make payload_ty = this.optional_payload(arg_ty.copy())
+
+                if is_fallible_arg { payload_ty = this.strip_bang(arg_ty.copy()) }
+
+                make payload_addr = this.gep(arg_addr, 8)
+
+                if this.is_agg(payload_ty.copy()) {
+                    this.memcpy(dest, payload_addr, this.size_of(payload_ty.copy()))
+                } elif dty == "char" {
+                    make payload = this.load_char(payload_addr)
+                    this.store_char(payload, dest)
+                } else {
+                    make payload = this.load_i64(payload_addr)
+                    this.store_i64(payload, dest)
+                }
+            } elif this.is_agg(dty !) {
+                this.memcpy(dest, this.inttoptr(v), this.size_of(dty !))
+            } else {
+                this.store_i64(v, dest)
+            }
+        }
+
+        this.go_to(term.*.target)
+    }
+
+    // address of the `{ ptr, len, cap }` header a built-in receiver refers to; `ref<..>` /
+    // `ptr<..>` receivers hold the header's address and are loaded once
+    @this @unsafe
+    make builtin_recv (op: ref<mir::MirOperand>) -> ptr<any> {
+        make addr = this.operand_addr(op)
+        make ty = this.strip_bang(this.type_of_place(op.*.place.pin))
+
+        if this.ends_with(ty !, "[]") { return addr }
+
+        make lt = this.first_at(ty !, '<')
+
+        if lt < ty.len() {
+            make prefix = this.slice(ty !, 0, lt)
+
+            if prefix == "ref" || prefix == "ptr" || prefix == "pin" {
+                return this.inttoptr(this.load_i64(addr))
+            }
+        }
+
+        return addr
+    }
+
+    // element type of a built-in array receiver
+    @this
+    make builtin_elem (op: ref<mir::MirOperand>) -> str {
+        make ty = this.strip_bang(this.type_of_place(op.*.place.pin))
+
+        if !this.ends_with(ty !, "[]") {
+            ty = this.pointee(ty)
+        }
+
+        return this.pointee(ty)
+    }
+
+    @this @unsafe
+    make gen_builtin (term: ref<mir::MirTerm>) {
+        make which = term.*.func.name !
+
+        if which == "__quip_builtin.opt.unwrap" || which == "__quip_builtin.fal.unwrap" {
+            this.gen_unwrap(term)
+            return
+        }
+
+        make recv = this.builtin_recv(term.*.args[0].pin)
+        make dest = this.place_addr(term.*.dest.pin)
+
+        make c0 = which == "__quip_builtin.len"
+        make c1 = which == "__quip_builtin.str.push_char"
+        make c2 = which == "__quip_builtin.str.push_str"
+        make c3 = which == "__quip_builtin.arr.push"
+        make c4 = which == "__quip_builtin.arr.pop"
+        make c5 = which == "__quip_builtin.arr.copy"
+
+        if c0 {
+            make v = this.load_i64(this.gep(recv, 8))
+
+            if dest != this.null { this.store_i64(v, dest) }
+        } elif c1 {
+            make c = this.gen_operand(term.*.args[1].pin)
+            this.call_named("__quip_str_push_char", [recv, this.conversion.narrow(c, this.byte)])
+        } elif c2 {
+            make src = this.operand_addr(term.*.args[1].pin)
+            this.call_named("__quip_str_append", [recv, src])
+        } elif c3 {
+            make elem_ty = this.builtin_elem(term.*.args[0].pin)
+            make esz = this.size_of(elem_ty.copy())
+            make item: ptr<any> = this.null
+
+            if this.has_closure(elem_ty.copy()) {
+                item = this.prepare_value(term.*.args[1].pin, elem_ty.copy())
+            } elif this.is_fallible(elem_ty.copy()) {
+                item = this.fallible_arg_addr(term.*.args[1].pin, elem_ty.copy())
+            } elif this.is_optional(elem_ty.copy()) {
+                item = this.optional_arg_addr(term.*.args[1].pin, elem_ty.copy())
+            } elif elem_ty == "str" || elem_ty == "String" {
+                item = this.string_result
+                this.assign_string_operand(item, term.*.args[1].pin)
+            } elif this.is_agg(elem_ty.copy()) {
+                item = this.operand_addr(term.*.args[1].pin)
+            } else {
+                item = this.allocate(8)
+                this.store_i64(this.gen_operand(term.*.args[1].pin), item)
+            }
+
+            this.call_named("__quip_dynamic_list_push", [recv, item, this.word_value(esz)])
+        } elif c5 {
+            this.call_named("__quip_value_copy", [dest, recv, this.schema_address(term.*.ret_ty.copy())])
+        } elif c4 {
+            make esz = this.size_of(this.builtin_elem(term.*.args[0].pin))
+            make len_addr = this.gep(recv, 8)
+            make old_len = this.load_i64(len_addr)
+            this.call_named("__quip_dynamic_list_pop", [recv])
+
+            if dest != this.null {
+                make idx = this.gen_binop("-", old_len, this.word_value(1), false)
+                make byte_off = this.gen_binop("*", idx, this.word_value(esz), false)
+                make data = this.load(recv, this.pointer, 8)
+                make elem_addr = this.gep_dyn(data, byte_off)
+                this.memcpy(dest, elem_addr, esz)
+            }
+        }
+
+        this.go_to(term.*.target)
+    }
+
+    @this @unsafe
+    make gen_c_call (term: ref<mir::MirTerm>, sym: str) {
+        make callee = this.named(sym)
+        make signature = api::LLVMGlobalGetValueType(callee)
+        make result_type = api::LLVMGetReturnType(signature)
+        make fixed = api::LLVMCountParamTypes(signature)
+        make args: ptr<any>[] = []
+
+        if term.*.ret_agg {
+            make dest = this.place_addr(term.*.dest.pin)
+            if term.*.ret_ty == "str" || term.*.ret_ty == "String" { this.drop_string(dest) }
+            args.push(dest)
+        }
+
+        make i: uint = 0
+        while i < term.*.args.len() {
+            if term.*.arg_aggs[i] {
+                args.push(this.operand_addr(term.*.args[i].pin))
+            } else {
+                make value = this.gen_operand(term.*.args[i].pin)
+                if args.len() < fixed {
+                    @unsafe make index: u32 = args.len()
+                    make ty = api::LLVMTypeOf(api::LLVMGetParam(callee, index))
+                    args.push(this.conversion.narrow(value, ty))
+                } else {
+                    make ty = term.*.arg_tys[i].copy()
+                    args.push(this.conversion.promote(value, this.c_scalar_type(ty.copy()), ty))
+                }
+            }
+            i++
+        }
+
+        make result = this.call(callee, signature, args)
+        if api::LLVMGetTypeKind(result_type) != 0 {
+            make dest = this.place_addr(term.*.dest.pin)
+            if dest != this.null {
+                make value = this.conversion.widen(result, result_type, native::signed_narrow(term.*.ret_ty.copy()))
+                this.store_i64(value, dest)
+            }
+        }
+
+        if term.*.ret_ty == "str" || term.*.ret_ty == "String" {
+            make owner = this.string_owner(this.place_addr(term.*.dest.pin))
+            if owner != this.null { this.store_i64(this.word_value(1), owner) }
+        }
+        this.go_to(term.*.target)
+    }
+
+    @this @unsafe
+    make gen_call (term: ref<mir::MirTerm>) {
+        // `syscall` has a platform-specific fixed argument and pointer-sized variadic arguments.
+        if term.*.func.kind == mir::MirOperandKind.Path && term.*.func.name == "syscall" {
+            this.gen_syscall(term)
+            return
+        }
+
+        if term.*.func.kind == mir::MirOperandKind.Path && this.is_builtin(term.*.func.name !) {
+            this.gen_builtin(term)
+            return
+        }
+
+        if term.*.c_abi && term.*.func.kind == mir::MirOperandKind.Path {
+            this.gen_c_call(term, term.*.func.name !)
+            return
+        }
+
+        make is_path = term.*.func.kind == mir::MirOperandKind.Path
+        make sym: str = ""
+        make target: ptr<any> = this.null
+        make environment: ptr<any> = this.null
+
+        if is_path {
+            sym = this.symbol_of(term.*.func.name !)
+            target = this.named(sym.copy())
+        } else {
+            make handle = this.gen_operand(term.*.func.pin)
+            target = this.inttoptr(this.call_named("__quip_closure_code", [handle]))
+            environment = this.call_named("__quip_closure_env", [handle])
+        }
+
+        // resolve the callee's signature so aggregate arguments/returns use the pointer convention
+        make fidx = this.fns.len()
+
+        if is_path { fidx = this.lookup_func(sym !) }
+
+        make ret_ty = term.*.ret_ty !
+
+        if fidx < this.fns.len() { ret_ty = (this.fns[fidx].*.ret_ty !).copy() }
+
+        make ret_agg = this.is_agg(ret_ty !)
+
+        if fidx >= this.fns.len() { ret_agg = term.*.ret_agg }
+
+        make args: ptr<any>[] = []
+        if ret_agg { args.push(this.null) }
+        if !is_path { args.push(environment) }
+
+        make ai: uint = 0
+
+        while ai < term.*.args.len() {
+            make pty: str = ""
+
+            if fidx < this.fns.len() {
+                if ai + 1 < this.fns[fidx].*.body.locals.len() {
+                    pty = (this.fns[fidx].*.body.locals[ai + 1].ty !).copy()
+                }
+            } elif ai < term.*.arg_tys.len() {
+                pty = term.*.arg_tys[ai] !
+            }
+
+            make arg_is_agg = this.is_agg(pty !)
+
+            if fidx >= this.fns.len() && ai < term.*.arg_aggs.len() {
+                arg_is_agg = term.*.arg_aggs[ai]
+            }
+
+            if this.has_closure(pty.copy()) {
+                make prepared = this.prepare_value(term.*.args[ai].pin, pty.copy())
+
+                if arg_is_agg { args.push(prepared) }
+                else { args.push(this.load_i64(prepared)) }
+            } elif arg_is_agg {
+                make arg_addr = this.operand_addr(term.*.args[ai].pin)
+
+                if this.is_fallible(pty.copy()) {
+                    arg_addr = this.fallible_arg_addr(term.*.args[ai].pin, pty.copy())
+                }
+
+                if this.is_variant(pty.copy()) {
+                    arg_addr = this.variant_arg(term.*.args[ai].pin, pty.copy())
+                }
+
+                if this.is_optional(pty.copy()) {
+                    make actual_ty = this.operand_type(term.*.args[ai].pin)
+                    make arg_none = term.*.args[ai].kind == mir::MirOperandKind.Const
+                        && term.*.args[ai].lit.kind == lexer::TokenKind.KeyNone
+
+                    if !this.is_optional(actual_ty.copy()) || arg_none {
+                        arg_addr = this.optional_arg_addr(term.*.args[ai].pin, pty.copy())
+                    }
+                }
+
+                args.push(arg_addr)
+            } elif term.*.has_receiver && ai == 0 && this.is_ref(pty.copy()) {
+                make source_ty = this.operand_type(term.*.args[ai].pin)
+
+                if this.is_ref(source_ty.copy()) {
+                    args.push(this.gen_operand(term.*.args[ai].pin))
+                } elif this.is_indirect(source_ty.copy())
+                    && (this.pointee(source_ty.copy()) == this.pointee(pty.copy())
+                        || (source_ty.len() > 6 && source_ty[0] == 'o' && source_ty[1] == 'w'
+                            && source_ty[2] == 'n' && source_ty[3] == 'e' && source_ty[4] == 'd'
+                            && source_ty[5] == '<' && source_ty == this.pointee(pty.copy()))) {
+                    args.push(this.gen_operand(term.*.args[ai].pin))
+                } else {
+                    make arg_addr = this.operand_addr(term.*.args[ai].pin)
+                    args.push(this.ptrtoint(arg_addr))
+                }
+            } else {
+                args.push(this.gen_operand(term.*.args[ai].pin))
+            }
+
+            ai = ai + 1
+        }
+
+        if this.has_closure(ret_ty.copy()) {
+            this.drop_managed(this.place_addr(term.*.dest.pin), this.schema_address(ret_ty.copy()))
+        }
+
+        if ret_ty == "str" || ret_ty == "String" {
+            this.drop_string(this.place_addr(term.*.dest.pin))
+        }
+
+        if ret_agg { args[0] = this.place_addr(term.*.dest.pin) }
+
+        make signature: ptr<any> = this.null
+        if is_path {
+            signature = api::LLVMGlobalGetValueType(target)
+        } else {
+            make types: ptr<any>[] = []
+            for argument : args { types.push(api::LLVMTypeOf(argument)) }
+            make result_type = this.word
+            if ret_agg { result_type = this.void_type }
+            signature = this.signature(result_type, types, false)
+        }
+
+        make result = this.call(target, signature, args)
+        if !ret_agg {
+            make destination = this.place_addr(term.*.dest.pin)
+            if destination != this.null { this.store_i64(result, destination) }
+        }
+
+        if ret_ty == "str" || ret_ty == "String" {
+            make owner = this.string_owner(this.place_addr(term.*.dest.pin))
+
+            if owner != this.null { this.store_i64(this.word_value(1), owner) }
+        }
+
+        this.go_to(term.*.target)
+    }
+
+    @this @unsafe
+    make gen_syscall (term: ref<mir::MirTerm>) {
+        make ty = this.word
+        if this.platform == "macos" { ty = this.c_int }
+        this.declare("syscall", ty, [ty], true)
+
+        make args: ptr<any>[] = []
+        make i: uint = 0
+        while i < term.*.args.len() {
+            make value = this.gen_operand(term.*.args[i].pin)
+            if i == 0 { value = this.conversion.narrow(value, ty) }
+            args.push(value)
+            i++
+        }
+
+        make result = this.call_named("syscall", args)
+        make dest = this.local_slot(term.*.dest.local)
+        if dest != this.null { this.store_i64(this.conversion.widen(result, ty, true), dest) }
+        this.go_to(term.*.target)
+    }
+}

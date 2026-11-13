@@ -1,0 +1,10 @@
+@pub @this
+make type Iterator <V> {
+
+    @pub @this
+    make next () -> V? {
+
+        return none
+    }
+
+}

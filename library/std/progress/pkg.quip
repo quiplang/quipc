@@ -1,0 +1,717 @@
+@pure @const {
+    make process = @import "../internal/process.quip"
+    make env = @import "../os/pkg.quip"
+    make time = @import "../internal/time.quip"
+
+    @target "macos" make os = @import "../os/macos.quip"
+    @target "linux" make os = @import "../os/linux.quip"
+    @target "windows" make os = @import "../os/windows.quip"
+}
+
+@pub
+make begin (title: str, enabled: bool, verbose: bool) {
+    make on: int = 0
+    make debug: int = 0
+
+    if enabled { on = 1 }
+
+    if verbose { debug = 1 }
+
+    @unsafe progress_begin(title.pin, on, debug)
+}
+
+@pub
+make phase (label: str, done: uint, total: uint, detail: str) {
+    @unsafe progress_phase(label.pin, done, total, detail.pin)
+}
+
+@pub
+make unit_done () { @unsafe progress_unit() }
+
+@pub
+make clear () { @unsafe progress_clear() }
+
+@pub
+make finish (success: bool) {
+    make ok: int = 0
+
+    if success { ok = 1 }
+
+    @unsafe progress_finish(ok)
+}
+
+@pub
+make run (name: str, args: str[]) -> int {
+    @unsafe make arguments: ptr<process::Arguments> = args.pin
+    @unsafe return progress_run(name.pin, arguments)
+}
+
+// Start a script-owned progress session using the invoking build's preferences.
+@pub
+make start (title: str) {
+    begin(title, env::getenv("QUIPC_NO_PROGRESS") != "1", env::getenv("QUIPC_VERBOSE") == "1")
+}
+
+@pub
+make note (message: str) { @unsafe progress_message(message.pin, 0) }
+
+@pub
+make fail (message: str) { @unsafe progress_message(message.pin, 1) }
+
+@pub
+make log (message: str) { @unsafe progress_message(message.pin, 2) }
+
+@pub
+make target (path: str) -> void {
+    @unsafe progress_target(path.pin)
+}
+
+// Keep the eight string slots together for indexed access during redraws.
+make type PanelRows {
+    make row0: str
+    make row1: str
+    make row2: str
+    make row3: str
+    make row4: str
+    make row5: str
+    make row6: str
+    make row7: str
+}
+
+make type Progress {
+    make enabled: bool
+    make interactive: bool
+    make color: bool
+    make verbose: bool
+    make file_open: bool
+    make panel_visible: bool
+    make compiled: uint
+    make file_index: uint
+    make file_total: uint
+    make started: uint
+    make title: str
+    make last_phase: str
+    make last_detail: str
+    make file_path: str
+    make file_phase_count: uint
+    make target: str
+    make rows: PanelRows
+}
+
+@unsafe @external @intrinsic "global_address"
+make quip_progress_state () -> ptr<Progress>
+
+@unsafe
+make progress_write (fd: i32, data: ptr<char>, length: uint) -> void {
+    make offset: uint = 0
+    while offset < length {
+        make written = os::write(fd, data + offset, length - offset)
+
+        if written < 0 { make code = time::time_errno()
+
+            if code.* == 4 { continue }
+
+            break
+        }
+
+        if written == 0 { break }
+
+        offset = offset + written
+    }
+}
+
+@unsafe
+make progress_text (value: ref<str>) -> void {
+    progress_write(2, value.*.data, value.*.len())
+}
+
+// Session strings outlive the call that allocates them.
+@unsafe
+make save_text (state: ptr<Progress>, target: ptr<str>, source: ref<str>, limit: uint) -> void {
+    quip_runtime_string_free(target)
+    make count = source.*.len()
+
+    if count > limit { count = limit }
+    if count == 0 { return }
+
+    target.*.reserve(count) catch { state.*.enabled = false return }
+    make data = target.*.data
+    make i: uint = 0
+    while i < count {
+        data[i] = source.*[i]
+        i = i + 1
+    }
+
+    target.*.set_length(count) catch { state.*.enabled = false return }
+    quip_runtime_memory_persist(data)
+}
+
+@unsafe
+make reset_text (state: ptr<Progress>) -> void {
+    quip_runtime_string_free(state.*.title.pin)
+    quip_runtime_string_free(state.*.last_phase.pin)
+    quip_runtime_string_free(state.*.last_detail.pin)
+    quip_runtime_string_free(state.*.file_path.pin)
+    quip_runtime_string_free(state.*.target.pin)
+}
+
+make ansi (code: str) -> str {
+    make result: str = ""
+    @unsafe make escape: char = 27
+    result.push(escape)
+    result.push(code)
+    return result
+}
+
+@unsafe
+make progress_now () -> uint {
+    make now: uint = 0
+    @unsafe make address: ptr<uint> = now.pin
+
+    if time::time_monotonic(address) != 0 { return 0 }
+
+    return now
+}
+
+@unsafe
+make progress_elapsed (state: ptr<Progress>) -> str {
+    make now = progress_now()
+    make elapsed: uint = 0
+
+    if now >= state.*.started { elapsed = (now - state.*.started + 5000000) / 10000000 }
+
+    make fraction = progress_number((elapsed % 100))
+
+    if elapsed % 100 < 10 { fraction = "0" + fraction }
+
+    return progress_number((elapsed / 100)) + "." + fraction + "s"
+}
+
+make progress_clip (text: ref<str>, width: uint) -> str {
+    make result: str = ""
+    make offset: uint = 0
+    make visible: uint = 0
+
+    while offset < text.*.len() && visible < width {
+        @unsafe make c: uint = text.*[offset]
+        make count: uint = 1
+
+        if c >= 240 { count = 4 }
+        elif c >= 224 { count = 3 }
+        elif c >= 192 { count = 2 }
+
+        if offset + count > text.*.len() { break }
+
+        make i: uint = 0
+        while i < count { result.push(text.*[offset + i]) i = i + 1 }
+
+        offset = offset + count
+        visible = visible + 1
+    }
+
+    return result
+}
+
+make progress_phase_name (index: uint) -> str {
+    if index == 0 { return "Analyze" }
+
+    if index == 1 { return "Type check" }
+
+    if index == 2 { return "Lower MIR" }
+
+    if index == 3 { return "Memory check" }
+
+    if index == 4 { return "Generate IR" }
+
+    return "Generate object"
+}
+
+// The number of file phases to display, including the active phase.
+make file_phase_count (label: ref<str>) -> uint {
+    make i: uint = 0
+    while i < 6 {
+        if label.* == progress_phase_name(i) { return i + 1 }
+        i = i + 1
+    }
+
+    return 0
+}
+
+make file_heading (path: ref<str>, index: uint, total: uint) -> str {
+    if total == 0 { return path.*.copy() }
+
+    return "[" + progress_number(index) + "/" + progress_number(total) + "] " + path.*
+}
+
+@pub @unsafe @export "quip_progress_clear"
+make progress_clear () -> void {
+    make state = quip_progress_state()
+
+    if state.*.panel_visible {
+        make frame: str = ""
+        make i: uint = 0
+        while i < 8 {
+            frame.push("\r")
+            frame.push(ansi("[2K"))
+
+            if i < 7 { frame.push(ansi("[1B")) }
+
+            i = i + 1
+        }
+
+        frame.push(ansi("[7A"))
+        frame.push("\r")
+        progress_text(frame.pin)
+        state.*.panel_visible = false
+        @unsafe make cached: ptr<str> = state.*.rows.row0.pin
+        i = 0
+        while i < 8 {
+            quip_runtime_string_free(cached + i)
+            i = i + 1
+        }
+    }
+
+}
+
+@unsafe
+make progress_input (value: ptr<str>, limit: uint) -> str {
+    make result: str = ""
+    @unsafe make null: ptr<str> = 0
+
+    if value == null { return result }
+
+    @unsafe make count: uint = value.*.length
+
+    if count > limit { count = limit }
+
+    if count == 0 { return result }
+
+    result.reserve(count) catch { return "" }
+    make data = result.data
+    make source = value.*.data
+    make i: uint = 0
+    while i < count {
+        make c = source[i]
+        @unsafe make byte: uint = c
+
+        if byte < 32 || byte == 127 { c = '?' }
+
+        data[i] = c
+        i = i + 1
+    }
+
+    result.set_length(count) catch { return "" }
+    return result
+}
+
+@unsafe
+make progress_panel (state: ptr<Progress>, file_phases: uint, label: ref<str>, detail: ref<str>, completed: bool) -> void {
+    make dimensions: uint = 0
+    @unsafe make address: ptr<any> = dimensions.pin
+    make columns: uint = 80
+
+    if os::ioctl(2, os::TIOCGWINSZ, address) == 0 {
+        make measured: uint = (dimensions >> 16) & 65535
+
+        if measured != 0 { columns = measured }
+    }
+
+    make width: uint = 1
+
+    if columns > 2 { width = columns - 1 }
+
+    make lines: PanelRows = .{}
+    @unsafe make rows: ptr<str> = lines.row0.pin
+    make heading = state.*.title.copy()
+    if state.*.target.len() > 0 { heading = "Compiling " + state.*.target }
+    make clipped_heading = progress_clip(heading.pin, width)
+    if state.*.color { clipped_heading = ansi("[1;36m") + clipped_heading + ansi("[0m") }
+    rows[0] = clipped_heading
+
+    make title = detail.*.copy()
+
+    if file_phases > 0 || label.* == "Lower" {
+        title = file_heading(detail, state.*.file_index, state.*.file_total)
+    }
+
+    make clipped = progress_clip(title.pin, width)
+
+    if state.*.color { clipped = ansi("[1m") + clipped + ansi("[0m") }
+
+    rows[1] = clipped
+    make count: uint = 1
+
+    if file_phases > 0 { count = file_phases }
+
+    make i: uint = 0
+    while i < count {
+        make done = completed || i + 1 < count
+        make icon: str = "›"
+
+        if done { icon = "✓" }
+
+        make branch: str = "├─"
+
+        if i == count - 1 { branch = "└─" }
+
+        make phase = label.* !
+
+        if file_phases > 0 { phase = progress_phase_name(i) }
+
+        make line = "  " + branch + " " + icon + " " + phase
+        make visible = progress_clip(line.pin, width)
+
+        if state.*.color {
+            make color = ansi("[1;36m")
+
+            if done { color = ansi("[32m") }
+
+            visible = color + visible + ansi("[0m")
+        }
+
+        rows[i + 2] = visible
+        i = i + 1
+    }
+
+    make frame: str = ""
+
+    if !state.*.panel_visible { frame.push("\n\n\n\n\n\n\n") frame.push(ansi("[7A")) frame.push("\r") }
+
+    @unsafe make cached_rows: ptr<str> = state.*.rows.row0.pin
+    i = 0
+
+    while i < 8 {
+        make cached = cached_rows + i
+
+        if !state.*.panel_visible || rows[i] != cached.* {
+            if i > 0 { frame.push(ansi("[" + progress_number(i) + "B")) }
+
+            frame.push("\r")
+            frame.push(rows[i] !)
+            frame.push(ansi("[K"))
+
+            if i > 0 { frame.push(ansi("[" + progress_number(i) + "A")) }
+
+            frame.push("\r")
+            @unsafe make row: ref<str> = rows + i
+            save_text(state, cached, row, 1023)
+        }
+        i = i + 1
+    }
+
+    progress_text(frame.pin)
+    i = 0
+
+    while i < 8 { quip_runtime_string_free(rows + i) i = i + 1 }
+
+    state.*.panel_visible = true
+}
+
+@pub @unsafe @export "quip_progress_begin"
+make progress_begin (title: ptr<str>, enabled: int, verbose: int) -> void {
+    progress_clear()
+    make state = quip_progress_state()
+    reset_text(state)
+    state.*.enabled = enabled != 0
+    state.*.verbose = verbose != 0
+    state.*.file_open = false
+    state.*.panel_visible = false
+    state.*.compiled = 0
+    state.*.file_index = 0
+    state.*.file_total = 0
+    @unsafe make null: ptr<char> = 0
+    make term = os::getenv("TERM".data)
+    state.*.interactive = os::isatty(2) != 0 && term != null && os::strcmp(term, "dumb".data) != 0
+    state.*.color = state.*.interactive && os::getenv("NO_COLOR".data) == null
+    make safe_title = progress_input(title, 63)
+    save_text(state, state.*.title.pin, safe_title.pin, 63)
+    state.*.started = progress_now()
+}
+
+@pub @unsafe @export "quip_progress_target"
+make progress_target (path: ptr<str>) -> void {
+    make state = quip_progress_state()
+    make safe_path = progress_input(path, 511)
+    save_text(state, state.*.target.pin, safe_path.pin, 511)
+
+    if state.*.enabled && !state.*.interactive && state.*.target.len() > 0 {
+        make line = "  Compiling " + state.*.target + "\n"
+        progress_text(line.pin)
+    }
+}
+
+@pub @unsafe @export "quip_progress_phase"
+make progress_phase (phase: ptr<str>, done: uint, total: uint, detail: ptr<str>) -> void {
+    make state = quip_progress_state()
+
+    if !state.*.enabled { return }
+
+    make label = progress_input(phase, 63)
+    make path = progress_input(detail, 511)
+    make file_phases = file_phase_count(label.pin)
+
+    if total > 0 && (file_phases > 0 || label == "Lower") {
+        state.*.file_index = done + 1
+        state.*.file_total = total
+    }
+
+    if file_phases > 0 {
+        save_text(state, state.*.file_path.pin, path.pin, 511)
+        state.*.file_phase_count = file_phases
+        state.*.file_open = true
+    }
+
+    if state.*.interactive {
+        state.*.file_open = file_phases > 0
+        progress_panel(state, file_phases, label.pin, path.pin, false)
+    } elif file_phases == 0 {
+        make lower = label == "Lower"
+        make repeated = label == state.*.last_phase && ((lower && !state.*.verbose) || path == state.*.last_detail)
+
+        if !repeated {
+            make line = ""
+
+            if lower && !state.*.verbose { line = "  Prepare declarations\n" }
+            else {
+                line = "  " + label
+
+                if path.len() > 0 { line.push("  ") line.push(path !) }
+
+                line.push('\n')
+            }
+
+            progress_text(line.pin)
+        }
+    }
+
+    save_text(state, state.*.last_phase.pin, label.pin, 63)
+    save_text(state, state.*.last_detail.pin, path.pin, 511)
+}
+
+// Buffer non-interactive file phases until the result is known.
+@unsafe
+make progress_file_result (state: ptr<Progress>, failed: bool) -> void {
+    make title = file_heading(state.*.file_path.pin, state.*.file_index, state.*.file_total)
+    title.push('\n')
+    progress_text(title.pin)
+
+    make i: uint = 0
+    while i < state.*.file_phase_count {
+        make line = "  |- " + progress_phase_name(i) + "\n"
+        progress_text(line.pin)
+        i = i + 1
+    }
+
+    make result: str = "Compiled"
+
+    if failed { result = "Failed" }
+
+    make line = "  `- " + result + "\n"
+    progress_text(line.pin)
+}
+
+@pub @unsafe @export "quip_progress_unit"
+make progress_unit () -> void {
+    make state = quip_progress_state()
+    state.*.compiled = state.*.compiled + 1
+
+    if state.*.enabled && state.*.file_open {
+        if state.*.interactive {
+            make label = progress_phase_name(state.*.file_phase_count - 1)
+            progress_panel(state, state.*.file_phase_count, label.pin, state.*.file_path.pin, true)
+        } else {
+            progress_file_result(state, false)
+        }
+
+        state.*.file_open = false
+    }
+}
+
+@pub @unsafe @export "quip_progress_finish"
+make progress_finish (success: int) -> void {
+    make state = quip_progress_state()
+    progress_clear()
+
+    if state.*.file_open && !state.*.interactive {
+        progress_file_result(state, success == 0)
+        state.*.file_open = false
+    }
+
+    if !state.*.enabled { reset_text(state) return }
+
+    make status: str = "FAIL"
+    make result: str = "failed"
+    make color = ansi("[31m")
+
+    if success != 0 { status = "OK" result = "succeeded" color = ansi("[32m") }
+
+    if state.*.interactive { status = "✗"
+
+        if success != 0 { status = "✓" }
+    }
+
+    make line = status + " " + state.*.title + " " + result
+
+    if state.*.color { line = color + line + ansi("[0m") }
+
+    if state.*.target.len() > 0 { line = line + " (" + state.*.target + ")" }
+
+    line = line + " in " + progress_elapsed(state)
+
+    if state.*.title == "Compile" { line = line + " | " + progress_number(state.*.compiled) + " compiled" }
+
+    line.push('\n')
+    progress_text(line.pin)
+    state.*.enabled = false
+    state.*.color = false
+    reset_text(state)
+}
+
+@pub @unsafe @export "quip_progress_message"
+make progress_message (message: ptr<str>, level: int) -> void {
+    make state = quip_progress_state()
+
+    if level == 0 && !state.*.enabled { return }
+
+    progress_clear()
+
+    make prefix: str = "  debug: "
+
+    if level == 1 { prefix = "error: " }
+    elif level == 0 {
+        prefix = "info: "
+        if state.*.interactive { prefix = "ℹ " }
+    } elif state.*.interactive { prefix = "  › " }
+
+    if state.*.color {
+        make color = ansi("[2m")
+        if level == 1 { color = ansi("[31m") }
+        progress_text(color.pin)
+    }
+
+    progress_text(prefix.pin)
+    progress_write(2, message.*.data, message.*.length)
+
+    if state.*.color {
+        make reset = ansi("[0m")
+        progress_text(reset.pin)
+    }
+
+    make newline: str = "\n"
+    progress_text(newline.pin)
+}
+
+make type PollStorage {
+    make stdout: uint
+    make stderr: uint
+}
+
+@pub @unsafe @export "quip_progress_run"
+make progress_run (name: ptr<str>, args: ptr<process::Arguments>) -> int {
+    make state = quip_progress_state()
+
+    if !state.*.panel_visible { return process::process_run(name, args, -1, -1, -1) }
+
+    make stdout_pipe: uint = 0
+    make stderr_pipe: uint = 0
+    @unsafe make stdout_fds: ptr<i32> = stdout_pipe.pin
+    @unsafe make stderr_fds: ptr<i32> = stderr_pipe.pin
+
+    if os::pipe(stdout_fds) != 0 { return -1 }
+
+    if os::pipe(stderr_fds) != 0 {
+        os::close(stdout_fds[0])
+        os::close(stdout_fds[1])
+        return -1
+    }
+
+    os::fcntl(stdout_fds[0], os::F_SETFD, os::FD_CLOEXEC)
+    os::fcntl(stdout_fds[1], os::F_SETFD, os::FD_CLOEXEC)
+    os::fcntl(stderr_fds[0], os::F_SETFD, os::FD_CLOEXEC)
+    os::fcntl(stderr_fds[1], os::F_SETFD, os::FD_CLOEXEC)
+    make pid = process::process_spawn(name, args, -1, stdout_fds[1], stderr_fds[1])
+    os::close(stdout_fds[1])
+    os::close(stderr_fds[1])
+    // Each pollfd contains an i32 descriptor followed by two 16-bit event masks.
+    make streams: PollStorage = .{}
+    @unsafe make raw: ptr<i32> = streams.pin
+    raw[0] = stdout_fds[0]
+    raw[2] = stderr_fds[0]
+    @unsafe make events: ptr<u16> = raw
+    make poll_in: u16 = 1
+    events[2] = poll_in
+    events[6] = poll_in
+    make remaining: uint = 2
+
+    if pid < 0 { remaining = 0 }
+
+    make buffer: str = ""
+    buffer.reserve(4096) catch { remaining = 0 }
+
+    while remaining > 0 {
+        if os::poll(raw, 2, -1) < 0 { make code = time::time_errno()
+
+            if code.* == 4 { continue }
+
+            break
+        }
+
+        make i: uint = 0
+        while i < 2 {
+            make fd_slot = i * 2
+            make ready_slot = i * 4 + 3
+            if raw[fd_slot] >= 0 && events[ready_slot] != 0 {
+                make count = os::read(raw[fd_slot], buffer.data, 4096)
+
+                if count < 0 { make code = time::time_errno()
+
+                    if code.* == 4 { i = i + 1 continue }
+                }
+
+                if count <= 0 {
+                    os::close(raw[fd_slot])
+                    raw[fd_slot] = -1
+                    remaining = remaining - 1
+                } else {
+                    progress_clear()
+                    @unsafe make output: i32 = i + 1
+                    progress_write(output, buffer.data, count)
+                }
+            }
+
+            i = i + 1
+        }
+    }
+
+    if raw[0] >= 0 { os::close(raw[0]) }
+
+    if raw[2] >= 0 { os::close(raw[2]) }
+
+    if pid < 0 { return -1 }
+
+    return process::process_wait(pid)
+}
+
+
+// Progress formatting is self-contained and does not import std::fmt.
+make progress_number (value: uint) -> str {
+    if value == 0 { return "0" }
+
+    make digits: str = "0123456789"
+    make reversed: str = ""
+    make result: str = ""
+    make remaining = value
+
+    while remaining > 0 {
+        reversed.push(digits[remaining % 10])
+        remaining = remaining / 10
+    }
+
+    make index = reversed.len()
+    while index > 0 { index = index - 1 result.push(reversed[index]) }
+
+    return result
+}
+
+@unsafe @external make quip_runtime_string_free (value: ptr<str>) -> void
+@unsafe @external make quip_runtime_memory_persist (buffer: ptr<any>) -> void

@@ -1,5 +1,3 @@
-
-
 @pub
 make range (start: int, end: int, step: int) -> int[] {
     make result: int[] = []

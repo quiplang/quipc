@@ -1,0 +1,107 @@
+// LLVM 22 C API used by the native object backend.
+@unsafe {
+    @pub @external make LLVMContextCreate () -> ptr<any>
+    @pub @external make LLVMContextDispose (context: ptr<any>) -> void
+    @pub @external make LLVMModuleCreateWithNameInContext (name: ptr<char>, context: ptr<any>) -> ptr<any>
+    @pub @external make LLVMSetSourceFileName (module: ptr<any>, name: ptr<char>, length: uint) -> void
+    @pub @external make LLVMDisposeModule (module: ptr<any>) -> void
+    @pub @external make LLVMDisposeMessage (message: ptr<char>) -> void
+
+    @pub @external make LLVMVerifyModule (module: ptr<any>, action: i32, message: ptr<ptr<char>>) -> i32
+
+
+    @pub @external make LLVMPrintModuleToString (module: ptr<any>) -> ptr<char>
+    @pub @external make LLVMGetNamedFunction (module: ptr<any>, name: ptr<char>) -> ptr<any>
+    @pub @external make LLVMGlobalGetValueType (value: ptr<any>) -> ptr<any>
+    @pub @external make LLVMInt32TypeInContext (context: ptr<any>) -> ptr<any>
+    @pub @external make LLVMPointerTypeInContext (context: ptr<any>, address_space: u32) -> ptr<any>
+    @pub @external make LLVMFunctionType (result: ptr<any>, params: ptr<ptr<any>>, count: u32, variadic: i32) -> ptr<any>
+    @pub @external make LLVMAddFunction (module: ptr<any>, name: ptr<char>, signature: ptr<any>) -> ptr<any>
+    @pub @external make LLVMAppendBasicBlockInContext (context: ptr<any>, function: ptr<any>, name: ptr<char>) -> ptr<any>
+    @pub @external make LLVMCreateBuilderInContext (context: ptr<any>) -> ptr<any>
+    @pub @external make LLVMPositionBuilderAtEnd (builder: ptr<any>, block: ptr<any>) -> void
+    @pub @external make LLVMBuildCall2 (builder: ptr<any>, signature: ptr<any>, callee: ptr<any>, args: ptr<ptr<any>>, count: u32, name: ptr<char>) -> ptr<any>
+    @pub @external make LLVMBuildTrunc (builder: ptr<any>, value: ptr<any>, ty: ptr<any>, name: ptr<char>) -> ptr<any>
+    @pub @external make LLVMBuildRet (builder: ptr<any>, value: ptr<any>) -> ptr<any>
+    @pub @external make LLVMBuildRetVoid (builder: ptr<any>) -> ptr<any>
+    @pub @external make LLVMDisposeBuilder (builder: ptr<any>) -> void
+
+    @pub @external make LLVMGetParam (function: ptr<any>, index: u32) -> ptr<any>
+    @pub @external make LLVMBuildAlloca (builder: ptr<any>, ty: ptr<any>, name: ptr<char>) -> ptr<any>
+    @pub @external make LLVMBuildLoad2 (builder: ptr<any>, ty: ptr<any>, address: ptr<any>, name: ptr<char>) -> ptr<any>
+    @pub @external make LLVMBuildMemSet (builder: ptr<any>, address: ptr<any>, byte: ptr<any>, size: ptr<any>, alignment: u32) -> ptr<any>
+    @pub @external make LLVMBuildMemMove (builder: ptr<any>, dest: ptr<any>, dest_align: u32, source: ptr<any>, source_align: u32, size: ptr<any>) -> ptr<any>
+    @pub @external make LLVMBuildStore (builder: ptr<any>, value: ptr<any>, address: ptr<any>) -> ptr<any>
+    @pub @external make LLVMSetAlignment (value: ptr<any>, alignment: u32) -> void
+    @pub @external make LLVMBuildBinOp (builder: ptr<any>, opcode: i32, left: ptr<any>, right: ptr<any>, name: ptr<char>) -> ptr<any>
+    @pub @external make LLVMBuildICmp (builder: ptr<any>, predicate: i32, left: ptr<any>, right: ptr<any>, name: ptr<char>) -> ptr<any>
+    @pub @external make LLVMBuildZExt (builder: ptr<any>, value: ptr<any>, ty: ptr<any>, name: ptr<char>) -> ptr<any>
+    @pub @external make LLVMBuildSelect (builder: ptr<any>, condition: ptr<any>, yes: ptr<any>, no: ptr<any>, name: ptr<char>) -> ptr<any>
+    @pub @external make LLVMBuildBr (builder: ptr<any>, target: ptr<any>) -> ptr<any>
+    @pub @external make LLVMBuildCondBr (builder: ptr<any>, cond: ptr<any>, yes: ptr<any>, no: ptr<any>) -> ptr<any>
+    @pub @external make LLVMBuildUnreachable (builder: ptr<any>) -> ptr<any>
+
+    @pub @external make LLVMFloatTypeInContext (context: ptr<any>) -> ptr<any>
+    @pub @external make LLVMDoubleTypeInContext (context: ptr<any>) -> ptr<any>
+    @pub @external make LLVMConstRealOfString (ty: ptr<any>, text: ptr<char>) -> ptr<any>
+    @pub @external make LLVMBuildBitCast (builder: ptr<any>, value: ptr<any>, ty: ptr<any>, name: ptr<char>) -> ptr<any>
+    @pub @external make LLVMBuildFNeg (builder: ptr<any>, value: ptr<any>, name: ptr<char>) -> ptr<any>
+    @pub @external make LLVMBuildFCmp (builder: ptr<any>, predicate: i32, left: ptr<any>, right: ptr<any>, name: ptr<char>) -> ptr<any>
+
+    @pub @external make LLVMVoidTypeInContext (context: ptr<any>) -> ptr<any>
+    @pub @external make LLVMInt1TypeInContext (context: ptr<any>) -> ptr<any>
+    @pub @external make LLVMInt16TypeInContext (context: ptr<any>) -> ptr<any>
+    @pub @external make LLVMGetTypeKind (ty: ptr<any>) -> i32
+    @pub @external make LLVMGetReturnType (signature: ptr<any>) -> ptr<any>
+    @pub @external make LLVMCountParamTypes (signature: ptr<any>) -> u32
+    @pub @external make LLVMBuildIntToPtr (builder: ptr<any>, value: ptr<any>, ty: ptr<any>, name: ptr<char>) -> ptr<any>
+    @pub @external make LLVMBuildFPExt (builder: ptr<any>, value: ptr<any>, ty: ptr<any>, name: ptr<char>) -> ptr<any>
+
+    @pub @external make LLVMInt8TypeInContext (context: ptr<any>) -> ptr<any>
+    @pub @external make LLVMStructTypeInContext (context: ptr<any>, types: ptr<ptr<any>>, count: u32, packed: i32) -> ptr<any>
+    @pub @external make LLVMBuildSExt (builder: ptr<any>, value: ptr<any>, ty: ptr<any>, name: ptr<char>) -> ptr<any>
+    @pub @external make LLVMBuildPtrToInt (builder: ptr<any>, value: ptr<any>, ty: ptr<any>, name: ptr<char>) -> ptr<any>
+    @pub @external make LLVMBuildArrayAlloca (builder: ptr<any>, ty: ptr<any>, count: ptr<any>, name: ptr<char>) -> ptr<any>
+    @pub @external make LLVMBuildGEP2 (builder: ptr<any>, ty: ptr<any>, address: ptr<any>, indices: ptr<ptr<any>>, count: u32, name: ptr<char>) -> ptr<any>
+    @pub @external make LLVMBuildStructGEP2 (builder: ptr<any>, ty: ptr<any>, address: ptr<any>, index: u32, name: ptr<char>) -> ptr<any>
+
+    @pub @external make LLVMInt64TypeInContext (context: ptr<any>) -> ptr<any>
+    @pub @external make LLVMConstInt (ty: ptr<any>, value: uint, sign_extend: i32) -> ptr<any>
+    @pub @external make LLVMConstStringInContext2 (context: ptr<any>, text: ptr<char>, length: uint, no_terminator: i32) -> ptr<any>
+    @pub @external make LLVMSetUnnamedAddress (global: ptr<any>, kind: i32) -> void
+    @pub @external make LLVMConstNull (ty: ptr<any>) -> ptr<any>
+    @pub @external make LLVMConstStructInContext (context: ptr<any>, values: ptr<ptr<any>>, count: u32, packed: i32) -> ptr<any>
+    @pub @external make LLVMArrayType2 (element: ptr<any>, count: uint) -> ptr<any>
+    @pub @external make LLVMConstArray2 (element: ptr<any>, values: ptr<ptr<any>>, count: uint) -> ptr<any>
+    @pub @external make LLVMGetNamedGlobal (module: ptr<any>, name: ptr<char>) -> ptr<any>
+    @pub @external make LLVMAddGlobal (module: ptr<any>, ty: ptr<any>, name: ptr<char>) -> ptr<any>
+    @pub @external make LLVMTypeOf (value: ptr<any>) -> ptr<any>
+    @pub @external make LLVMSetInitializer (global: ptr<any>, value: ptr<any>) -> void
+    @pub @external make LLVMSetGlobalConstant (global: ptr<any>, constant: i32) -> void
+    @pub @external make LLVMSetLinkage (global: ptr<any>, linkage: i32) -> void
+
+    @pub @external make LLVMInitializeAArch64TargetInfo () -> void
+    @pub @external make LLVMInitializeAArch64Target () -> void
+    @pub @external make LLVMInitializeAArch64TargetMC () -> void
+    @pub @external make LLVMInitializeAArch64AsmPrinter () -> void
+    @pub @external make LLVMInitializeX86TargetInfo () -> void
+    @pub @external make LLVMInitializeX86Target () -> void
+    @pub @external make LLVMInitializeX86TargetMC () -> void
+    @pub @external make LLVMInitializeX86AsmPrinter () -> void
+
+    @pub @external make LLVMGetDefaultTargetTriple () -> ptr<char>
+    @pub @external make LLVMGetTargetFromTriple (triple: ptr<char>, target: ptr<ptr<any>>, message: ptr<ptr<char>>) -> i32
+    @pub @external make LLVMSetTarget (module: ptr<any>, triple: ptr<char>) -> void
+    @pub @external make LLVMCreateTargetMachine (target: ptr<any>, triple: ptr<char>, cpu: ptr<char>, features: ptr<char>, level: i32, reloc: i32, model: i32) -> ptr<any>
+    @pub @external make LLVMDisposeTargetMachine (machine: ptr<any>) -> void
+    @pub @external make LLVMCreateTargetDataLayout (machine: ptr<any>) -> ptr<any>
+    @pub @external make LLVMSetModuleDataLayout (module: ptr<any>, layout: ptr<any>) -> void
+    @pub @external make LLVMDisposeTargetData (layout: ptr<any>) -> void
+    @pub @external make LLVMTargetMachineEmitToFile (machine: ptr<any>, module: ptr<any>, path: ptr<char>, kind: i32, message: ptr<ptr<char>>) -> i32
+
+    @pub @external make LLVMCreatePassBuilderOptions () -> ptr<any>
+    @pub @external make LLVMDisposePassBuilderOptions (options: ptr<any>) -> void
+    @pub @external make LLVMRunPasses (module: ptr<any>, passes: ptr<char>, machine: ptr<any>, options: ptr<any>) -> ptr<any>
+    @pub @external make LLVMGetErrorMessage (err: ptr<any>) -> ptr<char>
+    @pub @external make LLVMDisposeErrorMessage (message: ptr<char>) -> void
+}

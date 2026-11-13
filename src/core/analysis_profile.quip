@@ -1,0 +1,23 @@
+@pure @const {
+    make std = @import "std"
+}
+
+/// returns a monotonic timestamp, or zero when the clock is unavailable.
+@pub
+make now () -> uint {
+    make instant = std::time::Instant.now() catch { return 0 }
+    return instant.nanoseconds
+}
+
+/// writes an opt-in phase timing to stderr without affecting json output.
+@pub
+make record (enabled: bool, started: uint, phase: str, path: str) -> void {
+    if !enabled || started == 0 { return }
+
+    make finished = now()
+
+    if finished < started { return }
+
+    make line = "quip-profile\t" + phase + "\t" + (finished - started).to_str() + "\t" + path + "\n"
+    @unsafe { std::os::syscall::write(2, line.data, line.len()) }
+}

@@ -108,6 +108,8 @@ make type Checker {
     // type resolved together with a namespace constant/variant
     make resolved_ty: uint = ty::TY_ERROR
 
+    make allows_pure: bool = false
+
     // depth of enclosing `@unsafe` blocks; operations such as `__syscall` require it to be > 0
     make unsafe_depth: uint = 0
 
@@ -293,6 +295,10 @@ make type Checker {
             ci = ci + 1
         }
 
+        this.allows_pure = false
+        for tag : f.*.tags {
+            if tag == "pure" { this.allows_pure = true }
+        }
         this.cur_func_range = f.*.range !
 
         if f.*.has_ret_ty {
@@ -1161,8 +1167,11 @@ make type Checker {
                 if s.*.has_value {
                     make local = body.*.locals[s.*.local].pin
                     make local_type_idx = local.*.ty
+                    make previous_purity = this.allows_pure
+                    this.allows_pure = local.*.is_pure
                     this.check_anonymous_fields(body, s.*.value, declared)
                     make init = this.check_expr(body, s.*.value, UseKind.Copy)
+                    this.allows_pure = previous_purity
                     // Anonymous aggregate literals borrow their identity from
                     // the written local type; TY_ERROR is their old placeholder,
                     // not a failed expression. Do not poison a valid `T = .{}`.
@@ -1205,9 +1214,13 @@ make type Checker {
             }
 
             hir::HirStmtKind.Assign {
+                make previous_purity = this.allows_pure
+                this.mark_assignment_target(body, s.*.target)
                 make place = this.check_expr(body, s.*.target, UseKind.Place)
+                make is_const = this.reject_const_mutation(body, s.*.target)
 
                 if s.*.has_value {
+                    this.allows_pure = this.tagged_place(body, s.*.target, false)
                     this.check_anonymous_fields(body, s.*.value, place)
                     make value = this.check_expr(body, s.*.value, UseKind.Copy)
 
@@ -1217,7 +1230,7 @@ make type Checker {
                         writable = this.writable_place(body, s.*.target)
                     }
 
-                    if this.resolve(place) != ty::TY_ERROR && !writable {
+                    if !is_const && this.resolve(place) != ty::TY_ERROR && !writable {
                         make target = body.*.exprs[s.*.target].pin
                         make diagnostic = diags::Diag.err(e::Err.TypeMismatch, target.*.range !, "assignment requires a writable place")
                         this.diag.*.report(diagnostic)
@@ -1253,6 +1266,7 @@ make type Checker {
                         this.diag.*.report(d)
                     }
                 }
+                this.allows_pure = previous_purity
             }
 
             hir::HirStmtKind.Expr {
@@ -1460,9 +1474,14 @@ make type Checker {
         make id = ty::TY_ERROR
 
         match ex.*.kind {
-            hir::HirExprKind.Literal { id = this.lit_ty(ex.*.lit.pin) }
+            hir::HirExprKind.Literal {
+                this.require_pure(ex.*.requires_pure && !ex.*.is_assignment_target, ex.*.range.copy())
+                id = this.lit_ty(ex.*.lit.pin)
+            }
 
             hir::HirExprKind.Local {
+                ex.*.requires_pure = body.*.locals[ex.*.local].is_pure
+                this.require_pure(ex.*.requires_pure && !ex.*.is_assignment_target, ex.*.range.copy())
                 if ex.*.local < this.out.local_tys.len() {
                     id = this.out.local_tys[ex.*.local]
                 }
@@ -1493,11 +1512,17 @@ make type Checker {
                 make fi = this.symbols.find_func(ex.*.name !)
 
                 if fi < this.module.*.funcs.len() {
+                    this.require_pure_function(this.module.*.funcs[fi].pin, ex.*.range.copy())
                     facts::require_unsafe_local(this.unsafe_depth, this.out.semantic_checks.pin, this.module.*.funcs[fi].pin, ex.*.range.copy())
                     id = this.function_type(fi)
                 } else {
                     for item : this.module.*.items {
-                        if item.name == ex.*.name { facts::require_unsafe(this.unsafe_depth, this.out.semantic_checks.pin, item.is_unsafe, ex.*.range.copy()) }
+                        if item.name == ex.*.name && item.kind == hir::HirItemKind.Global {
+                            ex.*.is_const = item.is_const
+                            ex.*.requires_pure = item.is_pure
+                            this.require_pure(item.is_pure && !ex.*.is_assignment_target, ex.*.range.copy())
+                            facts::require_unsafe(this.unsafe_depth, this.out.semantic_checks.pin, item.is_unsafe, ex.*.range.copy())
+                        }
                     }
 
                     id = this.lookup_item(ex.*.name)
@@ -1530,6 +1555,7 @@ make type Checker {
 
             hir::HirExprKind.Pin {
                 id = this.tys.*.wrap(ty::TyKind.Ref, this.resolve(this.check_expr(body, ex.*.lhs, UseKind.Place)))
+                this.reject_const_mutation(body, ex.*.lhs)
             }
 
             hir::HirExprKind.Copy {
@@ -1561,7 +1587,12 @@ make type Checker {
 
                         if nsi < this.namespaces.*.len() {
                             for exported : this.namespaces.*[nsi].exports {
-                                if exported.name == ex.*.name { facts::require_unsafe(this.unsafe_depth, this.out.semantic_checks.pin, exported.is_unsafe, ex.*.range.copy()) }
+                                if exported.name == ex.*.name && !exported.is_unit && !exported.is_type {
+                                    ex.*.is_const = exported.is_const
+                                    ex.*.requires_pure = exported.is_pure
+                                    this.require_pure(exported.is_pure && !ex.*.is_assignment_target, ex.*.range.copy())
+                                    facts::require_unsafe(this.unsafe_depth, this.out.semantic_checks.pin, exported.is_unsafe, ex.*.range.copy())
+                                }
                             }
                         }
 
@@ -1605,7 +1636,7 @@ make type Checker {
                         if base == ty::TY_ERROR || this.require_deref(body, ex.*.lhs, base) {
                             id = ty::TY_ERROR
                         } else {
-                            id = this.check_field(base, ex.*.name !, range)
+                            id = this.check_field(base, ex, range)
                         }
 
                         this.note_use(idx, id, how)
@@ -1889,6 +1920,64 @@ make type Checker {
     }
 
     @this
+    make require_pure (required: bool, range: util::Range) {
+        if required && !this.allows_pure {
+            make d = diags::Diag.err(e::Err.PureRequired, range, "use of an `@pure` declaration requires an `@pure` context")
+            d.help("tag the receiving binding or enclosing function with `@pure`")
+            this.diag.*.report(d)
+        }
+    }
+
+    @this
+    make require_pure_function (function: ref<hir::HirFunc>, range: util::Range) {
+        for tag : function.*.tags {
+            if tag == "pure" {
+                this.require_pure(true, range)
+                return
+            }
+        }
+    }
+
+    // Only the destination and its base are write targets. Index expressions
+    // and calls used to compute the destination still read their operands.
+    @this
+    make mark_assignment_target (body: ref<hir::HirBody>, index: uint) {
+        make expression = body.*.exprs[index].pin
+        expression.*.is_assignment_target = true
+
+        if expression.*.kind == hir::HirExprKind.Field || expression.*.kind == hir::HirExprKind.Index || expression.*.kind == hir::HirExprKind.Deref {
+            this.mark_assignment_target(body, expression.*.lhs)
+        }
+    }
+
+    @this
+    make tagged_place (body: ref<hir::HirBody>, index: uint, check_const: bool) -> bool {
+        make expression = body.*.exprs[index].pin
+
+        if check_const {
+            if expression.*.is_const { return true }
+            if expression.*.kind == hir::HirExprKind.Local { return body.*.locals[expression.*.local].is_const }
+        } elif expression.*.requires_pure {
+            return true
+        }
+
+        if expression.*.kind == hir::HirExprKind.Field || expression.*.kind == hir::HirExprKind.Index || expression.*.kind == hir::HirExprKind.Deref {
+            return this.tagged_place(body, expression.*.lhs, check_const)
+        }
+
+        return false
+    }
+
+    @this
+    make reject_const_mutation (body: ref<hir::HirBody>, index: uint) -> bool {
+        if !this.tagged_place(body, index, true) { return false }
+
+        make d = diags::Diag.err(e::Err.ConstMutation, body.*.exprs[index].range.copy(), "cannot mutate an `@const` binding")
+        this.diag.*.report(d)
+        return true
+    }
+
+    @this
     make writable_place (body: ref<hir::HirBody>, index: uint) -> bool {
         make expression = body.*.exprs[index].pin
 
@@ -1920,6 +2009,8 @@ make type Checker {
         if result == ty::TY_ERROR {
             return result
         }
+
+        if this.reject_const_mutation(body, expression.*.lhs) { return ty::TY_ERROR }
 
         if !this.writable_place(body, expression.*.lhs) {
             make operand = body.*.exprs[expression.*.lhs].pin
@@ -2357,6 +2448,7 @@ make type Checker {
         }
 
         make f = this.module.*.funcs[found].pin
+        this.require_pure_function(f, cal.*.range.copy())
         facts::require_unsafe_local(this.unsafe_depth, this.out.semantic_checks.pin, f, cal.*.range.copy())
         make params = f.*.body.param_count
 
@@ -2520,6 +2612,7 @@ make type Checker {
             return ty::TY_ERROR
         }
 
+        this.require_pure(ns.*.exports[exported].is_pure, cal.*.range.copy())
         make fsi = this.symbols.find_func_sig(ns.*.module_name, member.copy())
         make has_sig = fsi < this.funcs.*.len()
 
@@ -2816,6 +2909,7 @@ make type Checker {
             sym = "len"
             ret = ty::TY_UINT
         } elif method == "push" {
+            this.reject_const_mutation(body, cal.*.lhs)
             want_args = 1
 
             if is_str {
@@ -2848,6 +2942,7 @@ make type Checker {
                 }
             }
         } elif method == "pop" && is_arr {
+            this.reject_const_mutation(body, cal.*.lhs)
             sym = "arr.pop"
             ret = this.tys.*.elem_of(recv_ty)
         } else {
@@ -2873,9 +2968,12 @@ make type Checker {
     make resolve_local_attached (body: ref<hir::HirBody>, idx: uint, ex: ref<hir::HirExpr>, found: uint) -> uint {
         make m = this.module.*.attached_funcs[found].pin
         make f = this.module.*.funcs[m.*.func].pin
+        this.require_pure_function(f, body.*.exprs[ex.*.lhs].range.copy())
         facts::require_unsafe_local(this.unsafe_depth, this.out.semantic_checks.pin, f, body.*.exprs[ex.*.lhs].range.copy())
         make params = f.*.body.param_count
         make has_this = f.*.has_this
+
+        if has_this { this.reject_const_mutation(body, body.*.exprs[ex.*.lhs].lhs) }
 
         make expect_n = params
 
@@ -2938,11 +3036,13 @@ make type Checker {
     @this
     make resolve_sig_attached (body: ref<hir::HirBody>, idx: uint, ex: ref<hir::HirExpr>, sfound: uint) -> uint {
         make sig = this.sigs.*[sfound].pin
+        this.require_pure(sig.*.is_pure, body.*.exprs[ex.*.lhs].range.copy())
         facts::require_unsafe_origin(this.unsafe_depth, this.out.semantic_checks.pin, sig.*.is_unsafe, body.*.exprs[ex.*.lhs].range.copy(), sig.*.path.copy(), sig.*.source, sig.*.name_span.copy())
 
         make expect_n = sig.*.param_count
 
         if sig.*.has_this && expect_n > 0 {
+            this.reject_const_mutation(body, body.*.exprs[ex.*.lhs].lhs)
             expect_n = expect_n - 1
         }
 
@@ -3213,11 +3313,12 @@ make type Checker {
     // type but does not declare the field. an unknown/inferred receiver stays an inference
     // variable so namespaced and imported receivers keep type-checking permissively.
     @this
-    make check_field (base: uint, name: str, range: util::Range) -> uint {
+    make check_field (base: uint, expression: ref<hir::HirExpr>, range: util::Range) -> uint {
+        make name = expression.*.name !
         make rk = this.tys.*.kind_of(base)
 
         if rk == ty::TyKind.Ref || rk == ty::TyKind.Ptr || rk == ty::TyKind.Owned {
-            return this.check_field(this.tys.*.elem_of(base), name, range)
+            return this.check_field(this.tys.*.elem_of(base), expression, range)
         }
 
         // Built-in string descriptors are { data, length, capacity }, three
@@ -3255,6 +3356,9 @@ make type Checker {
                     make sf = ss.*.fields[sfi].pin
 
                     if sf.*.name == name {
+                        expression.*.is_const = sf.*.is_const
+                        expression.*.requires_pure = sf.*.is_pure
+                        this.require_pure(sf.*.is_pure && !expression.*.is_assignment_target, range.copy())
                         facts::require_unsafe_field(this.unsafe_depth, this.out.semantic_checks.pin, this.structs, sf.*.is_unsafe, range.copy(), tname.copy(), name.copy())
                         facts::record_field_access(this.out.semantic_checks.pin, tname.copy(), name.copy(), range.copy())
 
@@ -3284,6 +3388,9 @@ make type Checker {
             make f = s.*.fields[fi].pin
 
             if f.*.name == name {
+                expression.*.is_const = f.*.is_const
+                expression.*.requires_pure = f.*.is_pure
+                this.require_pure(f.*.is_pure && !expression.*.is_assignment_target, range.copy())
                 facts::require_unsafe_field(this.unsafe_depth, this.out.semantic_checks.pin, this.structs, f.*.is_unsafe, range.copy(), tname.copy(), name.copy())
 
                 if f.*.has_ty {

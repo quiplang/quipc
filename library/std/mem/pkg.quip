@@ -2,7 +2,7 @@
     make heap: unit = @import "./heap.quip"
 }
 
-@pub @const @global_allocator @default_allocator {
+@pub @global_allocator @default_allocator {
     make debug: heap::Heap = heap::Heap.init()
 }
 

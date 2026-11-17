@@ -153,8 +153,15 @@ make collect_const (node: ptr<ast::AST_Head>, consts: ref<hir::HirConst[]>) {
             make before = consts.*.len()
             collect_const_val(ev, consts)
 
-            if node_has_tag(node, "unsafe") {
-                while before < consts.*.len() { consts.*[before].is_unsafe = true before = before + 1 }
+            make is_unsafe = node_has_tag(node, "unsafe")
+            make is_const = node_has_tag(node, "const")
+            make is_pure = node_has_compile_time_tag(node)
+
+            while before < consts.*.len() {
+                consts.*[before].is_unsafe = is_unsafe
+                consts.*[before].is_const = is_const
+                consts.*[before].is_pure = is_pure
+                before = before + 1
             }
         }
         none {}
@@ -370,6 +377,8 @@ make lower (program: ref<owned<ast::AST_Head>[]>, os: str, diagnostics: ref<diag
                 }
 
                 make gi = named_item(hir::HirItemKind.Global, v.*.name.lexeme !, node.*.range !)
+                gi.is_const = node_has_tag(node, "const")
+                gi.is_pure = node_has_compile_time_tag(node)
                 gi.is_unsafe = node_has_tag(node, "unsafe")
                 gi.is_global_allocator = node_has_tag(node, "global_allocator")
                 gi.is_default_allocator = node_has_tag(node, "default_allocator")
@@ -377,6 +386,7 @@ make lower (program: ref<owned<ast::AST_Head>[]>, os: str, diagnostics: ref<diag
                 if gi.is_global_allocator && v.*.sig_type != none && v.*.val != none {
                     make init = hir::HirFunc {}
 
+                    if gi.is_pure { init.tags.push("pure") }
                     init.name = "__quip_global_init_" + gi.name.copy()
                     init.range = node.*.range !
                     make lw = Lowerer.create(init.body.pin, os.copy(), module.enums.pin, module.consts.pin, diagnostics, module.funcs.pin)
@@ -540,6 +550,8 @@ make lower_struct (module: ref<hir::HirModule>, program: ref<owned<ast::AST_Head
 
                 make field = hir::HirField {}
 
+                field.is_const = node_has_tag(stmt, "const")
+                field.is_pure = node_has_compile_time_tag(stmt)
                 field.is_unsafe = node_has_tag(stmt, "unsafe")
                 field.name = fv.*.name.lexeme !
                 field.name_span = fv.*.name.span.copy()
@@ -560,6 +572,7 @@ make lower_struct (module: ref<hir::HirModule>, program: ref<owned<ast::AST_Head
                     if hs.body.exprs[field.default].kind != hir::HirExprKind.Literal {
                         make init = hir::HirFunc {}
 
+                        if field.is_pure { init.tags.push("pure") }
                         init.name = mangle::attached_name(owner.copy(), "__quip_default_" + field.name.copy())
                         init.is_attached = true
                         init.range = stmt.*.range.copy()
@@ -1796,6 +1809,8 @@ make type ReturnInfo {
 
         make local = hir::HirLocal {}
 
+        local.is_const = node_has_tag(h, "const")
+        local.is_pure = node_has_compile_time_tag(h)
         local.name = v.*.name.lexeme !
         local.name_span = v.*.name.span.copy()
         local.range = h.*.range !
@@ -2323,6 +2338,8 @@ make type ReturnInfo {
                         if this.consts.*[ci].has_lit && this.consts.*[ci].name == e.*.literal.lexeme {
                             out.kind = hir::HirExprKind.Literal
                             out.lit = this.consts.*[ci].lit !
+                            out.is_const = this.consts.*[ci].is_const
+                            out.requires_pure = this.consts.*[ci].is_pure
                             out.requires_unsafe = this.consts.*[ci].is_unsafe
                             const_found = true
                         }

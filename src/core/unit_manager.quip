@@ -780,6 +780,8 @@ make exports_of (program: ref<owned<ast::AST_Head>[]>) -> hir::HirExport[] {
         @unsafe make node: ptr<ast::AST_Head> = program.*[i].*.pin
 
         make before = out.len()
+        make is_const = false
+        make is_pure = false
         make is_unsafe = false
         make is_pub = false
         make is_external = false
@@ -788,7 +790,8 @@ make exports_of (program: ref<owned<ast::AST_Head>[]>) -> hir::HirExport[] {
         while ti < node.*.tags.len() {
             @unsafe make tag: ptr<ast::AST_Tag> = node.*.tags[ti].*.pin
 
-
+            if tag.*.name.lexeme == "const" { is_const = true }
+            if tag.*.name.lexeme == "pure" { is_pure = true }
             if tag.*.name.lexeme == "unsafe" { is_unsafe = true }
 
             if tag.*.name.lexeme == "pub" {
@@ -919,8 +922,11 @@ make exports_of (program: ref<owned<ast::AST_Head>[]>) -> hir::HirExport[] {
             }
         }
 
-        if is_unsafe {
-            while before < out.len() { out[before].is_unsafe = true before = before + 1 }
+        while before < out.len() {
+            out[before].is_const = is_const
+            out[before].is_pure = is_pure
+            out[before].is_unsafe = is_unsafe
+            before = before + 1
         }
 
         i = i + 1
@@ -1444,6 +1450,7 @@ make collect_sigs_into (out: ref<hir::HirAttachedSig[]>, module: ref<hir::HirMod
             sig.has_this = f.*.has_this
 
             for tag : f.*.tags {
+                if tag == "pure" { sig.is_pure = true }
                 if tag == "unsafe" { sig.is_unsafe = true }
             }
 
@@ -1556,6 +1563,8 @@ make collect_struct_sigs_into (out: ref<hir::HirStructSig[]>, module: ref<hir::H
 
                 fs.name_span = hf.*.name_span.copy()
                 fs.is_pub = hf.*.is_pub
+                fs.is_const = hf.*.is_const
+                fs.is_pure = hf.*.is_pure
                 fs.is_unsafe = hf.*.is_unsafe
                 fs.name = hf.*.name !
                 fs.default_init = hf.*.default_init.copy()
@@ -1582,6 +1591,8 @@ make collect_struct_sigs_into (out: ref<hir::HirStructSig[]>, module: ref<hir::H
                 fs.name_span = hf.*.name_span.copy()
                 fs.name = hf.*.name.copy()
                 fs.is_pub = hf.*.is_pub
+                fs.is_const = hf.*.is_const
+                fs.is_pure = hf.*.is_pure
                 fs.is_unsafe = hf.*.is_unsafe
                 sig.fields.push(fs)
             }

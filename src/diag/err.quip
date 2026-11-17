@@ -28,6 +28,8 @@ make enum Err {
     UnsafeRequired,
     PrivateField,
     UnknownSymbol,
+    ConstMutation,
+    PureRequired,
 
     // memory
     RefOutlivesSource,
@@ -93,6 +95,10 @@ make err_code (code: Err) -> str {
         Err.PrivateField { return "E1012" }
 
         Err.UnknownSymbol { return "E1013" }
+
+        Err.ConstMutation { return "E1015" }
+
+        Err.PureRequired { return "E1016" }
 
         // memory 2000+
         Err.RefOutlivesSource { return "E2000" }

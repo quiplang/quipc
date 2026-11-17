@@ -74,6 +74,9 @@ make type HirCase {
 /// represents an expression in a hir body.
 @pub
 make type HirExpr {
+    @pub make is_const: bool = false
+    @pub make requires_pure: bool = false
+    @pub make is_assignment_target: bool = false
     @pub make requires_unsafe: bool = false
     @pub make kind: HirExprKind = HirExprKind.Error
     @pub make range: util::Range = .{}
@@ -176,6 +179,8 @@ make type HirType {
 /// describes a local variable in a hir body.
 @pub
 make type HirLocal {
+    @pub make is_const: bool = false
+    @pub make is_pure: bool = false
     @pub make name_span: util::Span = .{}
     @pub make scope_body: bool = false
     @pub make hint_offset: uint = 0    // end of an unannotated source binding's identifier
@@ -258,6 +263,7 @@ make type HirTypeAlias {
 // top-level declaration, functions keep their body in HirModule.funcs
 @pub
 make type HirItem {
+    @pub make is_const: bool = false
     @pub make is_unsafe: bool = false
     @pub make kind: HirItemKind = HirItemKind.Func
     @pub make name: str = ""
@@ -300,6 +306,7 @@ make type HirTypeSig {
 // module can resolve (and validate) attached calls on types declared in its dependencies.
 @pub
 make type HirAttachedSig {
+    @pub make is_pure: bool = false
     @pub make path: str = ""
     @pub make source: ref<str>? = none
     @pub make name_span: util::Span = .{}
@@ -320,6 +327,8 @@ make type HirAttachedSig {
 // a field of an imported struct, carrying the same portable type shape as attached returns
 @pub
 make type HirFieldSig {
+    @pub make is_const: bool = false
+    @pub make is_pure: bool = false
     @pub make name_span: util::Span = .{}
     @pub make is_unsafe: bool = false
     @pub make is_pub: bool = false
@@ -376,6 +385,8 @@ make type HirEnum {
 // owning struct's `body` arena, just like a function's parameters and body do
 @pub
 make type HirField {
+    @pub make is_const: bool = false
+    @pub make is_pure: bool = false
     @pub make is_unsafe: bool = false
     @pub make name_span: util::Span = .{}
     @pub make name: str = ""
@@ -436,6 +447,8 @@ make type HirModule {
 // a top-level `make Name: T = <literal>` constant, inlined at its uses
 @pub
 make type HirConst {
+    @pub make is_const: bool = false
+    @pub make is_pure: bool = false
     @pub make is_unsafe: bool = false
     @pub make name: str = ""
     @pub make lit: lexer::Token = .{}
@@ -445,6 +458,8 @@ make type HirConst {
 // a `@pub` symbol exported by a module, as seen by the modules that import it
 @pub
 make type HirExport {
+    @pub make is_const: bool = false
+    @pub make is_pure: bool = false
     @pub make is_unsafe: bool = false
     @pub make global_type: str = ""
     @pub make global_type_namespace: str = ""

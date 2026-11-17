@@ -22,7 +22,7 @@
     make STDERR: int = 2
 }
 
-@pub @pure @const {
+@pub @const {
     make MODE_FILE: int = 420           // rw-r--r-- 0o644
     make MODE_FILE_PRIVATE: int = 384   // rw------- 0o600
 

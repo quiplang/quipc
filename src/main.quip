@@ -51,7 +51,7 @@ make proceed (argv: ptr<char>[]) -> int {
         }
 
         core::config::CommandKind.Compile {
-            make visible = driver.config.progress && !driver.config.emit_llvm && !driver.config.emit_mir && !driver.config.emit_mem
+            make visible = driver.config.options.progress_enabled && !driver.config.emit_llvm && !driver.config.emit_mir && !driver.config.emit_mem
             std::progress::begin("Compile", visible, driver.config.options.show_quipc_debug)
             driver.compile() catch err {
                 std::progress::clear()
@@ -88,7 +88,7 @@ make proceed (argv: ptr<char>[]) -> int {
         }
 
         core::config::CommandKind.Build {
-            std::progress::begin("Build", driver.config.progress, driver.config.options.show_quipc_debug)
+            std::progress::begin("Build", driver.config.options.progress_enabled, driver.config.options.show_quipc_debug)
             driver.build() catch err {
                 std::progress::clear()
 
@@ -111,7 +111,7 @@ make proceed (argv: ptr<char>[]) -> int {
         }
 
         core::config::CommandKind.Run {
-            std::progress::begin("Compile", driver.config.progress, driver.config.options.show_quipc_debug)
+            std::progress::begin("Compile", driver.config.options.progress_enabled, driver.config.options.show_quipc_debug)
             make code = driver.run() catch err {
                 std::progress::clear()
                 match err { error.FileNotFound { std::io::println("unable to locate the run input or executable") } _ {} }
@@ -158,6 +158,7 @@ make print_help () -> void {
     std::io::println("  --keep-llvm                             Retain intermediate LLVM IR files")
     std::io::println("")
     std::io::println("Diagnostic options:")
+    std::io::println("  --benchmark                             Report compile-time hotspots for compile or build")
     std::io::println("  --hide-warnings                         Hide warnings")
     std::io::println("  --emit-mir                              Print MIR and stop")
     std::io::println("  --emit-mem                              Print memory analysis and stop")

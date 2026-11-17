@@ -85,7 +85,6 @@ make type Unit {
         make llvm_ll: str = ""         // path for the .ll output; set by the Driver
         make keep_llvm: bool = false
         make verbose: bool = false
-        make profile_analysis: bool = false
         make llvm_optimization: str = "-O0"
         make llvm_out: str = ""        // path for the .o output; set by the Driver
         make entry_name: str = "main"  // entry point function; set by the Driver
@@ -117,7 +116,6 @@ make type Unit {
         make u = Unit {}
 
         u.id = id
-        u.profile_analysis = std::os::getenv("QUIPC_PROFILE_ANALYSIS") == "1"
         u.diag = diags::Diagnostic.init()
 
         u.diag.hide_warnings = hide_warnings
@@ -149,12 +147,12 @@ make type Unit {
 
     /// tokenizes and parses this unit, collecting imports after a successful parse.
     @pub @this
-    make parse_self () -> !void {
+    make parse_self (timings: ref<profile::Profile>) -> !void {
         this.status = UnitStatus.Lexing
         make failure_offset: uint = 0
         make started: uint = 0
 
-        if this.profile_analysis { started = profile::now() }
+        if timings.*.enabled { started = profile::now() }
 
         this.tokens = lexer::tokenize_at(this.content, failure_offset.pin) catch err {
             this.status = UnitStatus.Aborted
@@ -193,15 +191,15 @@ make type Unit {
             return error.CompilationAborted
         }
 
-        if this.profile_analysis { profile::record(true, started, "lex", this.path_rel.get()) }
+        if timings.*.enabled { timings.*.record(started, "lex", this.path_rel.get()) }
 
-        if this.profile_analysis { started = profile::now() }
+        if timings.*.enabled { started = profile::now() }
 
         make p = parser::Parser.init(this.tokens.pin)
         this.status = UnitStatus.Parsing
         this.program = p.proceed(this)
 
-        if this.profile_analysis { profile::record(true, started, "parse", this.path_rel.get()) }
+        if timings.*.enabled { timings.*.record(started, "parse", this.path_rel.get()) }
 
         if this.diag.is_aborting() || this.diag.has_errors() {
             this.status = UnitStatus.Aborted
@@ -221,23 +219,23 @@ make type Unit {
     // checking begins.
     /// lowers this unit to hir and validates its declarations and entry point.
     @pub @this
-    make lower () -> !void {
+    make lower (timings: ref<profile::Profile>) -> !void {
         // translate to HIR (honouring @target / @weak groups for the selected platform)
         make started: uint = 0
 
-        if this.profile_analysis { started = profile::now() }
+        if timings.*.enabled { started = profile::now() }
 
         this.hir_module = hir_lower::lower(this.program.pin, this.platform_name, this.diag.pin)
 
-        if this.profile_analysis { profile::record(true, started, "hir", this.path_rel.get()) }
+        if timings.*.enabled { timings.*.record(started, "hir", this.path_rel.get()) }
 
-        if this.profile_analysis { started = profile::now() }
+        if timings.*.enabled { started = profile::now() }
 
         // resolve symbols and reject duplicate declarations before anything consumes the module
         this.symbols = symcheck::check(this.hir_module.pin, this.diag.pin)
         semantics::check_module(this.hir_module.pin, this.diag.pin)
 
-        if this.profile_analysis { profile::record(true, started, "symbols", this.path_rel.get()) }
+        if timings.*.enabled { timings.*.record(started, "symbols", this.path_rel.get()) }
 
         if this.diag.is_aborting() || this.diag.has_errors() {
             this.status = UnitStatus.Aborted
@@ -298,7 +296,7 @@ make type Unit {
 
     /// type-checks, lowers to mir, checks memory, and optionally emits llvm for this unit.
     @pub @this
-    make analyze (sigs: ref<hir::HirAttachedSig[]>, structs: ref<hir::HirStructSig[]>, funcs: ref<hir::HirFuncSig[]>) -> !void {
+    make analyze (sigs: ref<hir::HirAttachedSig[]>, structs: ref<hir::HirStructSig[]>, funcs: ref<hir::HirFuncSig[]>, timings: ref<profile::Profile>) -> !void {
         this.status = UnitStatus.Checking
         semantics::check_array_copies(this.hir_module.pin, sigs, this.diag.pin)
 
@@ -311,17 +309,19 @@ make type Unit {
 
         make started: uint = 0
 
-        if this.profile_analysis { started = profile::now() }
+        if timings.*.enabled { started = profile::now() }
 
         this.checked = typeck::check(this.hir_module.pin, this.hir_imports.pin, this.hir_namespaces.pin, sigs, structs, funcs, this.tys.pin, this.diag.pin)
 
-        if this.profile_analysis { profile::record(true, started, "type", this.path_rel.get()) }
+        if timings.*.enabled { timings.*.record(started, "type", this.path_rel.get()) }
 
         if this.diag.is_aborting() {
             this.status = UnitStatus.Aborted
 
             return error.CompilationAborted
         }
+
+        if timings.*.enabled { started = profile::now() }
 
         // Array-copy return types are resolved by type checking and validated here.
         make copy_index: uint = 0
@@ -350,20 +350,24 @@ make type Unit {
             return error.CompilationAborted
         }
 
+        if timings.*.enabled { timings.*.record(started, "typed_semantics", this.path_rel.get()) }
+
         std::progress::phase("Lower MIR", 0, 0, this.path_rel.get())
 
         // translate to MIR
-        if this.profile_analysis { started = profile::now() }
+        if timings.*.enabled { started = profile::now() }
 
         this.mir_module = mir_build::build(this.hir_module.pin, this.checked.pin, this.tys.pin, structs, sigs)
 
-        if this.profile_analysis { profile::record(true, started, "mir", this.path_rel.get()) }
+        if timings.*.enabled { timings.*.record(started, "mir", this.path_rel.get()) }
 
         if this.emit_mir {
             mir_dump::print(this.mir_module.pin)
         }
 
         std::progress::phase("Memory check", 0, 0, this.path_rel.get())
+
+        if timings.*.enabled { started = profile::now() }
 
         // memory-rule validation
         make memory_index: uint = 0
@@ -382,15 +386,13 @@ make type Unit {
             memory_index = memory_index + 1
         }
 
-        if this.profile_analysis { started = profile::now() }
-
         this.status = UnitStatus.MemAnalysis
         memr::collect(this.hir_module.pin, this.mem_ctx.pin)
         make previous = memr::MemReport {}
         make reuse: bool[] = []
-        this.mem_report = mem::check_cached(this.mir_module.pin, this.diag.pin, this.mem_ctx.pin, this.path_rel.get(), previous.pin, reuse.pin, this.profile_analysis)
+        this.mem_report = mem::check_cached(this.mir_module.pin, this.diag.pin, this.mem_ctx.pin, this.path_rel.get(), previous.pin, reuse.pin, timings)
 
-        if this.profile_analysis { profile::record(true, started, "memory", this.path_rel.get()) }
+        if timings.*.enabled { timings.*.record(started, "memory", this.path_rel.get()) }
 
         if this.emit_mem {
             make show = this.is_main || this.verbose
@@ -426,7 +428,7 @@ make type Unit {
 
             if !llvm::object::compile(this.mir_module.pin, this.mem_report.pin, this.path_rel.get(),
                 this.entry_name !, this.content !, this.platform_name !, this.llvm_out !,
-                this.llvm_optimization !, this.print_llvm, dump_path) {
+                this.llvm_optimization !, this.print_llvm, dump_path, timings) {
                 std::progress::clear()
                 std::io::println("LLVM generation failed for " + this.path_rel.get())
                 return error.CompilationAborted
@@ -442,11 +444,12 @@ make type Unit {
     // lower then analyse a single unit. kept for the dependency-ordered path.
     @pub @this
     make proceed (sigs: ref<hir::HirAttachedSig[]>, structs: ref<hir::HirStructSig[]>, funcs: ref<hir::HirFuncSig[]>) -> !void {
-        this.lower() catch err {
+        make timings = profile::Profile.init(false)
+        this.lower(timings.pin) catch err {
             return err
         }
 
-        this.analyze(sigs, structs, funcs) catch err {
+        this.analyze(sigs, structs, funcs, timings.pin) catch err {
             return err
         }
 
@@ -989,13 +992,13 @@ make type UnitManager {
 
 
     @pub
-    make init (main: std::io::Path, names: str[], paths: std::io::Path[], hide_warnings: bool) -> !UnitManager {
+    make init (main: std::io::Path, names: str[], paths: std::io::Path[], hide_warnings: bool, timings: ref<profile::Profile>) -> !UnitManager {
         make manager = UnitManager {}
         manager.hide_warnings = hide_warnings
         manager.package_names = names
         manager.package_paths = paths
 
-        manager.declare(main) catch err {
+        manager.declare(main, timings) catch err {
             return err
         }
 
@@ -1065,7 +1068,7 @@ make type UnitManager {
     // parses `path` (unless a unit with the same canonical path was already declared) and
     // recursively declares every file it imports; returns the unit's index
     @this
-    make declare (path: std::io::Path) -> !uint {
+    make declare (path: std::io::Path, timings: ref<profile::Profile>) -> !uint {
         make key = sources::canonical(path.get())
 
         match this.find_by_key(key.copy()) {
@@ -1081,7 +1084,7 @@ make type UnitManager {
         u.key = key
         this.units.push(u)
 
-        this.units[id].parse_self() catch err {
+        this.units[id].parse_self(timings) catch err {
             return err
         }
 
@@ -1091,7 +1094,7 @@ make type UnitManager {
 
         while ii < this.units[id].imports.len() {
             make target = this.import_path(this.units[id].path_rel.copy(), this.units[id].imports[ii].path)
-            this.declare(target) catch err {
+            this.declare(target, timings) catch err {
                 return err
             }
 
@@ -1284,12 +1287,13 @@ make type UnitManager {
 
     @pub @this
     make proceed_all () -> !void {
+        make timings = profile::Profile.init(false)
         // lower every unit first so all attached functions are known
         make li: uint = 0
 
         while li < this.compilation_stack.len() {
             make id = this.compilation_stack[li]
-            this.units[id].lower() catch err {
+            this.units[id].lower(timings.pin) catch err {
                 return err
             }
 
@@ -1306,7 +1310,7 @@ make type UnitManager {
         while si < this.compilation_stack.len() {
             make id = this.compilation_stack[si]
             this.units[id].mem_ctx = acc
-            this.units[id].analyze(this.attached_sigs.pin, this.struct_sigs.pin, this.free_sigs.pin) catch err {
+            this.units[id].analyze(this.attached_sigs.pin, this.struct_sigs.pin, this.free_sigs.pin, timings.pin) catch err {
                 return err
             }
 

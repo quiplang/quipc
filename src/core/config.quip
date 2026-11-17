@@ -9,9 +9,11 @@ make native_platform_name () -> str {
     @target "macos" {
         return unix_platform_name()
     }
+
     @target "linux" {
         return unix_platform_name()
     }
+
     return ""
 }
 
@@ -50,9 +52,7 @@ make type Config {
     @pub make input: std::io::Path? = none
     @pub make output: std::io::Path
 
-    @pub make optimization: std::Optimization
     @pub make options: std::Options
-    @pub make mode: std::Mode
     make platform: std::Platform
     @pub make platform_name: str   // resolved OS name for @target selection
 
@@ -73,8 +73,6 @@ make type Config {
     @pub make entry: str = "main"            // entry point function name
     @pub make output_set: bool = false       // true if `-o` was given
     @pub make name: str = ""                 // optional executable basename
-    @pub make keep_llvm: bool = false
-    @pub make progress: bool = true
     @pub make entry_set: bool = false
     @pub make intermediate_directory: str = ""
     @pub make build_step: str = ""
@@ -85,13 +83,11 @@ make type Config {
 
         config.command = CommandKind.None
 
-        if std::os::getenv("QUIPC_NO_PROGRESS") == "1" { config.progress = false }
 
         config.output = std::io::Path.create("target/debug/")
 
-        config.optimization = std::Optimization.None
-        config.options = std::Options.default()
-        config.mode = std::Mode.Debug
+        config.options = std::Options {}
+        if std::os::getenv("QUIPC_NO_PROGRESS") == "1" { config.options.progress_enabled = false }
         config.platform = std::Platform.Native
         config.platform_name = native_platform_name()
 
@@ -318,7 +314,7 @@ make type Config {
                 i = i + 1
                 this.native_libraries.push(c::to_str(argv[i]))
             } elif t == "--keep-llvm" {
-                this.keep_llvm = true
+                this.options.keep_llvm = true
             } elif t == "--emit-llvm" {
                 this.emit_llvm = true
             } elif t == "--entry" {
@@ -331,13 +327,15 @@ make type Config {
                     return error.InvalidArgument
                 }
             } elif t == "-O2" {
-                this.optimization = std::Optimization.Standard
+                this.options.optimization = std::Optimization.Standard
             } elif t == "-O3" {
-                this.optimization = std::Optimization.Aggressive
+                this.options.optimization = std::Optimization.Aggressive
             } elif t == "-Os" {
-                this.optimization = std::Optimization.Size
+                this.options.optimization = std::Optimization.Size
+            } elif t == "--benchmark" {
+                this.options.benchmark = true
             } elif t == "--no-progress" {
-                this.progress = false
+                this.options.progress_enabled = false
             } elif t == "--show-debug" || t == "--verbose" {
                 this.options.show_quipc_debug = true
             } elif t == "--hide-warnings" {
@@ -349,9 +347,11 @@ make type Config {
             } elif t == "--emit-mem" {
                 this.emit_mem = true
             } elif t == "--release" {
-                this.mode = std::Mode.Release
+                this.options.mode = std::Mode.Release
             } elif t == "--debug" || t == "-g" {
-                this.mode = std::Mode.Debug
+                this.options.mode = std::Mode.Debug
+            } elif t == "--build-simplified" {
+                this.options.build_simplified = true
             } elif t == "--platform" {
                 if i + 1 < argv.len() {
                     make f = argv[i + 1]
@@ -397,6 +397,14 @@ make type Config {
             }
 
             i = i + 1
+        }
+
+        if this.options.benchmark {
+            if (this.command != CommandKind.Compile && this.command != CommandKind.Build) || this.emit_llvm || this.emit_mir || this.emit_mem {
+                std::io::println("--benchmark requires compile or build with full executable output")
+                return error.InvalidArgument
+            }
+            this.options.progress_enabled = false
         }
 
         if this.command == CommandKind.Run && (this.emit_llvm || this.emit_mir || this.emit_mem || this.options.show_memory_dump) { return error.InvalidArgument }

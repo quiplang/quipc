@@ -20,12 +20,13 @@
 /// checks each mir function and appends its memory report.
 @pub
 make check (mir_mod: ref<mir::MirModule>, hir_mod: ref<hir::HirModule>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, out: ref<report::MemReport>) -> void {
+    make timings = profile::Profile {}
     make i = 0
 
     while i < mir_mod.*.funcs.len() {
         if diag.*.is_aborting() { return }
 
-        check_func(mir_mod.*.funcs[i].pin, diag, ctx, out, mir_mod.*.structs.pin, mir_mod.*.funcs.pin, false)
+        check_func(mir_mod.*.funcs[i].pin, diag, ctx, out, mir_mod.*.structs.pin, mir_mod.*.funcs.pin, timings.pin)
         i = i + 1
     }
 
@@ -34,7 +35,7 @@ make check (mir_mod: ref<mir::MirModule>, hir_mod: ref<hir::HirModule>, diag: re
 
 /// reuses eligible function reports and checks the remaining mir functions.
 @pub
-make check_cached (mir_mod: ref<mir::MirModule>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, out: ref<report::MemReport>, previous: ref<report::MemReport>, reuse: ref<bool[]>, profiling: bool) -> void {
+make check_cached (mir_mod: ref<mir::MirModule>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, out: ref<report::MemReport>, previous: ref<report::MemReport>, reuse: ref<bool[]>, timings: ref<profile::Profile>) -> void {
     make i: uint = 0
 
     while i < mir_mod.*.funcs.len() {
@@ -45,7 +46,7 @@ make check_cached (mir_mod: ref<mir::MirModule>, diag: ref<diags::Diagnostic>, c
         if i < reuse.*.len() && reuse.*[i] && i < previous.*.funcs.len() && !has_pin_and_call(mir_mod.*.funcs[i].body.pin) {
             out.*.funcs.push(previous.*.funcs[i])
             out.*.reused_functions = out.*.reused_functions + 1
-        } else { check_func(mir_mod.*.funcs[i].pin, diag, ctx, out, mir_mod.*.structs.pin, mir_mod.*.funcs.pin, profiling) }
+        } else { check_func(mir_mod.*.funcs[i].pin, diag, ctx, out, mir_mod.*.structs.pin, mir_mod.*.funcs.pin, timings) }
 
         i = i + 1
     }
@@ -93,7 +94,7 @@ make successors (t: ref<mir::MirTerm>) -> uint[] {
 }
 
 /// checks the function.
-make check_func (f: ref<mir::MirFunc>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, out: ref<report::MemReport>, structs: ref<mir::MirStruct[]>, funcs: ref<mir::MirFunc[]>, profiling: bool) -> void {
+make check_func (f: ref<mir::MirFunc>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, out: ref<report::MemReport>, structs: ref<mir::MirStruct[]>, funcs: ref<mir::MirFunc[]>, timings: ref<profile::Profile>) -> void {
     make fr = report::MemFuncReport {}
 
     fr.name = f.*.name !
@@ -102,7 +103,7 @@ make check_func (f: ref<mir::MirFunc>, diag: ref<diags::Diagnostic>, ctx: ref<re
     make body = f.*.body.pin
 
     if body.*.terms.len() > 0 && body.*.locals.len() > 0 {
-        run(body, diag, ctx, fr.pin, structs, funcs, profiling)
+        run(body, diag, ctx, fr.pin, structs, funcs, timings)
     }
 
     fr.managed_heap_sites = report::count_managed_sites(body)
@@ -112,14 +113,14 @@ make check_func (f: ref<mir::MirFunc>, diag: ref<diags::Diagnostic>, ctx: ref<re
     return
 }
 
-make run (body: ref<mir::MirBody>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, fr: ref<report::MemFuncReport>, structs: ref<mir::MirStruct[]>, funcs: ref<mir::MirFunc[]>, profiling: bool) -> void {
+make run (body: ref<mir::MirBody>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, fr: ref<report::MemFuncReport>, structs: ref<mir::MirStruct[]>, funcs: ref<mir::MirFunc[]>, timings: ref<profile::Profile>) -> void {
     make started: uint = 0
 
-    if profiling { started = profile::now() }
+    if timings.*.enabled { started = profile::now() }
 
     make g = graph::build(body)
 
-    if profiling { profile::record(true, started, "mem_graph", fr.*.name.copy()) started = profile::now() }
+    if timings.*.enabled { timings.*.record(started, "mem_graph", fr.*.name.copy()) started = profile::now() }
 
     make nblocks = body.*.terms.len()
     make nlocals = body.*.locals.len()
@@ -282,7 +283,7 @@ make run (body: ref<mir::MirBody>, diag: ref<diags::Diagnostic>, ctx: ref<report
         }
     }
 
-    if profiling { profile::record(true, started, "mem_flow", fr.*.name.copy()) started = profile::now() }
+    if timings.*.enabled { timings.*.record(started, "mem_flow", fr.*.name.copy()) started = profile::now() }
 
     // reporting pass
     it.emit = true
@@ -332,11 +333,11 @@ make run (body: ref<mir::MirBody>, diag: ref<diags::Diagnostic>, ctx: ref<report
     // obligations still open auto-release at the owner's kill line
     obligations::finalize(fr.*.obligations.pin, g.pin, g.nstmts)
 
-    if profiling { profile::record(true, started, "mem_report", fr.*.name.copy()) started = profile::now() }
+    if timings.*.enabled { timings.*.record(started, "mem_report", fr.*.name.copy()) started = profile::now() }
 
     fr.*.slots = plan::build(g.pin, body, structs)
 
-    if profiling { profile::record(true, started, "mem_plan", fr.*.name.copy()) }
+    if timings.*.enabled { timings.*.record(started, "mem_plan", fr.*.name.copy()) }
 
     return
 }

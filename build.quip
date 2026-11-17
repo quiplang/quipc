@@ -11,9 +11,11 @@ make main (argc: int, argv: ptr<char>[]) -> int {
         return 1
     }
 
-    progress::begin("Build script", b.progress_enabled, b.options.show_quipc_debug)
+    progress::begin("Build script", b.options.progress_enabled, b.options.show_quipc_debug)
     progress::phase("Configure", 0, 1, "Quip compiler")
 
+    //b.options.benchmark = true
+    // b.options.keep_llvm = true
     b.options.hide_warnings = true
 
     make exe = std::Executable.default()
@@ -34,7 +36,7 @@ make main (argc: int, argv: ptr<char>[]) -> int {
     b.add_executable(exe)
 
     make profile: str = "debug"
-    if b.mode == std::Mode.Release { profile = "release" }
+    if b.options.mode == std::Mode.Release { profile = "release" }
 
     b.add_step("install", [profile] () -> !void {
         if !install_user(profile !) { return error.InstallFailed }

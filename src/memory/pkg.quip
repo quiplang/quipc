@@ -1,6 +1,7 @@
 // memory-rule validation pass over MIR
 
 @pure @const {
+    make profile = @import "../core/analysis_profile.quip"
     make mir = @import "../mir/mir.quip"
     make hir = @import "../hir/hir.quip"
     make diags = @import "../diag/diagnosis.quip"
@@ -26,11 +27,11 @@ make check (mir_mod: ref<mir::MirModule>, hir_mod: ref<hir::HirModule>, diag: re
 
 /// checks memory rules while reusing eligible previous function reports.
 @pub
-make check_cached (mir_mod: ref<mir::MirModule>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, module_name: str, previous: ref<report::MemReport>, reuse: ref<bool[]>, profiling: bool) -> report::MemReport {
+make check_cached (mir_mod: ref<mir::MirModule>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, module_name: str, previous: ref<report::MemReport>, reuse: ref<bool[]>, timings: ref<profile::Profile>) -> report::MemReport {
     make out = report::MemReport {}
 
     out.module_name = module_name
-    checker::check_cached(mir_mod, diag, ctx, out.pin, previous, reuse, profiling)
+    checker::check_cached(mir_mod, diag, ctx, out.pin, previous, reuse, timings)
     return out
 }
 

@@ -23,19 +23,18 @@
 make type Options {
 
     @pub {
-        make show_quipc_debug: bool
-        make show_memory_dump: bool
-        make hide_warnings: bool
+        make mode: Mode = Mode.Debug
+        make optimization: Optimization = Optimization.None
+        make show_quipc_debug: bool = false
+        make show_memory_dump: bool = false
+        make hide_warnings: bool = false
+        make benchmark: bool = false
+        make keep_llvm: bool = false
+        make progress_enabled: bool = true
+
+        make build_simplified: bool = false
     }
 
-    @pub
-    make default () -> Options {
-        return Options {
-            show_quipc_debug = false,
-            show_memory_dump = false,
-            hide_warnings = false,
-        }
-    }
 }
 
 @pub
@@ -201,8 +200,6 @@ make type Executable {
     }
 }
 
-
-
 @pub
 make type BuildStep {
     make name: str
@@ -215,12 +212,8 @@ make type Build {
 
     @pub {
         make options: Options
-        make mode: Mode
         make compiler_path: str = ""
-        make optimization: Optimization = Optimization.None
 
-        make keep_llvm: bool = false
-        make progress_enabled: bool = true
         make script_args: str[] = []
 
         make args: str[]
@@ -243,8 +236,7 @@ make type Build {
 
     make initial () -> Build {
         make b = Build {
-            options = Options.default(),
-            mode = Mode.Debug,
+            options = Options {},
             args = [],
             executables = [],
         }
@@ -383,7 +375,7 @@ make type Build {
             if exe.path_build.get().len() == 0 {
                 make profile: str = "debug"
 
-                if this.mode == Mode.Release { profile = "release" }
+                if this.options.mode == Mode.Release { profile = "release" }
 
                 exe.path_build = io::Path.create("target/" + profile + "/test")
             }
@@ -470,7 +462,7 @@ make type Build {
     make construct_args () {
         while this.args.len() > 0 { make _ = this.args.pop() }
 
-        match this.optimization {
+        match this.options.optimization {
             Optimization.Standard { this.args.push("-O2") }
             Optimization.Aggressive { this.args.push("-O3") }
             Optimization.Size { this.args.push("-Os") }
@@ -486,7 +478,7 @@ make type Build {
             }
         }
 
-        match this.mode {
+        match this.options.mode {
             Mode.Debug { this.args.push("-g") }
             Mode.Release { this.args.push("--release") }
             _ {}
@@ -498,8 +490,9 @@ make type Build {
 
         if this.options.show_memory_dump { this.args.push("--emit-mem") }
 
-        if this.keep_llvm { this.args.push("--keep-llvm") }
-        if !this.progress_enabled { this.args.push("--no-progress") }
+        if this.options.benchmark { this.args.push("--benchmark") }
+        if this.options.keep_llvm { this.args.push("--keep-llvm") }
+        if !this.options.progress_enabled { this.args.push("--no-progress") }
     }
 
     @pub @this
@@ -527,10 +520,10 @@ make type Build {
 }
 
 make set_build_profile (b: ref<Build>, profile: str, optimization: str) {
-    if profile == "release" { b.*.mode = Mode.Release }
-    if optimization == "-O2" { b.*.optimization = Optimization.Standard }
-    elif optimization == "-O3" { b.*.optimization = Optimization.Aggressive }
-    elif optimization == "-Os" { b.*.optimization = Optimization.Size }
+    if profile == "release" { b.*.options.mode = Mode.Release }
+    if optimization == "-O2" { b.*.options.optimization = Optimization.Standard }
+    elif optimization == "-O3" { b.*.options.optimization = Optimization.Aggressive }
+    elif optimization == "-Os" { b.*.options.optimization = Optimization.Size }
 }
 
 // Consume the driver arguments up to the separator, leaving script arguments intact.
@@ -543,12 +536,13 @@ make load_build_args (b: ref<Build>, argv: ptr<char>[]) -> !uint {
     while i < argv.len() {
         match c_ffi::to_str(argv[i]) {
             "--" { return i + 1 }
-            "--release" { b.*.mode = Mode.Release }
-            "-O2" { b.*.optimization = Optimization.Standard }
-            "-O3" { b.*.optimization = Optimization.Aggressive }
-            "-Os" { b.*.optimization = Optimization.Size }
-            "--keep-llvm" { b.*.keep_llvm = true }
-            "--no-progress" { b.*.progress_enabled = false }
+            "--release" { b.*.options.mode = Mode.Release }
+            "-O2" { b.*.options.optimization = Optimization.Standard }
+            "-O3" { b.*.options.optimization = Optimization.Aggressive }
+            "-Os" { b.*.options.optimization = Optimization.Size }
+            "--benchmark" { b.*.options.benchmark = true }
+            "--keep-llvm" { b.*.options.keep_llvm = true }
+            "--no-progress" { b.*.options.progress_enabled = false }
             "--verbose" { b.*.options.show_quipc_debug = true }
             "--alias" {
                 if i + 2 >= argv.len() { return error.InvalidBuildArguments }
@@ -565,10 +559,10 @@ make load_build_args (b: ref<Build>, argv: ptr<char>[]) -> !uint {
 // Older bootstrap drivers supply their settings through the environment.
 make load_legacy_build_context (b: ref<Build>) {
     b.*.options.show_quipc_debug = os::getenv("QUIPC_VERBOSE") == "1"
-    b.*.progress_enabled = os::getenv("QUIPC_NO_PROGRESS") != "1"
+    b.*.options.progress_enabled = os::getenv("QUIPC_NO_PROGRESS") != "1"
     make compiler = os::getenv("QUIPC_COMPILER")
     if compiler.len() > 0 { b.*.compiler_path = compiler }
-    b.*.keep_llvm = os::getenv("QUIPC_KEEP_LLVM") == "1"
+    b.*.options.keep_llvm = os::getenv("QUIPC_KEEP_LLVM") == "1"
     b.*.selected_step = os::getenv("QUIPC_STEP")
     set_build_profile(b, os::getenv("QUIPC_PROFILE"), os::getenv("QUIPC_OPTIMIZATION"))
 

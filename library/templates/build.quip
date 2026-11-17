@@ -10,13 +10,13 @@ make build (argc: int, argv: ptr<char>[]) -> int {
         return 1
     }
 
-    std::progress::begin("Project build", b.progress_enabled, b.options.show_quipc_debug)
+    std::progress::begin("Project build", b.options.progress_enabled, b.options.show_quipc_debug)
     std::progress::phase("Configure", 0, 1, "project")
 
     // b.options.hide_warnings = true
 
     make exe = std::Executable.default()
-    exe.add_import("std", "~/.quip/current/lib/std/pkg.quip") // create global alias to standard library
+    exe.add_import("std", "~/.quip/current/lib/std/pkg.quip") // creates global alias to standard library
 
     b.add_executable(exe)
 

@@ -190,4 +190,4 @@ make unix_timestamp () -> !int {
     return value
 }
 
-@pure @const make native = @import "../internal/time.quip"
+@import "../internal/time.quip"

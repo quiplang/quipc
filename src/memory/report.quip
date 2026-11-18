@@ -2,6 +2,7 @@
 
 @pure @const {
     make std = @import "std"
+    make util = @import "../util/pkg.quip"
     make mir = @import "../mir/mir.quip"
     make hir = @import "../hir/hir.quip"
 }
@@ -34,6 +35,7 @@ make type MemSlot {
 /// tracks an allocation and whether its obligation has been satisfied.
 @pub
 make type MemObligation {
+    @pub make allocation_range: util::Range = .{}
     @pub make local: uint = 0         // current owner
     @pub make name: str = ""
     @pub make allocator: str = ""

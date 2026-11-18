@@ -2,10 +2,10 @@
 
     make os: unit = @import "../os/pkg.quip"
 
-    make mem: unit = @import "../mem/pkg.quip"
-    make ffi: unit = @import "../ffi/c.quip"
+    @import "../mem/pkg.quip"
+    // make ffi: unit = @import "../ffi/c.quip"
 
-    make math: unit = @import "../math/pkg.quip"
+    // make math: unit = @import "../math/pkg.quip"
 }
 
 make __path_split (buffer: variant<String, str, ptr<char>>, c: char) -> str[] {

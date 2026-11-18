@@ -2,10 +2,12 @@
     @target "macos" make os = @import "../os/macos.quip"
     @target "linux" make os = @import "../os/linux.quip"
 }
+
 @pure @const { make errno = @import "errno.quip" }
 
 @pub @unsafe @export "quip_abort"
 make os_abort () -> void { os::abort() }
+
 @unsafe
 make cstring_length (value: ptr<char>) -> uint {
     make length: uint = 0
@@ -14,6 +16,7 @@ make cstring_length (value: ptr<char>) -> uint {
 
     return length
 }
+
 @pub @unsafe @export "quip_getcwd"
 make os_getcwd (output: ptr<str>) -> int {
     make buffer: str = ""
@@ -41,6 +44,7 @@ make os_getcwd (output: ptr<str>) -> int {
 
     return -1
 }
+
 @pub @unsafe @export "quip_getenv"
 make os_getenv (name: ptr<str>, output: ptr<str>) -> int {
     make data = os::getenv(name.*.data)
@@ -51,6 +55,7 @@ make os_getenv (name: ptr<str>, output: ptr<str>) -> int {
     quip_runtime_string_from_static(output, data, cstring_length(data))
     return 0
 }
+
 @pub @unsafe @export "quip_file_read_fd"
 make os_read_file (fd: int, output: ptr<str>) -> int {
     quip_runtime_string_free(output)

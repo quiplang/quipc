@@ -93,6 +93,8 @@ make memory_default_allocate (size: uint) -> ptr<any> {
 
 @pub @unsafe @export "quip_memory_default_free"
 make memory_default_free (context: ptr<any>, buffer: ptr<any>) -> void {
+    _ = context
+
     @unsafe make null: ptr<any> = 0
 
     if buffer == null { return }
@@ -169,7 +171,7 @@ make memory_release (state: ptr<State>, header: ptr<Header>) -> void {
     make bytes: uint = header.*.bytes
     @unsafe make callback: ptr<any> = header.*.deallocate
     @unsafe make context: ptr<any> = header.*.context
-    @unsafe make null: ptr<any> = 0
+    // @unsafe make null: ptr<any> = 0
     memory_backend_free(header, callback, context)
     state.*.freed = state.*.freed + 1
     state.*.live_bytes = state.*.live_bytes - bytes

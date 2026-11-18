@@ -1,4 +1,4 @@
-@pure @const make mem: unit = @import "../mem/pkg.quip"
+@import "../mem/pkg.quip"
 
 @impl int
 make to_str () -> str {

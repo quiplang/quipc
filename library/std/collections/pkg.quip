@@ -5,7 +5,7 @@
 
     make io: unit = @import "../io/pkg.quip"
 
-    make fmt: unit = @import "../fmt/pkg.quip"
+@import "../fmt/pkg.quip"
 
 }
 

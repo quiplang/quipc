@@ -5,6 +5,8 @@
 
 @pub @entry
 make main (argc: int, argv: ptr<char>[]) -> int {
+    _ = argc
+
     make b = std::Build.from_args(argv) catch {
         std::progress::fail("invalid build arguments")
         std::progress::finish(false)
@@ -79,8 +81,6 @@ make add_link_inputs (exe: ref<std::Executable>, args: str[]) -> bool {
         std::panic("unsupported platform", @file, @line)
     }
 
-    progress::fail("pass the LLVM 22 archives and dependencies as repeated --link arguments on this platform")
-    return false
 }
 
 make macos_llvm_inputs () -> !str[] {
@@ -91,7 +91,10 @@ make macos_llvm_inputs () -> !str[] {
     // eventually ask the developer to update path in the build script
     make prefix = command_output("brew", ["--prefix"]) catch err { return err }
     make llvm = prefix.copy() + "/opt/llvm@22/bin/llvm-config"
-    if std::os::syscall::access(llvm.copy(), 1) != 0 { llvm = prefix.copy() + "/opt/llvm/bin/llvm-config" }
+    make llvm_path = llvm.copy()
+    llvm_path.push('\0')
+    @unsafe make llvm_missing = std::os::platform::access(llvm_path.data, 1) != 0
+    if llvm_missing { llvm = prefix.copy() + "/opt/llvm/bin/llvm-config" }
 
     make version = command_output(llvm.copy(), ["--version"]) catch err { return err }
     if version.len() < 3 || version[0] != '2' || version[1] != '2' || version[2] != '.' {
@@ -113,7 +116,10 @@ make macos_llvm_inputs () -> !str[] {
     inputs.push(sdk + "/usr/lib/libxml2.tbd")
 
     for path : inputs.iter() {
-        if std::os::syscall::access(path.copy(), 4) != 0 {
+        make native_path = path.copy()
+        native_path.push('\0')
+        @unsafe make missing = std::os::platform::access(native_path.data, 4) != 0
+        if missing {
             progress::fail("missing linker input " + path)
             return error.MissingLinkInput
         }

@@ -1,7 +1,6 @@
 @pure @const {
 
-    make mem: unit = @import "../mem/pkg.quip"
-    make ffi: unit = @import "../ffi/c.quip"
+    @import "../mem/pkg.quip"
 
     make file: unit = @import "./file.quip"
     make path: unit = @import "./path.quip"

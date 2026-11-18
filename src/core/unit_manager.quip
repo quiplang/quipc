@@ -51,6 +51,10 @@ make enum UnitStatus {
 
 @pub
 make type ImportInfo {
+    @pub make span: util::Span = .{}
+    @pub make is_public: bool = false
+    @pub make provides_methods: bool = false
+    @pub make exports: hir::HirExport[] = []
     @pub make alias: str = ""    // the name the importing file binds it to
     @pub make path: str = ""     // the raw string literal, relative to the importing file
     @pub make unit: uint = 0     // index into UnitManager.units; set by `resolve_all` (phase 2)
@@ -66,6 +70,7 @@ make type Unit {
         make content: str
         make map: linemap::LineMap
         make tokens: lexer::Token[]
+        @pub make extra_warnings: bool = false
 
         make path_rel: std::io::Path
         make key: str = ""       // canonical absolute path, used to de-duplicate imports
@@ -298,6 +303,12 @@ make type Unit {
     @pub @this
     make analyze (sigs: ref<hir::HirAttachedSig[]>, structs: ref<hir::HirStructSig[]>, funcs: ref<hir::HirFuncSig[]>, timings: ref<profile::Profile>) -> !void {
         this.status = UnitStatus.Checking
+        for imported : this.imports {
+            if imported.resolved && imported.alias.len() == 0 {
+                semantics::check_unbound_import(this.hir_module.pin, imported.exports.pin, imported.path.copy(), imported.span.start, this.diag.pin)
+            }
+        }
+        semantics::check_bodies(this.hir_module.pin, this.diag.pin)
         semantics::check_array_copies(this.hir_module.pin, sigs, this.diag.pin)
 
         if this.diag.is_aborting() || this.diag.has_errors() {
@@ -339,15 +350,26 @@ make type Unit {
         while typed_index < this.checked.funcs.len() && typed_index < this.hir_module.funcs.len() {
             make result = this.checked.funcs[typed_index].pin
 
+            if types_valid && !this.diag.hide_warnings && !this.hir_module.funcs[typed_index].is_external {
+                semantics::warn_body(this.hir_module.funcs[typed_index].body.pin, result.*.expr_tys.pin, this.tys.pin, this.diag.pin, this.extra_warnings)
+            }
             if types_valid { semantics::check_typed_function(this.hir_module.pin, typed_index, this.tys.pin, result.*.local_tys.pin, result.*.ret_ty, this.diag.pin) }
 
-            semantics::check_uses(this.hir_module.funcs[typed_index].body.pin, result.*.semantic_checks.pin, structs, this.diag.pin)
+            semantics::check_uses(this.hir_module.funcs[typed_index].body.pin, result.*.semantic_checks.pin, result.*.expr_tys.pin, this.tys.pin, structs, this.diag.pin)
             typed_index = typed_index + 1
         }
 
         if this.diag.is_aborting() || this.diag.has_errors() {
             this.status = UnitStatus.Aborted
             return error.CompilationAborted
+        }
+
+        if !this.diag.has_errors() && !this.diag.hide_warnings {
+            for imported : this.imports {
+                if imported.resolved && !imported.is_public && imported.alias.len() > 0 {
+                    semantics::warn_import(this.tokens.pin, imported.alias.copy(), imported.span.copy(), imported.path.copy(), imported.provides_methods, this.diag.pin)
+                }
+            }
         }
 
         if timings.*.enabled { timings.*.record(started, "typed_semantics", this.path_rel.get()) }
@@ -588,6 +610,7 @@ make collect_import_from_var (node: ptr<ast::AST_Head>, out: ref<ImportInfo[]>) 
 
                     val_box: owned<ast::AST_Head> {
                         make is_import = false
+                        make is_public = false
                         make ti: uint = 0
 
                         while ti < val_box.*.tags.len() {
@@ -605,6 +628,7 @@ make collect_import_from_var (node: ptr<ast::AST_Head>, out: ref<ImportInfo[]>) 
                         while ti < node.*.tags.len() {
                             @unsafe make tag2: ptr<ast::AST_Tag> = node.*.tags[ti].*.pin
 
+                            if tag2.*.name.lexeme == "pub" { is_public = true }
                             if tag2.*.name.lexeme == "import" {
                                 is_import = true
                             }
@@ -620,6 +644,8 @@ make collect_import_from_var (node: ptr<ast::AST_Head>, out: ref<ImportInfo[]>) 
                                     if expr_box.*.kind == ast::ExprKind.Literal {
                                         make info = ImportInfo {}
 
+                                        info.span = var_box.*.name.span.copy()
+                                        info.is_public = is_public
                                         info.alias = var_box.*.name.lexeme !
                                         info.path = expr_box.*.literal.lexeme !
                                         out.*.push(info)
@@ -650,6 +676,17 @@ make collect_imports (program: ref<owned<ast::AST_Head>[]>) -> ImportInfo[] {
 
         if node.*.var != none {
             collect_import_from_var(node, out.pin)
+        }
+
+        if node.*.kind == ast::AST_Kind.Expr && node.*.expr != none {
+            @unsafe make expression: ptr<ast::AST_Expr> = node.*.expr.unwrap()
+            if expression.*.kind == ast::ExprKind.Literal {
+                for tag : node.*.tags {
+                    if tag.*.name.lexeme == "import" {
+                        out.push(ImportInfo { path = expression.*.literal.lexeme.copy(), span = node.*.range.start.copy() })
+                    }
+                }
+            }
         }
 
         i = i + 1
@@ -1129,7 +1166,12 @@ make type UnitManager {
                     some {
                         this.units[id].imports[ii].unit = some
                         this.units[id].imports[ii].resolved = true
+                        this.units[id].imports[ii].exports = exports_of(this.units[some].program.pin)
 
+                        if this.units[id].imports[ii].alias.len() == 0 {
+                            ii++
+                            continue
+                        }
                         make imp = hir::HirImport {}
 
                         imp.alias = this.units[id].imports[ii].alias !
@@ -1154,7 +1196,7 @@ make type UnitManager {
             make ii: uint = 0
 
             while ii < this.units[id].imports.len() {
-                if this.units[id].imports[ii].resolved {
+                if this.units[id].imports[ii].resolved && this.units[id].imports[ii].alias.len() > 0 {
                     make alias = this.units[id].imports[ii].alias !
                     make target = this.units[id].imports[ii].unit
                     this.add_namespace(id, alias, target)
@@ -1231,6 +1273,32 @@ make type UnitManager {
     // after all units have been lowered and monomorphized.
     @pub @this
     make build_signatures () -> void {
+        make providers: bool[] = []
+        for unit : this.units { providers.push(unit.hir_module.attached_funcs.len() > 0) }
+        make changed = true
+        while changed {
+            changed = false
+            make host: uint = 0
+            while host < this.units.len() {
+                for imported : this.units[host].imports {
+                    if imported.resolved && providers[imported.unit] && !providers[host] {
+                        providers[host] = true
+                        changed = true
+                    }
+                }
+                host++
+            }
+        }
+        make host: uint = 0
+        while host < this.units.len() {
+            make index: uint = 0
+            while index < this.units[host].imports.len() {
+                make imported = this.units[host].imports[index].pin
+                imported.*.provides_methods = imported.*.resolved && providers[imported.*.unit]
+                index++
+            }
+            host++
+        }
         this.attached_sigs = []
         this.struct_sigs = []
         this.free_sigs = []

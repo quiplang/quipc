@@ -937,29 +937,20 @@ make type ReturnInfo {
     /// declares a local in the current scope and checks for duplicate names.
     @this
     make declare (local: hir::HirLocal) -> uint {
-        // a name may be declared only once per scope; shadowing an outer name is fine
-        make mark: uint = 0
+        make id = this.body.*.locals.len()
 
-        if this.scope_marks.len() > 0 {
-            mark = this.scope_marks[this.scope_marks.len() - 1]
-        }
-
-        make di = mark
-
-        while di < this.scope_names.len() {
-            if this.scope_names[di] == local.name {
-                make d = diag::Diag.err(err::Err.DuplicateSymbol, local.range !, "duplicate symbol")
-                d.label("`" + (local.name !) + "` is declared more than once in this scope")
-                d.help("rename one of the declarations")
+        if local.name != "_" {
+            make previous = this.lookup(local.name.copy())
+            if previous > 0 {
+                make d = diag::Diag.err(err::Err.DuplicateSymbol, local.range.copy(), "duplicate symbol `" + local.name + "`")
+                d.attach(diag::Label.create(this.body.*.locals[previous - 1].range.copy(), "previous binding declared here"))
+                d.help("rename the new binding, assign to the existing binding, or use `_` to discard the value")
                 this.diagref.*.report(d)
             }
 
-            di = di + 1
+            this.scope_names.push(local.name !)
+            this.scope_locals.push(id)
         }
-
-        make id = this.body.*.locals.len()
-        this.scope_names.push(local.name !)
-        this.scope_locals.push(id)
         this.body.*.locals.push(local)
         return id
     }
@@ -2144,6 +2135,17 @@ make type ReturnInfo {
                         is_assign = true
                     }
                 }
+            }
+        }
+
+        if is_assign && op.kind == lexer::TokenKind.Equal && target.*.expr != none {
+            @unsafe make target_expr: ptr<ast::AST_Expr> = target.*.expr.unwrap()
+            if target_expr.*.kind == ast::ExprKind.Identifier && target_expr.*.literal.lexeme == "_" {
+                st.kind = hir::HirStmtKind.Let
+                st.value = this.lower_expr(value)
+                st.has_value = true
+                st.local = this.declare(hir::HirLocal { name = "_", range = st.range.copy() })
+                return this.push_stmt(st)
             }
         }
 

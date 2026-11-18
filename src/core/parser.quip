@@ -251,6 +251,14 @@ make type Parser {
             match this.current().*.kind {
 
                 lexer::TokenKind.At {
+                    if this.next().*.lexeme == "import" {
+                        make import_start = this.current().*.span.copy()
+                        make imported = this.parse_expr(ctx)
+                        imported.*.range.start = import_start
+                        while tags.len() > 0 { imported.*.tags.push(tags.pop()) }
+                        program.push(imported)
+                        continue
+                    }
                     this.parse_tag(ctx, tags.pin)
                     continue
                 }
@@ -258,7 +266,7 @@ make type Parser {
                 lexer::TokenKind.KeyMake {
                     make node = this.parse_make(ctx)
 
-                    for i : std::math::range(0, tags.len(), 1) {
+                    for _ : std::math::range(0, tags.len(), 1) {
                         node.*.tags.push(tags.pop())
                     }
 
@@ -553,7 +561,7 @@ make type Parser {
                 }
 
                 if is_type_alias {
-                    make start = this.current().*.span
+                    make alias_start = this.current().*.span
                     make e = ast::fresh_expr()
                     e.*.kind = ast::ExprKind.TypeSig
                     make alias_status = ast::AST_Status.Ok
@@ -568,7 +576,7 @@ make type Parser {
 
                     make e_head = ast::new_expr(e)
                     e_head.*.status = alias_status
-                    e_head.*.range.start = start
+                    e_head.*.range.start = alias_start
                     e_head.*.range.end = this.prev().*.span
                     node.*.val = e_head
                 } else {

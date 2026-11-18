@@ -1,11 +1,7 @@
 // the process library
 @pure @const {
-make os: unit = @import "../os/pkg.quip"
-
-make io: unit = @import "../io/pkg.quip"
-
-make to_str: unit = @import "../fmt/pkg.quip"
-make native: unit = @import "../internal/process.quip"
+    make os: unit = @import "../os/pkg.quip"
+    make errno = @import "../internal/errno.quip"
 }
 
 @pub
@@ -80,7 +76,7 @@ make type Process {
 
     @pub
     make spawn (command: Command) -> !Process {
-        make pid: int = os::syscall::quip_spawn_process(
+        @unsafe make pid: int = process_spawn(
             command.name.pin, command.args.pin,
             command.fd_in, command.fd_out, command.fd_err
         )
@@ -99,7 +95,7 @@ make type Process {
 
     @pub @this
     make wait () {
-        make result: int = os::syscall::quip_wait_process(this.pid)
+        @unsafe make result: int = process_wait(this.pid)
 
         if result >= 0 {
             this.state = ProcessState.Exited
@@ -112,7 +108,9 @@ make type Process {
 
     @pub @this
     make kill () {
-        os::syscall::quip_kill_process(this.pid, 9)
+
+
+        @unsafe { process_kill(this.pid, 9) }
         this.state = ProcessState.Signaled
         this.signal_code = 9
     }
@@ -120,7 +118,7 @@ make type Process {
     @pub
     make run (command: Command) -> int {
 
-        make result: int = os::syscall::quip_run_process(
+        @unsafe make result: int = process_run(
             command.name.pin, command.args.pin,
             command.fd_in, command.fd_out, command.fd_err)
 
@@ -131,10 +129,182 @@ make type Process {
 
 @pub
 make exit (code: int) -> int {
-    return os::syscall::exit(code)
+    @unsafe {
+        @unsafe make status: i32 = code
+        os::platform::exit(status)
+    }
+    return code
 }
 
 @pub
 make abort () -> void {
-    os::syscall::quip_abort()
+    @unsafe { os::platform::abort() }
+}
+
+@unsafe @external @intrinsic "constant_address:quip: exec '%s' failed: %s\n"
+make process_spawn_error_format () -> ptr<char>
+
+make type Arguments { make data: ptr<str> make length: uint make capacity: uint }
+
+@unsafe
+make process_argv_free (argv: ptr<ptr<char>>, count: uint) -> void {
+    make i: uint = 0
+    while i < count { quip_heap_free(argv[i]) i = i + 1 }
+
+    quip_heap_free(argv)
+}
+
+@unsafe
+make process_argv (path: ptr<str>, arguments: ptr<Arguments>) -> ptr<ptr<char>> {
+    @unsafe make null: ptr<ptr<char>> = 0
+    @unsafe make empty: ptr<Arguments> = 0
+
+    if path.*.length <= 0 { return null }
+
+    make count: uint = 0
+
+    if arguments != empty { count = arguments.*.length }
+
+    if count > 1152921504606846973 { return null }
+
+    @unsafe make argv: ptr<ptr<char>> = quip_heap_alloc((count + 2) * 8)
+
+    if argv == null { return null }
+
+    make i: uint = 0
+    while i <= count {
+        make item = path
+
+        if i > 0 { item = arguments.*.data + (i - 1) }
+
+        @unsafe make data: ptr<char> = quip_heap_alloc(item.*.length + 1)
+        @unsafe make no_bytes: ptr<char> = 0
+
+        if data == no_bytes { process_argv_free(argv, i) return null }
+
+        process_copy(data, item.*.data, item.*.length)
+        make length: int = item.*.length
+        data[length] = '\0'
+        argv[i] = data
+        i = i + 1
+    }
+
+    @unsafe make terminal: ptr<char> = 0
+    argv[count + 1] = terminal
+    return argv
+}
+
+@unsafe
+make process_redirect (source: int, target: int) -> void {
+    if source >= 0 && source != target {
+        @unsafe make descriptor: i32 = source
+        @unsafe make destination: i32 = target
+
+        if os::platform::dup2(descriptor, destination) < 0 { os::platform::_exit(127) }
+    }
+}
+
+@unsafe
+make process_duplicate (source: int) -> int {
+    if source < 0 { return -1 }
+
+    @unsafe make descriptor: i32 = source
+    make minimum: i32 = 3
+    make result = os::platform::fcntl(descriptor, os::platform::F_DUPFD, minimum)
+
+    if result < 0 { os::platform::_exit(127) }
+
+    return result
+}
+
+@unsafe
+make process_close (source: int) -> void {
+    if source > 2 { @unsafe make descriptor: i32 = source os::platform::close(descriptor) }
+}
+
+@unsafe
+make process_spawn (path: ptr<str>, arguments: ptr<Arguments>, input: int, output: int, errors: int) -> int {
+    make argv = process_argv(path, arguments)
+    @unsafe make null: ptr<ptr<char>> = 0
+
+    if argv == null { return -1 }
+
+    make pid = os::platform::fork()
+
+    if pid < 0 { process_argv_free(argv, arguments.*.length + 1) return -1 }
+
+    if pid == 0 {
+        // Duplicate first so shared descriptors and stdin/stdout swaps cannot
+        // invalidate a later redirect. All temporaries are raw OS descriptors.
+        make child_input = process_duplicate(input)
+        make child_output = process_duplicate(output)
+        make child_errors = process_duplicate(errors)
+        process_redirect(child_input, 0)
+        process_redirect(child_output, 1)
+        process_redirect(child_errors, 2)
+        process_close(child_input)
+        process_close(child_output)
+        process_close(child_errors)
+        process_close(input)
+
+        if output != input { process_close(output) }
+
+        if errors != input && errors != output { process_close(errors) }
+
+        os::platform::execvp(argv[0], argv)
+        make code = errno::get()
+        os::platform::dprintf(2, process_spawn_error_format(), argv[0], os::platform::strerror(code.*))
+        os::platform::_exit(127)
+    }
+
+    process_argv_free(argv, arguments.*.length + 1)
+    return pid
+}
+
+@unsafe
+make process_wait (pid: int) -> int {
+    @unsafe make native_pid: i32 = pid
+    make status: i32 = 0
+    @unsafe make address: ptr<i32> = status.pin
+    make result = os::platform::waitpid(native_pid, address, 0)
+
+    while result < 0 {
+        make code = errno::get()
+
+        if code.* != 4 { return -1 }
+
+        result = os::platform::waitpid(native_pid, address, 0)
+    }
+
+    @unsafe make value: int = status
+    make signal: int = value & 127
+
+    if signal != 0 && signal != 127 { return -signal }
+
+    if signal == 0 { return (value >> 8) & 255 }
+
+    return -1
+}
+
+@unsafe
+make process_run (path: ptr<str>, arguments: ptr<Arguments>, input: int, output: int, errors: int) -> int {
+    make pid = process_spawn(path, arguments, input, output, errors)
+
+    if pid < 0 { return -1 }
+
+    return process_wait(pid)
+}
+
+@unsafe
+make process_kill (pid: int, signal: int) -> int {
+    @unsafe make native_pid: i32 = pid
+    @unsafe make native_signal: i32 = signal
+    return os::platform::kill(native_pid, native_signal)
+}
+
+@unsafe @external make quip_heap_alloc (size: uint) -> ptr<any>
+@unsafe @external make quip_heap_free (buffer: ptr<any>) -> void
+@unsafe make process_copy (dst: ptr<char>, src: ptr<char>, count: uint) -> void {
+    make i: uint = 0
+    while i < count { dst[i] = src[i] i = i + 1 }
 }

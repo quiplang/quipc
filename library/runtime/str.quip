@@ -7,8 +7,9 @@
 // The built-in str ABI is three eight-byte fields: data, length, capacity.
 // A zero capacity marks borrowed storage. Only allocation and process exit
 // cross the native boundary; all descriptor and byte operations are Quip.
-@pure @const make methods = @import "str_methods.quip"
-@pure @const make memory = @import "memory.quip"
+@import "str_methods.quip"
+@import "memory.quip"
+
 @unsafe @external make quip_heap_alloc (bytes: uint) -> ptr<char>
 @unsafe @external make quip_heap_free (data: ptr<char>) -> void
 

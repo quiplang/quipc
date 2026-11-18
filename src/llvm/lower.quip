@@ -809,12 +809,12 @@ make type Emitter {
 
             if si < this.structs.len() {
                 descriptor.kind = 3
-                make i: uint = 0
+                make field_index: uint = 0
 
-                while i < this.structs[si].*.fields.len() {
-                    make child = this.schema(this.structs[si].*.fields[i].ty.copy())
-                    descriptor.fields.push(descriptors::DescriptorField { offset = this.field_off_at(si, i), schema = child })
-                    i++
+                while field_index < this.structs[si].*.fields.len() {
+                    make child = this.schema(this.structs[si].*.fields[field_index].ty.copy())
+                    descriptor.fields.push(descriptors::DescriptorField { offset = this.field_off_at(si, field_index), schema = child })
+                    field_index++
                 }
             }
         }
@@ -1570,9 +1570,9 @@ make type Emitter {
 
         make local_index: uint = 0
         for local : f.*.body.locals {
-            make index = layouts::find(this.builder_layouts.pin, local.ty.copy())
+            make local_layout = layouts::find(this.builder_layouts.pin, local.ty.copy())
             make string_result = local_index == 0 && (local.ty == "!str" || local.ty == "!String")
-            if index < this.builder_layouts.len() && this.builder_layouts[index].managed
+            if local_layout < this.builder_layouts.len() && this.builder_layouts[local_layout].managed
                 && !string_result && !this.has_closure(local.ty.copy()) {
                 return false
             }
@@ -1603,8 +1603,8 @@ make type Emitter {
             make parameter: uint = 1
             while parameter <= target.*.body.param_count {
                 make ty = target.*.body.locals[parameter].ty.copy()
-                make index = layouts::find(this.builder_layouts.pin, ty.copy())
-                if index < this.builder_layouts.len() && this.builder_layouts[index].managed
+                make parameter_layout = layouts::find(this.builder_layouts.pin, ty.copy())
+                if parameter_layout < this.builder_layouts.len() && this.builder_layouts[parameter_layout].managed
                     && !this.has_closure(ty) { return false }
                 parameter++
             }

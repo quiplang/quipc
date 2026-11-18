@@ -1224,22 +1224,12 @@ make type Checker {
                     this.check_anonymous_fields(body, s.*.value, place)
                     make value = this.check_expr(body, s.*.value, UseKind.Copy)
 
-                    make writable = true
-
-                    if s.*.op.kind != lexer::TokenKind.Equal {
-                        writable = this.writable_place(body, s.*.target)
-                    }
-
-                    if !is_const && this.resolve(place) != ty::TY_ERROR && !writable {
-                        make target = body.*.exprs[s.*.target].pin
-                        make diagnostic = diags::Diag.err(e::Err.TypeMismatch, target.*.range !, "assignment requires a writable place")
-                        this.diag.*.report(diagnostic)
+                    if !is_const && this.resolve(place) != ty::TY_ERROR {
+                        facts::record_write(this.out.semantic_checks.pin, s.*.target, false)
                     }
 
                     if s.*.op.kind != lexer::TokenKind.Equal {
-                        if writable {
-                            this.check_compound(body, s, place, value)
-                        }
+                        this.check_compound(body, s, place, value)
                     } elif this.resolve(place) != ty::TY_ERROR && this.resolve(value) != ty::TY_ERROR && this.unify(place, value) == ty::TY_ERROR {
                         make value_ex = body.*.exprs[s.*.value].pin
                         make d = diags::Diag.err(e::Err.TypeMismatch, value_ex.*.range !, "mismatched types")
@@ -1331,8 +1321,6 @@ make type Checker {
                     }
                 }
             }
-
-            hir::HirStmtKind.Break {}
 
             hir::HirStmtKind.Unsupported {}
 
@@ -1622,6 +1610,17 @@ make type Checker {
                         if this.symbols.namespace_has_type(nsi, ex.*.name !) {
                             id = this.intern_imported_type(nsi, ex.*.name !)
                             is_ns_type = true
+                        } else {
+                            make member_path = this.symbols.access_path(body, idx)
+                            if this.symbols.find_namespace(member_path) >= this.namespaces.*.len() {
+                                make range = ex.*.range.copy()
+                                if ex.*.has_member_span { range = util::Range.of(ex.*.member_span.start, ex.*.member_span.end) }
+                                make d = diags::Diag.err(e::Err.UnknownSymbol, range, "unknown or private namespace member `" + ex.*.name + "`")
+                                d.help("use a public member exported by this namespace, or bind the defining module with a named import")
+                                this.diag.*.report(d)
+                                id = ty::TY_ERROR
+                                is_ns_type = true
+                            }
                         }
                     }
 
@@ -1922,9 +1921,7 @@ make type Checker {
     @this
     make require_pure (required: bool, range: util::Range) {
         if required && !this.allows_pure {
-            make d = diags::Diag.err(e::Err.PureRequired, range, "use of an `@pure` declaration requires an `@pure` context")
-            d.help("tag the receiving binding or enclosing function with `@pure`")
-            this.diag.*.report(d)
+            this.out.semantic_checks.push(facts::UseCheck { kind = 10, range = range })
         }
     }
 
@@ -1972,34 +1969,8 @@ make type Checker {
     make reject_const_mutation (body: ref<hir::HirBody>, index: uint) -> bool {
         if !this.tagged_place(body, index, true) { return false }
 
-        make d = diags::Diag.err(e::Err.ConstMutation, body.*.exprs[index].range.copy(), "cannot mutate an `@const` binding")
-        this.diag.*.report(d)
+        this.out.semantic_checks.push(facts::UseCheck { kind = 11, range = body.*.exprs[index].range.copy() })
         return true
-    }
-
-    @this
-    make writable_place (body: ref<hir::HirBody>, index: uint) -> bool {
-        make expression = body.*.exprs[index].pin
-
-        if expression.*.kind == hir::HirExprKind.Local || expression.*.kind == hir::HirExprKind.Deref {
-            return true
-        }
-
-        if expression.*.kind == hir::HirExprKind.Field || expression.*.kind == hir::HirExprKind.Index {
-            make base = this.resolve(this.out.expr_tys[expression.*.lhs])
-
-            if this.tys.*.kind_of(base) == ty::TyKind.StrBuf || this.tys.*.kind_of(base) == ty::TyKind.Text {
-                return false
-            }
-
-            if this.is_pointer_kind(this.tys.*.kind_of(base)) {
-                return true
-            }
-
-            return this.writable_place(body, expression.*.lhs)
-        }
-
-        return false
     }
 
     @this
@@ -2012,12 +1983,7 @@ make type Checker {
 
         if this.reject_const_mutation(body, expression.*.lhs) { return ty::TY_ERROR }
 
-        if !this.writable_place(body, expression.*.lhs) {
-            make operand = body.*.exprs[expression.*.lhs].pin
-            make diagnostic = diags::Diag.err(e::Err.TypeMismatch, operand.*.range !, "increment/decrement requires a writable place")
-            this.diag.*.report(diagnostic)
-            return ty::TY_ERROR
-        }
+        facts::record_write(this.out.semantic_checks.pin, expression.*.lhs, true)
 
         if !this.tys.*.is_numeric(result) && this.tys.*.kind_of(result) != ty::TyKind.Ptr {
             make diagnostic = diags::Diag.err(e::Err.TypeMismatch, expression.*.range !, "increment/decrement requires a number or raw pointer")
@@ -2251,10 +2217,10 @@ make type Checker {
                     else { this.out.closure_shapes[slot].complete = false }
                 }
             } else {
-                make index = this.symbols.find_struct_sig(name)
+                make signature_index = this.symbols.find_struct_sig(name)
 
-                if index < this.structs.*.len() {
-                    for field : this.structs.*[index].fields { children.push(this.resolve(this.sig_type_of(field.ty.pin))) }
+                if signature_index < this.structs.*.len() {
+                    for field : this.structs.*[signature_index].fields { children.push(this.resolve(this.sig_type_of(field.ty.pin))) }
                 }
             }
         }

@@ -1034,6 +1034,7 @@ make type Infer {
                 }
                 make automatic = contains_text(t.*.ret_ty.copy(), "owned<")
                 obls::open(this.fr.*.obligations.pin, dest, name, t.*.name !, index, this.graph.*.nstmts, size.bytes, size.known, automatic)
+                this.fr.*.obligations[this.fr.*.obligations.len() - 1].allocation_range = range.copy()
             }
         }
 

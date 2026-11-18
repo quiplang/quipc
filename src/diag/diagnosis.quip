@@ -86,6 +86,13 @@ make type Label {
     }
 }
 
+@pub
+make type SuggestionEdit {
+    @pub make offset: uint = 0
+    @pub make text: str = ""
+    @pub make removed: uint = 0
+}
+
 /// describes a diagnostic and its labels, notes, and suggested help.
 @pub
 make type Diag {
@@ -99,6 +106,7 @@ make type Diag {
         make code: str
 
         make labels: Label[]
+        make edits: SuggestionEdit[] = []
         make help_msg: str = ""
         make note_msg: str = ""
         make located: bool = true
@@ -114,6 +122,7 @@ make type Diag {
         d.*.range = range
         d.*.code = e::warn_code(code)
         d.*.labels = []
+        d.*.edits = []
         d.*.help_msg = ""
         d.*.note_msg = ""
         d.*.located = true
@@ -129,7 +138,8 @@ make type Diag {
         d.*.range = range
         d.*.code = e::err_code(code)
         d.*.labels = []
-        d.*.help_msg = ""
+        d.*.edits = []
+        d.*.help_msg = e::err_help(code)
         d.*.note_msg = ""
         d.*.located = true
         return d
@@ -145,6 +155,7 @@ make type Diag {
 
         d.*.code = e::err_code(code)
         d.*.labels = []
+        d.*.edits = []
         d.*.help_msg = ""
         d.*.note_msg = ""
         d.*.located = false
@@ -161,6 +172,19 @@ make type Diag {
     @pub @this
     make label (msg: str) -> void {
         this.labels.push(Label.main(this.range.copy(), msg))
+    }
+
+    /// Adds an insertion to the source preview displayed below the help text.
+    @pub @this
+    make suggest_insert (offset: uint, text: str) {
+        this.edits.push(SuggestionEdit { offset = offset, text = text })
+    }
+
+    /// Replaces or removes a source range in the help preview.
+    @pub @this
+    make suggest_replace (start: uint, end: uint, text: str) {
+        if end < start { return }
+        this.edits.push(SuggestionEdit { offset = start, removed = end - start, text = text })
     }
 
     /// sets the suggested help text for this diagnostic.
@@ -202,6 +226,16 @@ make type Diagnostic {
     make has_source: bool = false
     make aborting: bool = false
     @pub make hide_warnings: bool = false
+
+    /// Suggests replacing the source line containing the supplied offset.
+    @pub @this
+    make suggest_line (d: ref<Diag>, offset: uint, text: str) {
+        if !this.has_source || offset > this.source.len() { return }
+        make line = this.map.resolve(offset).line
+        make start = this.map.line_start(line)
+        make end = this.map.line_end(line)
+        d.*.suggest_replace(start, end, text)
+    }
 
     @pub
     make init () -> Diagnostic {
@@ -345,6 +379,7 @@ make type Diagnostic {
 
         if d.*.help_msg.len() > 0 {
             footer("help", d.*.help_msg.pin, C_CYAN())
+            this.render_suggestions(d.*.pin)
         }
 
         if d.*.note_msg.len() > 0 {
@@ -352,6 +387,81 @@ make type Diagnostic {
         }
 
         std::io::println("")
+    }
+
+    @this
+    make render_suggestions (d: ref<Diag>) {
+        if this.has_source && d.*.located && d.*.edits.len() == 0 {
+            // When the repair requires a developer decision, show its source
+            // location below the guidance without proposing a replacement.
+            make offset = d.*.range.start.start
+            if offset <= this.source.len() {
+                make location = this.map.resolve(offset)
+                make width = location.line.to_str().len()
+                std::io::println(gutter(width))
+                this.source_line(width, location.line)
+                make marker: str = ""
+                make pos = this.map.line_start(location.line)
+                while pos < offset {
+                    if this.source[pos] == '\t' { marker.push('\t') }
+                    else { marker.push(' ') }
+                    pos++
+                }
+                make highlight_end = d.*.range.end.end
+                if highlight_end <= offset { highlight_end = d.*.range.start.end }
+                make line_end = this.map.line_end(location.line)
+                if highlight_end > line_end { highlight_end = line_end }
+                if highlight_end <= offset { marker.push('^') }
+                while pos < highlight_end {
+                    if this.source[pos] == '\t' { marker.push('\t') }
+                    else { marker.push('^') }
+                    pos++
+                }
+                std::io::println(gutter(width) + " " + paint(C_CYAN(), marker))
+            }
+        }
+        for edit : d.*.edits {
+            if this.has_source && edit.offset <= this.source.len() && edit.removed <= this.source.len() - edit.offset {
+                make line = this.map.resolve(edit.offset).line
+                make start = this.map.line_start(line)
+                make end = this.map.line_end(line)
+                make preview: str = ""
+                make marker: str = ""
+                make pos = start
+                while pos < edit.offset {
+                    preview.push(this.source[pos])
+                    if this.source[pos] == '\t' { marker.push('\t') }
+                    else { marker.push(' ') }
+                    pos++
+                }
+                make color = C_GREEN()
+                if edit.removed > 0 { color = C_BLUE() }
+                make symbol: char = '+'
+                if edit.removed > 0 { symbol = '~' }
+                make count: uint = 0
+                if edit.removed > 0 && edit.text.len() == 0 {
+                    symbol = '-'
+                    color = C_RED()
+                    while count < edit.removed && pos < end {
+                        preview.push(this.source[pos])
+                        marker.push(symbol)
+                        count++
+                        pos++
+                    }
+                    pos = edit.offset + edit.removed
+                } else {
+                    preview = preview + edit.text
+                    while count < edit.text.len() { marker.push(symbol) count++ }
+                    pos += edit.removed
+                }
+                while pos < end { preview.push(this.source[pos]) pos++ }
+                make display_line = line
+                make width = display_line.to_str().len()
+                std::io::println(gutter(width))
+                std::io::println(paint(C_BLUE(), lpad(display_line.to_str(), width) + " |") + " " + preview)
+                std::io::println(gutter(width) + " " + paint(color + C_BOLD(), marker))
+            }
+        }
     }
 
     /// renders the labels.
@@ -755,6 +865,9 @@ make C_BOLD () -> str    { return esc() + "[1m" }
 
 /// returns the terminal sequence for blue text.
 make C_BLUE () -> str    { return esc() + "[34m" }
+
+/// returns the terminal sequence for green text.
+make C_GREEN () -> str { return esc() + "[32m" }
 
 /// returns the terminal sequence for cyan text.
 make C_CYAN () -> str    { return esc() + "[36m" }

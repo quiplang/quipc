@@ -9,8 +9,8 @@ make type TimeSpec { make seconds: i64 make nanoseconds: i64 }
 make time_errno () -> ptr<i32> {
     @target "macos" { return os::__error() }
     @target "linux" { return os::__errno_location() }
-    @unsafe make null: ptr<i32> = 0
-    return null
+    // @unsafe make null: ptr<i32> = 0
+    // return null
 }
 
 @pub @unsafe @export "quip_time_monotonic_ns"

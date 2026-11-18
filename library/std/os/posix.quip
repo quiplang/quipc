@@ -1,6 +1,7 @@
 @unsafe @external make uname (buffer: ptr<any>) -> i32
 
-@pure @const make native_process = @import "../internal/os_process.quip"
+@import "../internal/os_process.quip"
+
 @external make quip_fork () -> int
 
 @pub
@@ -91,7 +92,7 @@ make create (path: str, mode: int) -> int {
 }
 
 @pub
-make fstat (fd: int) -> int {
+make fstat (_: int) -> int {
     return -1
 }
 

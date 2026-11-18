@@ -775,9 +775,9 @@ make type Builder {
                 return
             }
             if layout.*.fallible_payload.len() > 0 {
-                make index = structs::find(this.layouts, layout.*.fallible_payload.copy())
+                make payload_layout = structs::find(this.layouts, layout.*.fallible_payload.copy())
                 api::LLVMSetAlignment(api::LLVMBuildStore(this.handle, this.zero, dest), 8)
-                this.construct_array(this.byte_offset(dest, 8), rv, body, this.layouts.*[index].array_element.copy())
+                this.construct_array(this.byte_offset(dest, 8), rv, body, this.layouts.*[payload_layout].array_element.copy())
                 return
             }
         }

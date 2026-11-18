@@ -11,7 +11,7 @@
 @pub @pure @const {
     @target "macos" make platform: unit = @import "macos.quip"
     @target "linux" make platform: unit = @import "linux.quip"
-    make syscall: unit = @import "syscall.quip"
+    // make syscall: unit = @import "syscall.quip"
 }
 
 
@@ -34,9 +34,12 @@ make getcwd () -> str {
         runtime::runtime_panic("unsupported platform".to_c_str(), "std/pkg.quip".to_c_str(), 32)
     }
 
-    @unsafe if syscall::quip_getcwd(result.pin) < 0 { return result }
-
-    return result
+//     @unsafe
+//     if syscall::quip_getcwd(result.pin) < 0 {
+//         return result
+//     }
+//
+//     return result
 }
 
 @pub

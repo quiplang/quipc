@@ -6,6 +6,7 @@
 
 @pub
 make type UseCheck {
+    @pub make target: uint = 0
     @pub make kind: uint = 0
     @pub make range: util::Range = .{}
     @pub make span: util::Span = .{}
@@ -104,4 +105,11 @@ make type FieldCheck {
     @pub make range: util::Range
     @pub make name: str
     @pub make owner: str
+}
+
+@pub
+make record_write (checks: ref<UseCheck[]>, target: uint, update: bool) {
+    make kind: uint = 8
+    if update { kind = 9 }
+    checks.*.push(UseCheck { kind = kind, target = target })
 }

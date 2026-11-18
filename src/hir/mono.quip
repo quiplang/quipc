@@ -344,8 +344,8 @@ make type Mono {
 
             if want != arg_idx.len() {
                 make d = diags::Diag.err(err::Err.TypeMismatch, body.*.types[idx].range !, "wrong number of type arguments")
-                make t = "`" + member.copy() + "` takes " + want.to_str() + " type argument(s), found " + arg_idx.len().to_str()
-                d.label(t)
+                make message = "`" + member.copy() + "` takes " + want.to_str() + " type argument(s), found " + arg_idx.len().to_str()
+                d.label(message)
                 this.units.*[ctx].diag.*.report(d)
                 return false
             }

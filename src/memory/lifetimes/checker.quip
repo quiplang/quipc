@@ -2,6 +2,7 @@
 // checks and the stack slot / obligation reports
 
 @pure @const {
+    make e = @import "../../diag/err.quip"
     make mir = @import "../../mir/mir.quip"
     make hir = @import "../../hir/hir.quip"
     make diags = @import "../../diag/diagnosis.quip"
@@ -104,6 +105,18 @@ make check_func (f: ref<mir::MirFunc>, diag: ref<diags::Diagnostic>, ctx: ref<re
 
     if body.*.terms.len() > 0 && body.*.locals.len() > 0 {
         run(body, diag, ctx, fr.pin, structs, funcs, timings)
+    }
+
+    if !diag.*.hide_warnings && !diag.*.has_errors() {
+        for obligation : fr.obligations {
+            if !obligation.closed && !obligation.freed && !obligation.transferred && !obligation.auto_released && !obligation.auto_cleanup {
+                make d = diags::Diag.warn(e::Warn.PossibleMemoryLeak, obligation.allocation_range.copy(), "allocation may leak")
+                d.label("allocation has no tracked deallocation or ownership transfer")
+                d.note("allocation made by `" + obligation.allocator.copy() + "`; raw-pointer escapes may require manual ownership verification")
+                d.help("free this allocation with its matching deallocator on every exit path, return or transfer ownership explicitly, or use an automatically cleaned owned value")
+                diag.*.report(d)
+            }
+        }
     }
 
     fr.managed_heap_sites = report::count_managed_sites(body)

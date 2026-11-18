@@ -7,6 +7,10 @@
 make get () -> ptr<i32> {
     @target "macos" { return os::__error() }
     @target "linux" { return os::__errno_location() }
+
+    @weak {
+
+    }
     @unsafe make null: ptr<i32> = 0
     return null
 }

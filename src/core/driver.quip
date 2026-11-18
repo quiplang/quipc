@@ -102,6 +102,8 @@ make type Driver {
             _ {}
         }
         if this.config.options.benchmark { args.push("--benchmark") }
+        if this.config.options.extra_warnings { args.push("--extra-warnings") }
+        if this.config.options.hide_warnings { args.push("--hide-warnings") }
         if this.config.options.keep_llvm { args.push("--keep-llvm") }
         if !this.config.options.progress_enabled { args.push("--no-progress") }
         if this.config.options.show_quipc_debug { args.push("--verbose") }
@@ -238,6 +240,7 @@ make type Driver {
                 while si < mgr.*.compilation_stack.len() {
                     make id = mgr.*.compilation_stack[si]
                     std::progress::phase("Lower", si, mgr.*.compilation_stack.len(), mgr.*.units[id].path_rel.get())
+                    mgr.*.units[id].extra_warnings = this.config.options.extra_warnings
                     mgr.*.units[id].verbose = this.config.options.show_quipc_debug
 
                     mgr.*.units[id].emit_mir = this.config.emit_mir
@@ -335,8 +338,6 @@ make type Driver {
                     memr::collect(mgr.*.units[mi].hir_module.pin, memory_context.pin)
                     mi = mi + 1
                 }
-
-
 
 
                 mi = 0

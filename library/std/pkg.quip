@@ -1,5 +1,5 @@
 @pure @const make c_ffi = @import "./ffi/c.quip"
-@pure @const make runtime = @import "../runtime/pkg.quip"
+@import "../runtime/pkg.quip"
 @pure @const make panic_runtime = @import "../runtime/panic.quip"
 
 @pub @pure @const {
@@ -18,7 +18,6 @@
 }
 
 
-
 @pub
 make type Options {
 
@@ -28,6 +27,7 @@ make type Options {
         make show_quipc_debug: bool = false
         make show_memory_dump: bool = false
         make hide_warnings: bool = false
+        make extra_warnings: bool = false
         make benchmark: bool = false
         make keep_llvm: bool = false
         make progress_enabled: bool = true
@@ -484,6 +484,7 @@ make type Build {
             _ {}
         }
 
+        if this.options.extra_warnings { this.args.push("--extra-warnings") }
         if this.options.hide_warnings {
             this.args.push("--hide-warnings")
         }
@@ -543,6 +544,8 @@ make load_build_args (b: ref<Build>, argv: ptr<char>[]) -> !uint {
             "--benchmark" { b.*.options.benchmark = true }
             "--keep-llvm" { b.*.options.keep_llvm = true }
             "--no-progress" { b.*.options.progress_enabled = false }
+            "--extra-warnings" { b.*.options.extra_warnings = true }
+            "--hide-warnings" { b.*.options.hide_warnings = true }
             "--verbose" { b.*.options.show_quipc_debug = true }
             "--alias" {
                 if i + 2 >= argv.len() { return error.InvalidBuildArguments }
@@ -576,8 +579,6 @@ make load_legacy_build_context (b: ref<Build>) {
     }
 }
 
-
-
 @impl char
 make is_space () -> bool {
     make c = this.deref
@@ -605,14 +606,17 @@ make is_digit () -> bool {
 
 @pub
 make todo (fmt: variant<str, String>, line: int, file: String) {
+    _ = fmt
+    _ = line
+    _ = file
 
-    match fmt {
-        a: str {
-        }
-
-        b: String {
-        }
-    }
+//     match fmt {
+//         a: str {
+//         }
+//
+//         b: String {
+//         }
+//     }
 
     process::abort()
 }

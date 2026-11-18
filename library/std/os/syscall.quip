@@ -1,8 +1,8 @@
 @pure @const make posix: unit = @import "./posix.quip"
-@pure @const make native_os = @import "../internal/os.quip"
-@pure @const make windows: unit = @import "./windows.quip"
+@import "../internal/os.quip"
+// @pure @const make windows: unit = @import "./windows.quip"
 
-@pure @const make mem: unit = @import "../mem/pkg.quip"
+@import "../mem/pkg.quip"
 
 @pub
 make open (path: str) -> int {

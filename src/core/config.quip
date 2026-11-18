@@ -338,6 +338,8 @@ make type Config {
                 this.options.progress_enabled = false
             } elif t == "--show-debug" || t == "--verbose" {
                 this.options.show_quipc_debug = true
+            } elif t == "--extra-warnings" {
+                this.options.extra_warnings = true
             } elif t == "--hide-warnings" {
                 this.options.hide_warnings = true
             } elif t == "--memory-dump" {

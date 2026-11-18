@@ -159,6 +159,7 @@ make print_help () -> void {
     std::io::println("")
     std::io::println("Diagnostic options:")
     std::io::println("  --benchmark                             Report compile-time hotspots for compile or build")
+    std::io::println("  --extra-warnings                        Warn about discarded ordinary results")
     std::io::println("  --hide-warnings                         Hide warnings")
     std::io::println("  --emit-mir                              Print MIR and stop")
     std::io::println("  --emit-mem                              Print memory analysis and stop")

@@ -1,6 +1,6 @@
 @pure @const {
-    make io: unit = @import "../io/pkg.quip"
-    make mem: unit = @import "../mem/pkg.quip"
+    // make io: unit = @import "../io/pkg.quip"
+    // make mem: unit = @import "../mem/pkg.quip"
 }
 
 

@@ -1,7 +1,7 @@
 @pure @const {
     make p: unit = @import "path.quip"
 
-    @target "macos" make os: unit = @import "../os/macos.quip"
+    make os: unit = @import "../os/pkg.quip"
 }
 
 
@@ -10,25 +10,29 @@ make type Dir {
 
     @pub
     make mkdir (path: ref<p::Path>, mode: int) -> !void {
-        @target "macos" {
-            @unsafe
-            if os::access(path.*.get().data, 0) == 0 { return }
-
-            @unsafe
-            if os::mkdir(path.*.get().data, mode) < 0 { return error.DirCreationFailed }
+        make filename = path.*.get()
+        for ch : filename ! {
+            if ch == '\0' { os::set_errno(os::ErrorCode.Invalid) return error.InvalidPath }
         }
+        filename.push('\0')
+        make exists = true
+        @unsafe os::access(filename.data, os::AccessMode.Exists) catch { exists = false }
+        if exists { return }
+        if mode < 0 || mode > 4095 { return error.InvalidMode }
+        @unsafe make permissions: u32 = mode
+        @unsafe os::mkdir(filename.data, permissions) catch { return error.DirCreationFailed }
 
-        @target "linux" {}
-
-        @target "windows" {}
     }
 
     @pub
     make rmdir (path: ref<p::Path>) -> !void {
-        @target "macos" {
-            @unsafe
-            if os::rmdir(path.*.get().data) < 0 { return error.DirRemovalFailed }
+        make filename = path.*.get()
+        for ch : filename ! {
+            if ch == '\0' { os::set_errno(os::ErrorCode.Invalid) return error.InvalidPath }
         }
+        filename.push('\0')
+        @unsafe os::rmdir(filename.data) catch { return error.DirRemovalFailed }
+
     }
 
 }

@@ -1,43 +1,14 @@
-@pure @const {
+@import "../impl/str.quip"
+@import "../fmt/pkg.quip"
+@import "../ffi/cffi.quip"
+@import "../mem/pkg.quip"
 
+@pure @const {
     make os: unit = @import "../os/pkg.quip"
 
-    @import "../mem/pkg.quip"
     // make ffi: unit = @import "../ffi/c.quip"
 
     // make math: unit = @import "../math/pkg.quip"
-}
-
-make __path_split (buffer: variant<String, str, ptr<char>>, c: char) -> str[] {
-    make s: str = match buffer {
-        x: str => x
-        y: String => y.to_str()
-        z: ptr<char> => z.to_str()
-        _ => ""
-    }
-
-    make result: str[] = []
-    make current: str = ""
-    make i: int = 0
-
-    while i < s.len() {
-        if s[i] == c {
-            if current.len() > 0 {
-                result.push(current + "")
-                current = ""
-            }
-        } else {
-            current = current + s[i]
-        }
-
-        i = i + 1
-    }
-
-    if current.len() > 0 {
-        result.push(current + "")
-    }
-
-    return result
 }
 
 @pub
@@ -48,9 +19,7 @@ make type Path {
         make is_absolute: bool = false
     }
 
-    @target "macos" {
-        @const make delimeter: char = '/'
-    }
+    @const make delimeter: char = '/'
 
 
     @pub
@@ -68,13 +37,20 @@ make type Path {
             path.is_absolute = text[0] == path.delimeter
         }
 
-        path.content = __path_split(text, path.delimeter)
+        path.content = text.split(path.delimeter)
 
         // resolve '~' (home directory) so it is not passed to the system
         if path.content.len() > 0 {
             if path.content[0] == "~" {
 
-                @unsafe make home_parts = __path_split(os::getenv("HOME"), path.delimeter)
+                make home_parts: str[] = []
+                @unsafe {
+                    make home = os::getenv("HOME".data)
+                    make null: ptr<char> = 0
+                    if home != null {
+                        home_parts = home.to_str().split(path.delimeter)
+                    }
+                }
                 make resolved: str[] = []
 
                 for p : home_parts.iter() {
@@ -126,8 +102,8 @@ make type Path {
             }
         }
 
-        make cwd = Path.create(os::getcwd())
-        make result = Path {}
+        make cwd = Path.cwd() catch { @unsafe os::abort() }
+        make result = Path { is_absolute = true }
 
         for i : cwd.content.iter() {
             result.content.push(i)
@@ -177,6 +153,31 @@ make type Path {
         }
 
         return new
+    }
+
+    @pub
+    make cwd () -> !Path {
+        make buffer: str = ""
+        make capacity: uint = 1024
+
+        while capacity <= 1048576 {
+            buffer.reserve(capacity) catch { return error.OSFailed }
+
+            @unsafe make value = os::getcwd_into(buffer.data, capacity) catch err {
+                if !os::error_is(os::ErrorCode.Range) { return err }
+                capacity = capacity * 2
+                continue
+            }
+
+            make result: str = ""
+            make i: uint = 0
+            while value[i] != '\0' { result.push(value[i]) i++ }
+
+            return Path.create(result)
+        }
+
+        os::set_errno(os::ErrorCode.Range)
+        return error.OSFailed
     }
 }
 

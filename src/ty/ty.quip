@@ -55,6 +55,7 @@ make enum TyKind {
 /// stores an interned type and its associated type ids.
 @pub
 make type Ty {
+    @pub make is_noreturn: bool = false
     @pub make is_unsafe: bool = false
     @pub make kind: TyKind = TyKind.Error
     @pub make elem: uint = 0
@@ -221,7 +222,7 @@ make type TyInterner {
     /// compares an interned type with a candidate for structural equality.
     @this
     make eq_at (idx: uint, b: ref<Ty>) -> bool {
-        if this.tys[idx].is_unsafe != b.*.is_unsafe || this.tys[idx].kind != b.*.kind || this.tys[idx].elem != b.*.elem || this.tys[idx].def != b.*.def {
+        if this.tys[idx].is_noreturn != b.*.is_noreturn || this.tys[idx].is_unsafe != b.*.is_unsafe || this.tys[idx].kind != b.*.kind || this.tys[idx].elem != b.*.elem || this.tys[idx].def != b.*.def {
             return false
         }
 

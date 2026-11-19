@@ -344,6 +344,13 @@ make type Parser {
             return
         }.*
 
+        if node.*.name.lexeme == "weak" {
+            make d = diag::Diag.err(err::Err.InvalidSyntax, util::Range.of(start.start, node.*.name.span.end), "`@weak` has been removed")
+            d.help("replace `@weak` with `@target \"unknown\"` for a platform fallback")
+            d.suggest_replace(start.start - 1, node.*.name.span.end, "@target \"unknown\"")
+            this.report(ctx, d)
+        }
+
         node.*.target = ""
 
         // a few tags carry data with them, e.g. `@target "macos"` (a string) and
@@ -1314,10 +1321,12 @@ make type Parser {
         }
 
         make tags: owned<ast::AST_Tag>[] = []
+        make source_start = this.current().*.span.copy()
 
         while this.current().*.kind != lexer::TokenKind.RBrace && this.current().*.kind != lexer::TokenKind.EOF {
 
             make before_stmt = this.index
+            if tags.len() == 0 { source_start = this.current().*.span.copy() }
 
             if this.current().*.kind == lexer::TokenKind.At && !this.is_source_location() {
                 this.parse_tag(ctx, tags.pin)
@@ -1330,6 +1339,7 @@ make type Parser {
 
                 if nested != none {
                     make nested_stmts = nested.unwrap()
+                    make group_range = util::Range.of(source_start.start, nested_stmts.end_span.end)
                     // same as proceed: drain owned heads with pop, do not move via iter
                     make drained: owned<ast::AST_Head>[] = []
 
@@ -1339,6 +1349,7 @@ make type Parser {
 
                     while drained.len() > 0 {
                         make node = drained.pop()
+                        node.*.group_range = group_range.copy()
 
                         for tag : tags.iter() {
                             node.*.tags.push(tag.copy())
@@ -1358,6 +1369,9 @@ make type Parser {
 
                 if stmt != none {
                     make stmt_node = stmt.unwrap()
+                    // Include every tag and the statement keyword in source edits.
+                    stmt_node.*.range.start = source_start.copy()
+                    stmt_node.*.range.end = this.prev().*.span.copy()
 
                     make tagsc: owned<ast::AST_Tag>[] = []
 

@@ -1,13 +1,8 @@
+@pure @const {
+    make os: unit = @import "../os/pkg.quip"
+}
+
 // Monotonic elapsed time, whole-unit durations, sleeping and Unix timestamps.
-@external
-make quip_time_monotonic_ns (output: ref<uint>) -> int
-
-@external
-make quip_time_unix_seconds (output: ref<int>) -> int
-
-@external
-make quip_time_sleep_ns (nanoseconds: uint) -> int
-
 @pub
 make type Duration {
 
@@ -91,14 +86,19 @@ make type Instant {
 
     @pub
     make now () -> !Instant {
-        make value: uint = 0
+        make value: os::TimeSpec = .{}
+        @unsafe {
+            os::clock_gettime(os::Clock.Monotonic, value.pin) catch { return error.ClockFailed }
+        }
 
-        if quip_time_monotonic_ns(value.pin) != 0 {
+        @unsafe make seconds: uint = value.seconds
+        @unsafe make nanos: uint = value.nanoseconds
+        if value.seconds < 0 || value.nanoseconds < 0 || nanos >= 1000000000 || seconds > 18446744073 || (seconds == 18446744073 && nanos > 709551615) {
             return error.ClockFailed
         }
 
         return Instant {
-            nanoseconds = value,
+            nanoseconds = seconds * 1000000000 + nanos,
         }
     }
 
@@ -173,21 +173,31 @@ make type Timer {
 
 @pub
 make sleep (duration: Duration) -> !void {
-    if quip_time_sleep_ns(duration.nanoseconds) != 0 {
-        return error.SleepFailed
+    make remaining: os::TimeSpec = .{}
+    @unsafe make seconds: i64 = duration.nanoseconds / 1000000000
+    @unsafe make fraction: i64 = duration.nanoseconds % 1000000000
+    remaining.seconds = seconds
+    remaining.nanoseconds = fraction
+
+    @unsafe {
+        make address: ptr<os::TimeSpec> = remaining.pin
+        while true {
+            os::nanosleep(address, address) catch {
+                if os::error_is(os::ErrorCode.Interrupted) { continue }
+                return error.SleepFailed
+            }
+            break
+        }
     }
 }
 
 // Wall-clock seconds since 1970-01-01 UTC. Use Instant/Timer for intervals.
 @pub
 make unix_timestamp () -> !int {
-    make value: int = 0
-
-    if quip_time_unix_seconds(value.pin) != 0 {
-        return error.ClockFailed
+    make value: os::TimeSpec = .{}
+    @unsafe {
+        os::clock_gettime(os::Clock.Realtime, value.pin) catch { return error.ClockFailed }
     }
 
-    return value
+    return value.seconds
 }
-
-@import "../internal/time.quip"

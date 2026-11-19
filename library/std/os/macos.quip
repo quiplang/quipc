@@ -8,8 +8,8 @@
 @target "macos" {
 @pub
 make type timespec {
-    make tv_sec: i64 = 0
-    make tv_nsec: i64 = 0
+    @pub make tv_sec: i64 = 0
+    @pub make tv_nsec: i64 = 0
 }
 
 // Darwin LP64 struct stat storage. Quip scalar fields occupy eight-byte
@@ -433,13 +433,13 @@ make type stat_t {
     make usleep (microseconds: u32) -> i32
 
     @pub @external
-    make _exit (status: i32) -> void
+    @noreturn make _exit (status: i32) -> void
 
     @pub @external
-    make exit (status: i32) -> void
+    @noreturn make exit (status: i32) -> void
 
     @pub @external
-    make abort () -> void
+    @noreturn make abort () -> void
 
     @pub @external
     make system (command: ptr<char>) -> i32
@@ -575,10 +575,11 @@ make type stat_t {
 
     @pub @unsafe @external make raise (signal: i32) -> i32
 
-    @pub @unsafe @external make atexit (callback: ptr<any>)
-    -> i32
+    @pub @unsafe @external make atexit (callback: ptr<any>) -> i32
+
     @pub @unsafe @external @variadic make ioctl (fd: i32, request: u64) -> i32
 
     @pub @unsafe @external make poll (fds: ptr<any>, count: nfds_t, timeout: i32) -> i32
 
+    @pub @unsafe @external make uname (buffer: ptr<any>) -> i32
 }

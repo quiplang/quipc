@@ -58,7 +58,7 @@ make type Profile {
 
     @pub
     make init (summary: bool) -> Profile {
-        make trace = std::os::getenv("QUIPC_PROFILE_ANALYSIS") == "1"
+        make trace = std::process::Environment.get("QUIPC_PROFILE_ANALYSIS", "") == "1"
         return Profile { enabled = summary || trace, summary = summary, trace = trace }
     }
 
@@ -72,7 +72,7 @@ make type Profile {
         make elapsed = finished - started
         if this.trace {
             make line = "quip-profile\t" + phase.copy() + "\t" + elapsed.to_str() + "\t" + path.copy() + "\n"
-            @unsafe { std::os::platform::write(2, line.data, line.len()) }
+            @unsafe { std::os::write(2, line.data, line.len()) catch {} }
         }
         if !this.summary { return }
 

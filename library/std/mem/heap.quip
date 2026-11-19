@@ -1,9 +1,13 @@
 @pure @const {
     make block: unit = @import "block.quip"
-    make syscall: unit = @import "../os/syscall.quip"
+    make os: unit = @import "../os/pkg.quip"
 
     make io: unit = @import "../io/pkg.quip"
 }
+
+// Runtime ownership bookkeeping is independent of the selected OS.
+@unsafe @external
+make quip_runtime_allocation_active () -> uint
 
 // the head of one free list
 make type Bin {
@@ -61,7 +65,8 @@ make type Heap {
 
         @unsafe {
             // map anonymous memory
-            make raw_mem: ptr<any> = syscall::quip_map_anon(h.chunk_size !)
+            @unsafe make no_address: ptr<any> = 0
+            make raw_mem: ptr<any> = os::map(no_address, h.chunk_size !, os::MapOptions {}, -1, 0) catch { os::abort() }
 
             // the list heads live at the start of the chunk
             make chunk: ptr<Chunk> = raw_mem
@@ -184,7 +189,8 @@ make type Heap {
     @pub @this
     make grow (req_size: int) {
         @unsafe {
-            make page: int = syscall::quip_page_size()
+            make page: int = os::page_size()
+            if page <= 0 { page = 4096 }
 
             make want: int = this.chunk_size
             make needed: int = req_size + (@sizeof block::Block) * 2 + (@sizeof Chunk)
@@ -196,7 +202,8 @@ make type Heap {
             // whole pages only
             want = ((want + page - 1) / page) * page
 
-            make raw_mem: ptr<any> = syscall::quip_map_anon(want)
+            @unsafe make no_address: ptr<any> = 0
+            make raw_mem: ptr<any> = os::map(no_address, want, os::MapOptions {}, -1, 0) catch { os::abort() }
             make chunk: ptr<Chunk> = raw_mem
             chunk.*.next = this.chunks
             chunk.*.size = want
@@ -252,7 +259,7 @@ make type Heap {
 
                     // Runtime buffers retain their own lifetime and accounting,
                     // even when the runtime is routed through this allocator.
-                    if syscall::quip_runtime_allocation_active() != 0 { some.*.generation = 0 }
+                    if quip_runtime_allocation_active() != 0 { some.*.generation = 0 }
 
                     this.live_bytes = this.live_bytes + some.*.size
 

@@ -1,1 +1,31 @@
-@pure @const make runtime_methods = @import "../../runtime/str_methods.quip"
+
+@impl str
+make split (delimeter: char) -> str[] {
+
+    make result: str[] = []
+
+    make current: str = ""
+    make i: int = 0
+
+    while i < this.len() {
+        if this[i] == delimeter {
+            if current.len() > 0 {
+                result.push(current)
+                current = ""
+            }
+        } else {
+            current += this[i]
+        }
+
+        i += 1
+    }
+
+    if current.len() > 0 {
+        result.push(current)
+    }
+
+    return result
+}
+
+
+@import "../../runtime/str_methods.quip"

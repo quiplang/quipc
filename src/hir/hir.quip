@@ -74,6 +74,7 @@ make type HirCase {
 /// represents an expression in a hir body.
 @pub
 make type HirExpr {
+    @pub make is_noreturn: bool = false
     @pub make is_const: bool = false
     @pub make requires_pure: bool = false
     @pub make is_assignment_target: bool = false
@@ -133,6 +134,7 @@ make enum HirStmtKind {
 make type HirStmt {
     @pub make kind: HirStmtKind = HirStmtKind.Unsupported
     @pub make range: util::Range = .{}
+    @pub make group_range: util::Range = .{}
 
     @pub make local: uint = 0            // Let
     @pub make target: uint = 0           // Assign: place expression
@@ -306,6 +308,7 @@ make type HirTypeSig {
 // module can resolve (and validate) attached calls on types declared in its dependencies.
 @pub
 make type HirAttachedSig {
+    @pub make is_noreturn: bool = false
     @pub make is_pure: bool = false
     @pub make path: str = ""
     @pub make source: ref<str>? = none
@@ -356,6 +359,7 @@ make type HirStructSig {
 // `ast::fresh_func()` from another module
 @pub
 make type HirFuncSig {
+    @pub make is_noreturn: bool = false
     // True only when a source body has a conservative effect proof.
     @pub make path: str = ""
     @pub make source: ref<str>? = none
@@ -458,6 +462,7 @@ make type HirConst {
 // a `@pub` symbol exported by a module, as seen by the modules that import it
 @pub
 make type HirExport {
+    @pub make is_noreturn: bool = false
     @pub make is_const: bool = false
     @pub make is_pure: bool = false
     @pub make is_unsafe: bool = false

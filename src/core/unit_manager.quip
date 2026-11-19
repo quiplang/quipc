@@ -1,4 +1,5 @@
 @pure @const {
+    make facts = @import "../analysis/facts.quip"
     make sources = @import "sources.quip"
     make profile = @import "analysis_profile.quip"
     make std = @import "std"
@@ -213,7 +214,7 @@ make type Unit {
         }
 
         this.public_symbols = public_symbols_of(this.program.pin)
-        this.imports = collect_imports(this.program.pin)
+        this.imports = collect_imports(this.program.pin, this.platform_name.copy())
 
         return
     }
@@ -225,7 +226,7 @@ make type Unit {
     /// lowers this unit to hir and validates its declarations and entry point.
     @pub @this
     make lower (timings: ref<profile::Profile>) -> !void {
-        // translate to HIR (honouring @target / @weak groups for the selected platform)
+        // translate to HIR (honouring @target groups for the selected platform)
         make started: uint = 0
 
         if timings.*.enabled { started = profile::now() }
@@ -666,12 +667,14 @@ make collect_import_from_var (node: ptr<ast::AST_Head>, out: ref<ImportInfo[]>) 
     }
 }
 
-make collect_imports (program: ref<owned<ast::AST_Head>[]>) -> ImportInfo[] {
+make collect_imports (program: ref<owned<ast::AST_Head>[]>, os: str) -> ImportInfo[] {
     make out: ImportInfo[] = []
 
+    make selected = hir_lower::selected_nodes(program, os)
     make i: uint = 0
 
     while i < program.*.len() {
+        if !selected[i] { i++ continue }
         @unsafe make node: ptr<ast::AST_Head> = program.*[i].*.pin
 
         if node.*.var != none {
@@ -811,12 +814,14 @@ make export_const_expr (val: ptr<ast::AST_Head>, name: str, out: ref<hir::HirExp
 }
 
 // the `@pub` symbols declared at the top level of a program, with their `@external` flag
-make exports_of (program: ref<owned<ast::AST_Head>[]>) -> hir::HirExport[] {
+make exports_of (program: ref<owned<ast::AST_Head>[]>, os: str) -> hir::HirExport[] {
     make out: hir::HirExport[] = []
 
+    make selected = hir_lower::selected_nodes(program, os)
     make i: uint = 0
 
     while i < program.*.len() {
+        if !selected[i] { i++ continue }
         @unsafe make node: ptr<ast::AST_Head> = program.*[i].*.pin
 
         make before = out.len()
@@ -825,6 +830,7 @@ make exports_of (program: ref<owned<ast::AST_Head>[]>) -> hir::HirExport[] {
         make is_unsafe = false
         make is_pub = false
         make is_external = false
+        make is_noreturn = false
         make ti: uint = 0
 
         while ti < node.*.tags.len() {
@@ -833,6 +839,7 @@ make exports_of (program: ref<owned<ast::AST_Head>[]>) -> hir::HirExport[] {
             if tag.*.name.lexeme == "const" { is_const = true }
             if tag.*.name.lexeme == "pure" { is_pure = true }
             if tag.*.name.lexeme == "unsafe" { is_unsafe = true }
+            if tag.*.name.lexeme == "noreturn" { is_noreturn = true }
 
             if tag.*.name.lexeme == "pub" {
                 is_pub = true
@@ -966,6 +973,7 @@ make exports_of (program: ref<owned<ast::AST_Head>[]>) -> hir::HirExport[] {
             out[before].is_const = is_const
             out[before].is_pure = is_pure
             out[before].is_unsafe = is_unsafe
+            out[before].is_noreturn = is_noreturn
             before = before + 1
         }
 
@@ -1025,13 +1033,15 @@ make type UnitManager {
     @pub make free_sigs: hir::HirFuncSig[] = []
 
     make hide_warnings: bool = false
+    make platform_name: str = ""
     make visited: bool[] = []
 
 
     @pub
-    make init (main: std::io::Path, names: str[], paths: std::io::Path[], hide_warnings: bool, timings: ref<profile::Profile>) -> !UnitManager {
+    make init (main: std::io::Path, names: str[], paths: std::io::Path[], hide_warnings: bool, os: str, timings: ref<profile::Profile>) -> !UnitManager {
         make manager = UnitManager {}
         manager.hide_warnings = hide_warnings
+        manager.platform_name = os
         manager.package_names = names
         manager.package_paths = paths
 
@@ -1077,7 +1087,7 @@ make type UnitManager {
         if path.len() == 0 || path[0] == '/' || path[0] == '~' { return relative }
         if can_open_import(relative.pin) { return relative }
 
-        make home = std::os::getenv("HOME")
+        make home = std::process::Environment.get("HOME", "")
         if home.len() == 0 { return relative }
 
         make installed = std::io::Path.create(home + "/.quip/current/lib/" + path)
@@ -1118,6 +1128,7 @@ make type UnitManager {
             return err
         }
 
+        u.platform_name = this.platform_name.copy()
         u.key = key
         this.units.push(u)
 
@@ -1166,7 +1177,7 @@ make type UnitManager {
                     some {
                         this.units[id].imports[ii].unit = some
                         this.units[id].imports[ii].resolved = true
-                        this.units[id].imports[ii].exports = exports_of(this.units[some].program.pin)
+                        this.units[id].imports[ii].exports = exports_of(this.units[some].program.pin, this.platform_name.copy())
 
                         if this.units[id].imports[ii].alias.len() == 0 {
                             ii++
@@ -1176,7 +1187,7 @@ make type UnitManager {
 
                         imp.alias = this.units[id].imports[ii].alias !
                         imp.basename = basename_of(this.units[id].imports[ii].path !)
-                        imp.exports = exports_of(this.units[some].program.pin)
+                        imp.exports = exports_of(this.units[some].program.pin, this.platform_name.copy())
                         this.units[id].hir_imports.push(imp)
                     }
                 }
@@ -1213,7 +1224,7 @@ make type UnitManager {
     // recurse into every unit that `target` re-exports with `@pub`
     @this
     make add_namespace (host: uint, path: str, target: uint) {
-        make exports = exports_of(this.units[target].program.pin)
+        make exports = exports_of(this.units[target].program.pin, this.platform_name.copy())
 
         // collect re-exported units before `exports` is moved into the namespace entry
         make sub_names: str[] = []
@@ -1515,6 +1526,7 @@ make collect_sigs_into (out: ref<hir::HirAttachedSig[]>, module: ref<hir::HirMod
             sig.path = path.copy()
             sig.source = source
             sig.name_span = f.*.name_span.copy()
+            sig.is_noreturn = facts::noreturn_function(f)
             sig.symbol = f.*.name !
             sig.type_name = m.*.type_name !
             sig.name = m.*.name !
@@ -1700,6 +1712,7 @@ make collect_free_sigs_into (out: ref<hir::HirFuncSig[]>, module: ref<hir::HirMo
             sig.path = module_name.copy()
             sig.source = source
             sig.name_span = f.*.name_span.copy()
+            sig.is_noreturn = facts::noreturn_function(f)
             sig.module = module_name.copy()
             sig.name = f.*.name !
             sig.is_variadic = f.*.is_variadic

@@ -1,6 +1,8 @@
-@pure @const make c_ffi = @import "./ffi/c.quip"
 @import "../runtime/pkg.quip"
+
 @pure @const make panic_runtime = @import "../runtime/panic.quip"
+
+@pure @const make c_ffi = @import "./ffi/c.quip"
 
 @pub @pure @const {
 
@@ -561,20 +563,20 @@ make load_build_args (b: ref<Build>, argv: ptr<char>[]) -> !uint {
 
 // Older bootstrap drivers supply their settings through the environment.
 make load_legacy_build_context (b: ref<Build>) {
-    b.*.options.show_quipc_debug = os::getenv("QUIPC_VERBOSE") == "1"
-    b.*.options.progress_enabled = os::getenv("QUIPC_NO_PROGRESS") != "1"
-    make compiler = os::getenv("QUIPC_COMPILER")
+    b.*.options.show_quipc_debug = process::Environment.get("QUIPC_VERBOSE", "") == "1"
+    b.*.options.progress_enabled = process::Environment.get("QUIPC_NO_PROGRESS", "") != "1"
+    make compiler = process::Environment.get("QUIPC_COMPILER", "")
     if compiler.len() > 0 { b.*.compiler_path = compiler }
-    b.*.options.keep_llvm = os::getenv("QUIPC_KEEP_LLVM") == "1"
-    b.*.selected_step = os::getenv("QUIPC_STEP")
-    set_build_profile(b, os::getenv("QUIPC_PROFILE"), os::getenv("QUIPC_OPTIMIZATION"))
+    b.*.options.keep_llvm = process::Environment.get("QUIPC_KEEP_LLVM", "") == "1"
+    b.*.selected_step = process::Environment.get("QUIPC_STEP", "")
+    set_build_profile(b, process::Environment.get("QUIPC_PROFILE", ""), process::Environment.get("QUIPC_OPTIMIZATION", ""))
 
     make i: uint = 0
     while true {
         make suffix = i.to_str()
-        make name = os::getenv("QUIPC_PACKAGE_NAME_" + suffix.copy())
+        make name = process::Environment.get("QUIPC_PACKAGE_NAME_" + suffix.copy(), "")
         if name.len() == 0 { break }
-        b.*.add_package(Package.create(name, os::getenv("QUIPC_PACKAGE_PATH_" + suffix)))
+        b.*.add_package(Package.create(name, process::Environment.get("QUIPC_PACKAGE_PATH_" + suffix, "")))
         i++
     }
 }
@@ -636,6 +638,7 @@ make test () -> !void {
 
 /// Prints a panic message with its source location and terminates the process.
 @pub
+@noreturn
 make panic (message: str, file: str, line: int) -> void {
     make message_bytes = message.copy()
     make file_bytes = file.copy()

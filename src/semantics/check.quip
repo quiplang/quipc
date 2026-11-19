@@ -11,67 +11,145 @@
 
 
 
+// Track distinct exits so a loop consumes its own break/continue edges.
+make type Flow {
+    @pub make next: bool = true
+    @pub make returns: bool = false
+    @pub make breaks: bool = false
+    @pub make continues: bool = false
+}
+
+make block_flow (body: ref<hir::HirBody>, block: uint) -> Flow {
+    make flow = Flow {}
+    for index : body.*.blocks[block].stmts {
+        if !flow.next { break }
+        make step = statement_flow(body, body.*.stmts[index].pin)
+        flow.next = step.next
+        flow.returns = flow.returns || step.returns
+        flow.breaks = flow.breaks || step.breaks
+        flow.continues = flow.continues || step.continues
+    }
+    return flow
+}
+
 @pub
 make block_exits (body: ref<hir::HirBody>, block: uint) -> bool {
-    make i: uint = 0
+    make flow = block_flow(body, block)
+    return !flow.next
+}
 
-    while i < body.*.blocks[block].stmts.len() {
-        make stmt = body.*.stmts[body.*.blocks[block].stmts[i]].pin
-
-        if statement_exits(body, stmt) { return true }
-
-        i = i + 1
+// Evaluate only operands guaranteed to run; short-circuit RHSs are conditional.
+make expression_exits (body: ref<hir::HirBody>, index: uint) -> bool {
+    make ex = body.*.exprs[index].pin
+    if ex.*.kind == hir::HirExprKind.Call {
+        if ex.*.is_noreturn || expression_exits(body, ex.*.lhs) { return true }
+        for argument : ex.*.args {
+            if expression_exits(body, argument) { return true }
+        }
+    } elif ex.*.kind == hir::HirExprKind.Binary {
+        if expression_exits(body, ex.*.lhs) { return true }
+        if ex.*.lit.lexeme != "&&" && ex.*.lit.lexeme != "||" {
+            return expression_exits(body, ex.*.rhs)
+        }
+    } elif ex.*.kind == hir::HirExprKind.Unary || ex.*.kind == hir::HirExprKind.Copy
+        || ex.*.kind == hir::HirExprKind.Deref || ex.*.kind == hir::HirExprKind.Pin
+        || ex.*.kind == hir::HirExprKind.Field {
+        return expression_exits(body, ex.*.lhs)
+    } elif ex.*.kind == hir::HirExprKind.Index {
+        return expression_exits(body, ex.*.lhs) || expression_exits(body, ex.*.rhs)
     }
-
     return false
 }
 
+make statement_flow (body: ref<hir::HirBody>, stmt: ref<hir::HirStmt>) -> Flow {
+    make flow = Flow {}
+    if stmt.*.kind == hir::HirStmtKind.Return {
+        flow.next = false
+        flow.returns = !stmt.*.has_value || !expression_exits(body, stmt.*.value)
+        return flow
+    }
+    if stmt.*.kind == hir::HirStmtKind.Break || stmt.*.kind == hir::HirStmtKind.Continue {
+        flow.next = false
+        flow.breaks = stmt.*.kind == hir::HirStmtKind.Break
+        flow.continues = stmt.*.kind == hir::HirStmtKind.Continue
+        return flow
+    }
+    if (stmt.*.kind == hir::HirStmtKind.Expr || stmt.*.kind == hir::HirStmtKind.Let
+        || stmt.*.kind == hir::HirStmtKind.Assign || stmt.*.kind == hir::HirStmtKind.If
+        || stmt.*.kind == hir::HirStmtKind.Match) && stmt.*.has_value {
+        if expression_exits(body, stmt.*.value) { flow.next = false return flow }
+    }
+    if stmt.*.kind == hir::HirStmtKind.Expr && expression_exits(body, stmt.*.value) {
+        flow.next = false
+        return flow
+    }
+    if stmt.*.kind == hir::HirStmtKind.Block { return block_flow(body, stmt.*.then_block) }
+    if stmt.*.kind == hir::HirStmtKind.Loop {
+        make inner = block_flow(body, stmt.*.then_block)
+        flow.next = inner.breaks
+        flow.returns = inner.returns
+        return flow
+    }
+    if stmt.*.kind == hir::HirStmtKind.If {
+        make condition = body.*.exprs[stmt.*.value].pin
+        if condition.*.kind == hir::HirExprKind.Literal {
+            if condition.*.lit.lexeme == "true" { return block_flow(body, stmt.*.then_block) }
+            if condition.*.lit.lexeme == "false" {
+                if stmt.*.has_else { return block_flow(body, stmt.*.else_block) }
+                return flow
+            }
+        }
+        make left = block_flow(body, stmt.*.then_block)
+        make right = Flow {}
+        if stmt.*.has_else { right = block_flow(body, stmt.*.else_block) }
+        flow.next = left.next || right.next
+        flow.returns = left.returns || right.returns
+        flow.breaks = left.breaks || right.breaks
+        flow.continues = left.continues || right.continues
+        return flow
+    }
+    if stmt.*.kind == hir::HirStmtKind.Match {
+        flow.next = false
+        make exhaustive = false
+        make has_some = false
+        make has_none = false
+        make has_true = false
+        make has_false = false
+        for index : stmt.*.cases {
+            make arm = body.*.cases[index].pin
+            if arm.*.kind == hir::HirPatternKind.Some { has_some = true }
+            if arm.*.kind == hir::HirPatternKind.None { has_none = true }
+            if arm.*.kind == hir::HirPatternKind.Literal {
+                if arm.*.lit.lexeme == "true" { has_true = true }
+                if arm.*.lit.lexeme == "false" { has_false = true }
+            }
+            make branch = Flow {}
+            if arm.*.has_body { branch = block_flow(body, arm.*.body) }
+            if branch.next && arm.*.has_result && expression_exits(body, arm.*.result) { branch.next = false }
+            flow.next = flow.next || branch.next
+            flow.returns = flow.returns || branch.returns
+            flow.breaks = flow.breaks || branch.breaks
+            flow.continues = flow.continues || branch.continues
+            if arm.*.kind == hir::HirPatternKind.Wildcard || arm.*.kind == hir::HirPatternKind.Binding {
+                exhaustive = true
+                break
+            }
+        }
+        flow.next = flow.next || !(exhaustive || (has_some && has_none) || (has_true && has_false))
+    }
+    return flow
+}
 
 make statement_exits (body: ref<hir::HirBody>, stmt: ref<hir::HirStmt>) -> bool {
-    if stmt.*.kind == hir::HirStmtKind.Return || stmt.*.kind == hir::HirStmtKind.Break
-        || stmt.*.kind == hir::HirStmtKind.Continue { return true }
-
-    if stmt.*.kind == hir::HirStmtKind.Block && block_exits(body, stmt.*.then_block) { return true }
-
-    if stmt.*.kind == hir::HirStmtKind.If && stmt.*.has_else {
-        if block_exits(body, stmt.*.then_block) && block_exits(body, stmt.*.else_block) { return true }
-    }
-
-    if stmt.*.kind == hir::HirStmtKind.Match {
-        make all_exit = stmt.*.cases.len() > 0
-        make exhaustive = false
-        make ci: uint = 0
-
-        while ci < stmt.*.cases.len() {
-            make hc = body.*.cases[stmt.*.cases[ci]].pin
-
-            if hc.*.kind == hir::HirPatternKind.Wildcard || hc.*.kind == hir::HirPatternKind.Binding { exhaustive = true }
-
-            if !hc.*.has_body { all_exit = false }
-            elif !block_exits(body, hc.*.body) { all_exit = false }
-
-            ci = ci + 1
-        }
-
-        if exhaustive && all_exit { return true }
-    }
-    return false
+    make flow = statement_flow(body, stmt)
+    return !flow.next
 }
+
 
 /// checks whether a hir function carries the unsafe tag.
 
 
 // A resolved use is recorded during type inference and checked in the semantic phase.
-
-
-
-
-
-
-
-
-
-
 make writable_place (body: ref<hir::HirBody>, index: uint, types: ref<uint[]>, tys: ref<ty::TyInterner>) -> bool {
     make expression = body.*.exprs[index].pin
     if expression.*.kind == hir::HirExprKind.Local || expression.*.kind == hir::HirExprKind.Deref { return true }
@@ -119,7 +197,9 @@ make check_uses (body: ref<hir::HirBody>, checks: ref<facts::UseCheck[]>, types:
             d.help("tag the receiving binding or enclosing function with `@pure`")
             diag.*.report(d)
         } elif check.kind == 11 {
-            diag.*.report(diags::Diag.err(e::Err.ConstMutation, check.range.copy(), "cannot mutate an `@const` binding"))
+            make d = diags::Diag.err(e::Err.ConstMutation, check.range.copy(), "cannot mutate an `@const` binding")
+            diag.*.suggest_line(d.*.pin, check.range.start.start, "")
+            diag.*.report(d)
         } elif check.kind == 8 || check.kind == 9 {
             if !writable_place(body, check.target, types, tys) {
                 make message = "assignment requires a writable place"
@@ -416,6 +496,28 @@ make check_typed_function (module: ref<hir::HirModule>, index: uint, tys: ref<ty
 
     make function = module.*.funcs[index].pin
 
+    if !function.*.is_external {
+        make noreturn = facts::noreturn_function(function)
+        make needs_value = ret_ty != ty::TY_VOID && ret_ty != ty::TY_ERROR
+        if tys.*.kind_of(ret_ty) == ty::TyKind.Fallible && tys.*.elem_of(ret_ty) == ty::TY_VOID { needs_value = false }
+        make flow = block_flow(function.*.body.pin, function.*.body.root)
+        if (flow.next || flow.breaks || flow.continues) && (noreturn || needs_value) {
+            make end = function.*.body.blocks[function.*.body.root].end_span.copy()
+            make d = diags::Diag.err(e::Err.TypeMismatch, util::Range.of(end.start, end.end), "function can reach its end without returning a value")
+            if noreturn { d.msg = "`@noreturn` function can reach its end" }
+            d.attach(diags::Label.create(util::Range.of(function.*.name_span.start, function.*.name_span.end), "function declared here"))
+            d.help("return a value on every path, or end the path with a call to an `@noreturn` function")
+            diag.*.report(d)
+        }
+        if noreturn {
+            if flow.returns {
+                make d = diags::Diag.err(e::Err.TypeMismatch, function.*.range.copy(), "`@noreturn` function must not return to its caller")
+                d.help("terminate execution, or remove `@noreturn` from the function")
+                diag.*.report(d)
+            }
+        }
+    }
+
     if function.*.export_name.len() > 0 { check_native_export(module, tys, diag, function, params, ret_ty, ret_ty) }
 
     if function.*.intrinsic_name.len() > 0 { check_native_intrinsic(tys, diag, function, params, ret_ty, ret_ty) }
@@ -536,12 +638,35 @@ make warn_body (body: ref<hir::HirBody>, types: ref<uint[]>, tys: ref<ty::TyInte
         make unreachable = false
         make previous: uint = 0
         make previous_local: uint = 0
+        make exit_end: uint = 0
         for index : block.stmts {
             make stmt = body.*.stmts[index].pin
             if unreachable {
-                make warning = diags::Diag.warn(e::Warn.Unreachable, stmt.*.range.copy(), "unreachable statement")
+                // Only selected HIR statements participate: source for other targets
+                // must never be swept into a deletion spanning the whole tail.
+                make range = stmt.*.range.copy()
+                if stmt.*.group_range.end.end > 0 && stmt.*.group_range.start.start >= exit_end {
+                    range = stmt.*.group_range.copy()
+                }
+                make warning = diags::Diag.warn(e::Warn.Unreachable, range.copy(), "unreachable statement")
                 warning.help("remove this unreachable code or change the preceding control flow so it can run")
-                warning.suggest_replace(stmt.*.range.start.start, stmt.*.range.end.end, "")
+                warning.attach(diags::Label.create(body.*.stmts[previous].range.copy(), "control flow exits here for the selected target"))
+                make deleting = false
+                make deleted_end: uint = 0
+                for dead_index : block.stmts {
+                    if dead_index == index { deleting = true }
+                    if deleting {
+                        make dead = body.*.stmts[dead_index].pin
+                        make removal = dead.*.range.copy()
+                        if dead.*.group_range.end.end > 0 && dead.*.group_range.start.start >= exit_end {
+                            removal = dead.*.group_range.copy()
+                        }
+                        if removal.start.start >= deleted_end {
+                            warning.suggest_replace(removal.start.start, removal.end.end, "")
+                            deleted_end = removal.end.end
+                        }
+                    }
+                }
                 diag.*.report(warning)
                 break
             }
@@ -581,6 +706,7 @@ make warn_body (body: ref<hir::HirBody>, types: ref<uint[]>, tys: ref<ty::TyInte
                 }
             }
             unreachable = statement_exits(body, stmt)
+            if unreachable { exit_end = stmt.*.range.end.end }
         }
     }
 }

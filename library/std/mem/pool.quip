@@ -10,7 +10,7 @@
 // nothing but the pointer. memory is never returned to the OS.
 
 @pure @const {
-    make syscall: unit = @import "../os/syscall.quip"
+    make os: unit = @import "../os/pkg.quip"
 
     make std: unit = @import "../pkg.quip"
     make io: unit = @import "../io/pkg.quip"
@@ -47,7 +47,8 @@ make type Pool {
         make p = Pool {}
 
         @unsafe {
-            make raw_mem: ptr<any> = syscall::quip_map_anon(p.chunk_size)
+            @unsafe make no_address: ptr<any> = 0
+            make raw_mem: ptr<any> = os::map(no_address, p.chunk_size, os::MapOptions {}, -1, 0) catch { os::abort() }
 
             make table: ptr<Link> = raw_mem
             make i: int = 0
@@ -61,7 +62,8 @@ make type Pool {
             make bytes: ptr<char> = raw_mem
 
             p.heads = table
-            p.cur = bytes + table_bytes
+            make start: ptr<char> = bytes + table_bytes
+            p.cur = start
             p.left = p.chunk_size - table_bytes
             p.mapped = p.chunk_size
         }
@@ -109,7 +111,8 @@ make type Pool {
     @pub @this
     make grow (need: int) {
         @unsafe {
-            make page: int = syscall::quip_page_size()
+            make page: int = os::page_size()
+            if page <= 0 { page = 4096 }
 
             make want: int = this.chunk_size
 
@@ -120,7 +123,8 @@ make type Pool {
             // whole pages only
             want = ((want + page - 1) / page) * page
 
-            make raw_mem: ptr<any> = syscall::quip_map_anon(want)
+            @unsafe make no_address: ptr<any> = 0
+            make raw_mem: ptr<any> = os::map(no_address, want, os::MapOptions {}, -1, 0) catch { os::abort() }
             make bytes: ptr<char> = raw_mem
 
             this.cur = bytes
@@ -163,7 +167,8 @@ make type Pool {
 
             make start: ptr<char> = this.cur.unwrap()
             make payload: ptr<char> = start + 16
-            this.cur = start + need
+            make next: ptr<char> = start + need
+            this.cur = next
             this.left = this.left - need
 
             make tag: ptr<Tag> = payload

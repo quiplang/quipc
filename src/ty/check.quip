@@ -791,6 +791,15 @@ make type Checker {
             return aa
         }
 
+        // A character is an unsigned byte and can widen to an unsigned integer.
+        // Keep this directional: assigning an integer to a character can lose bits.
+        if this.tys.*.kind_of(bb) == ty::TyKind.Char {
+            if aa == ty::TY_UINT || aa == ty::TY_U8 || aa == ty::TY_U16
+                || aa == ty::TY_U32 || aa == ty::TY_U64 {
+                return aa
+            }
+        }
+
         // the reference treats the fixed-width integer types as interchangeable, so a value of one
         // integer type is accepted where another is expected (`@sizeof` yields `u32` but unifies
         // with `int`, `return 0` works in a `uint` function, and so on)
@@ -2237,6 +2246,7 @@ make type Checker {
         make function = ty::Ty {}
 
         function.kind = ty::TyKind.Func
+        function.is_noreturn = facts::noreturn_function(f)
         function.is_unsafe = facts::unsafe_function(f)
         function.elem = ty::TY_VOID
 
@@ -2270,6 +2280,7 @@ make type Checker {
             return ty::TY_ERROR
         }
 
+        ex.*.is_noreturn = this.tys.*.tys[function].is_noreturn
         facts::require_unsafe(this.unsafe_depth, this.out.semantic_checks.pin, this.tys.*.tys[function].is_unsafe, ex.*.range.copy())
         make parameters = this.tys.*.args_of(function)
 
@@ -2414,6 +2425,7 @@ make type Checker {
         }
 
         make f = this.module.*.funcs[found].pin
+        ex.*.is_noreturn = facts::noreturn_function(f)
         this.require_pure_function(f, cal.*.range.copy())
         facts::require_unsafe_local(this.unsafe_depth, this.out.semantic_checks.pin, f, cal.*.range.copy())
         make params = f.*.body.param_count
@@ -2502,6 +2514,7 @@ make type Checker {
             make signature = this.funcs.*[value.signature].pin
             make function = ty::Ty {}
             function.kind = ty::TyKind.Func
+            function.is_noreturn = signature.*.is_noreturn
             function.is_unsafe = signature.*.is_unsafe
             function.elem = ty::TY_VOID
 
@@ -2578,6 +2591,9 @@ make type Checker {
             return ty::TY_ERROR
         }
 
+        // Export contracts are available even across import cycles, before the
+        // dependency's complete typed signature has been collected.
+        ex.*.is_noreturn = ns.*.exports[exported].is_noreturn
         this.require_pure(ns.*.exports[exported].is_pure, cal.*.range.copy())
         make fsi = this.symbols.find_func_sig(ns.*.module_name, member.copy())
         make has_sig = fsi < this.funcs.*.len()
@@ -2687,6 +2703,7 @@ make type Checker {
 
         if has_sig {
             make fs = this.funcs.*[fsi].pin
+            ex.*.is_noreturn = fs.*.is_noreturn
 
             this.out.abi_exprs.push(idx)
             this.out.abi_arg_starts.push(arg_start)
@@ -2934,6 +2951,7 @@ make type Checker {
     make resolve_local_attached (body: ref<hir::HirBody>, idx: uint, ex: ref<hir::HirExpr>, found: uint) -> uint {
         make m = this.module.*.attached_funcs[found].pin
         make f = this.module.*.funcs[m.*.func].pin
+        ex.*.is_noreturn = facts::noreturn_function(f)
         this.require_pure_function(f, body.*.exprs[ex.*.lhs].range.copy())
         facts::require_unsafe_local(this.unsafe_depth, this.out.semantic_checks.pin, f, body.*.exprs[ex.*.lhs].range.copy())
         make params = f.*.body.param_count
@@ -3070,6 +3088,7 @@ make type Checker {
 
         this.out.call_exprs.push(idx)
         this.out.call_names.push(sig.*.symbol !)
+        ex.*.is_noreturn = sig.*.is_noreturn
         this.out.abi_exprs.push(idx)
         this.out.abi_arg_starts.push(arg_start)
         this.out.abi_arg_counts.push(ex.*.args.len())

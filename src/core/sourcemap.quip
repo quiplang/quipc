@@ -7,6 +7,7 @@ make util = @import "../util/pkg.quip"
 make type LineMap {
 
     make offsets: uint[] // offsets[i] = start index of line i+1
+    make ends: uint[] // line ends, excluding newline bytes
     make size: uint = 0  // total length of the content
 
     @pub
@@ -21,13 +22,22 @@ make type LineMap {
 
         while index < content.*.len() {
 
-            if content.*[index] == '\n' {
+            // Treat CRLF as one newline and accept lone CR line endings too.
+            if content.*[index] == '\r' {
+                map.ends.push(index)
+                if index + 1 < content.*.len() && content.*[index + 1] == '\n' {
+                    index = index + 1
+                }
+                map.offsets.push(index + 1)
+            } elif content.*[index] == '\n' {
+                map.ends.push(index)
                 map.offsets.push(index + 1)
             }
 
             index = index + 1
         }
 
+        map.ends.push(index)
         map.size = index
 
         return map
@@ -56,11 +66,11 @@ make type LineMap {
     // byte offset where `line` (1-based) ends, excluding the newline
     @pub @this
     make line_end (line: uint) -> uint {
-        if line == 0 || line >= this.offsets.len() {
+        if line == 0 || line > this.ends.len() {
             return this.size
         }
 
-        make end: uint = this.offsets[line] - 1
+        make end: uint = this.ends[line - 1]
 
         return end
     }

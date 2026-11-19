@@ -29,18 +29,16 @@ make is_scalar_type_name (name: str) -> bool {
 // the tag information that platform selection needs
 make type TagInfo {
     make is_target: bool
-    make is_weak: bool
     make is_unsafe: bool
     make target: str
 }
 
-/// read a node's `@target` value and `@weak` presence. single-argument on purpose: the reference\
+/// read a node's `@target` value. single-argument on purpose: the reference\
 /// compiler cannot resolve a call that passes a `ptr<ast::AST_Head>` alongside another argument.
 make scan_tags (node: ptr<ast::AST_Head>) -> TagInfo {
     make info = TagInfo {}
 
     info.is_target = false
-    info.is_weak = false
     info.is_unsafe = false
     info.target = ""
 
@@ -53,8 +51,6 @@ make scan_tags (node: ptr<ast::AST_Head>) -> TagInfo {
         if nm == "target" {
             info.is_target = true
             info.target = tag.*.target
-        } elif nm == "weak" {
-            info.is_weak = true
         } elif nm == "unsafe" {
             info.is_unsafe = true
         }
@@ -63,6 +59,28 @@ make scan_tags (node: ptr<ast::AST_Head>) -> TagInfo {
     }
 
     return info
+}
+
+/// Selects source declarations before resolving imports and exported namespaces.
+@pub
+make selected_nodes (program: ref<owned<ast::AST_Head>[]>, os: str) -> bool[] {
+    make selected: bool[] = []
+    make matched = false
+    make index: uint = 0
+    while index < program.*.len() {
+        @unsafe make node: ptr<ast::AST_Head> = program.*[index]
+        make info = scan_tags(node)
+        make keep = true
+        if info.is_target {
+            if info.target == "unknown" { keep = !matched }
+            elif info.target == os || (info.target == "darwin" && os == "macos") || (info.target == "macos" && os == "darwin") {
+                matched = true
+            } else { keep = false }
+        } else { matched = false }
+        selected.push(keep)
+        index++
+    }
+    return selected
 }
 
 /// true when the node carries a compile-time tag `@pure`. `Type` is a\
@@ -243,7 +261,7 @@ make lower (program: ref<owned<ast::AST_Head>[]>, os: str, diagnostics: ref<diag
         ei = ei + 1
     }
 
-    // `@target` / `@weak` groups: only the statements that apply to the selected platform
+    // `@target` groups: only the statements that apply to the selected platform
     // make it into HIR
     make matched = false
 
@@ -259,14 +277,9 @@ make lower (program: ref<owned<ast::AST_Head>[]>, os: str, diagnostics: ref<diag
 
         if info.is_target {
             make tv = info.target
-
-            if tv == os.copy() || (tv == "darwin" && os.copy() == "macos") || (tv == "macos" && os.copy() == "darwin") {
-                matched = true
-            } else {
-                keep = false
-            }
-        } elif info.is_weak {
-            if !matched {
+            if tv == "unknown" {
+                keep = !matched
+            } elif tv == os.copy() || (tv == "darwin" && os.copy() == "macos") || (tv == "macos" && os.copy() == "darwin") {
                 matched = true
             } else {
                 keep = false
@@ -662,7 +675,7 @@ make type ReturnInfo {
     // duplicate-declaration diagnostics are reported here while scopes are still visible
     make diagref: ref<diag::Diagnostic>
 
-    // the operating-system name `@target` / `@weak` groups are resolved against
+    // the operating-system name `@target` groups are resolved against
     make target_os: str
 
     // while lowering an attached function: the receiver type name (`@impl T` / enclosing `type T`)
@@ -1544,14 +1557,9 @@ make type ReturnInfo {
 
             if info.is_target {
                 make tv = info.target
-
-                if tv == os || (tv == "darwin" && os == "macos") || (tv == "macos" && os == "darwin") {
-                    matched = true
-                } else {
-                    keep = false
-                }
-            } elif info.is_weak {
-                if !matched {
+                if tv == "unknown" {
+                    keep = !matched
+                } elif tv == os || (tv == "darwin" && os == "macos") || (tv == "macos" && os == "darwin") {
                     matched = true
                 } else {
                     keep = false
@@ -1562,6 +1570,7 @@ make type ReturnInfo {
 
             if keep {
                 make sid = this.lower_stmt(node)
+                this.body.*.stmts[sid].group_range = node.*.group_range.copy()
 
                 if info.is_unsafe {
                     this.body.*.stmts[sid].is_unsafe = true

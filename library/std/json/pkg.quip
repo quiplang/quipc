@@ -1,6 +1,5 @@
 @pure @const {
-    @target "macos" make os = @import "../os/macos.quip"
-    @target "linux" make os = @import "../os/linux.quip"
+    make os = @import "../os/pkg.quip"
 }
 
 @pub
@@ -485,7 +484,7 @@ make type Parser {
         if floating {
             token.push('\0')
             @unsafe make end: ptr<ptr<char>> = 0
-            @unsafe make number: float = os::strtod(token.data, end)
+            @unsafe make number: float = os::strtod(token.data, end) catch { return error.NumberOutOfRange }
 
             // NaN cannot occur with the validated grammar. Reject infinities.
             if number != 0.0 && number + number == number {

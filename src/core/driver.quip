@@ -9,7 +9,7 @@
     make memr = @import "../memory/report.quip"
     make mono = @import "../hir/mono.quip"
     make qualify = @import "../semantics/symbol/qualify.quip"
-    make hashing = @import "fingerprint.quip"
+    make sources = @import "sources.quip"
 }
 
 /// create `path` and every missing parent directory, e.g. "target/debug" when "target" is absent.\
@@ -62,7 +62,22 @@ make type Driver {
 
         f.close()
 
-        make compiler = hashing::executable()
+        make compiler: str = ""
+        make executable_buffer: str = ""
+        executable_buffer.reserve(4096) catch { return error.FailedToBuild }
+        @unsafe {
+            @target "macos" {
+                make size: u32 = 4096
+                std::os::_NSGetExecutablePath(executable_buffer.data, size.pin) catch { return error.FailedToBuild }
+            }
+            @target "linux" {
+                make count = std::os::readlink("/proc/self/exe".data, executable_buffer.data, 4095) catch { return error.FailedToBuild }
+                if count >= 4095 { return error.FailedToBuild }
+                executable_buffer.data[count] = '\0'
+            }
+            make i: uint = 0
+            while executable_buffer.data[i] != '\0' { compiler.push(executable_buffer.data[i]) i++ }
+        }
 
         if compiler.len() == 0 {
             std::progress::clear()
@@ -203,7 +218,7 @@ make type Driver {
                 for path : this.config.package_paths.iter() { paths.push(path.copy()) }
 
                 make manager = um::UnitManager.init(some.copy(), this.config.package_names !,
-                    paths, this.config.options.hide_warnings, timings.pin) catch err { return err }
+                    paths, this.config.options.hide_warnings, this.config.platform_name.copy(), timings.pin) catch err { return err }
 
                 // phase 2 (Resolve): link every `@import` alias to its already-declared unit
                 if timings.enabled { started = profile::now() }
@@ -254,7 +269,7 @@ make type Driver {
 
 
                     mgr.*.units[id].platform_name = this.config.platform_name !
-                    make object_name = "unit_" + hashing::digest(mgr.*.units[id].key !)
+                    make object_name = "unit_" + id.to_str()
                     mgr.*.units[id].llvm_ll = ir_dir.add(object_name.copy() + ".ll").get()
                     mgr.*.units[id].llvm_out = object_dir.add(object_name + ".o").get()
                     mgr.*.units[id].keep_llvm = this.config.options.keep_llvm
@@ -419,10 +434,10 @@ make type Driver {
     make intermediate_path () -> str {
         if this.config.intermediate_directory.len() > 0 { return this.config.intermediate_directory ! }
 
-        // Keep intermediate files for each output in a separate directory.
-        make key = "output=" + this.executable_path()
+        // Mirror the normalized absolute output path to isolate each output's intermediates.
+        make output = sources::lexical_path(this.executable_path())
 
-        return this.profile_path() + "/intermediate/targets/" + hashing::digest(key)
+        return this.profile_path() + "/intermediate/targets" + output
     }
 
     /// returns the target directory for the selected debug or release profile.
@@ -446,7 +461,8 @@ make type Driver {
             return build_dir.add(this.config.name !).get()
         }
 
-        make stem = basename_stem(std::os::getcwd())
+        make cwd = std::io::Path.cwd() catch { std::panic("unable to read current directory", @file, @line) }
+        make stem = basename_stem(cwd.get())
 
         return build_dir.add(stem).get()
     }

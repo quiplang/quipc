@@ -1,66 +1,2736 @@
+// The public OS boundary. Native bindings, flag values and ABI layouts stay here.
+// Raw pointer operations require @unsafe: C strings must be NUL terminated,
+// buffers must hold the requested byte count, and native handles must be valid.
+// Fallible operations return !T. On failure, query errno()/error_is() immediately in catch.
+// EOF, partial reads/writes and unsuccessful searches remain ordinary results.
+@import "../../runtime/str_methods.quip"
+
 @pure @const {
-    make mem: unit = @import "../mem/pkg.quip"
-    make ffi: unit = @import "../ffi/c.quip"
-    make runtime: unit = @import "../../runtime/pkg.quip"
-
-    make std: unit = @import "../pkg.quip"
-
-    @target "macos" make macos: unit = @import "macos.quip"
+    @target "macos" make native = @import "macos.quip"
+    @target "linux" make native = @import "linux.quip"
 }
 
-@pub @pure @const {
-    @target "macos" make platform: unit = @import "macos.quip"
-    @target "linux" make platform: unit = @import "linux.quip"
-    // make syscall: unit = @import "syscall.quip"
-}
-
-
-
-// Copy libc's cwd buffer into Quip-owned storage, then release the libc allocation.
-@pub
-make getcwd () -> str {
-
-    @target "macos" {
-
-        make buffer = mem::debug.alloc((@sizeof ffi::c_char) * macos::PATH_MAX).unwrap()
-        @unsafe make t: ptr<ffi::c_char> = macos::getcwd(buffer, macos::PATH_MAX)
-
-        make result = ffi::to_str(t)
-        return result
-
-    }
-
-    @weak {
-        runtime::runtime_panic("unsupported platform".to_c_str(), "std/pkg.quip".to_c_str(), 32)
-    }
-
-//     @unsafe
-//     if syscall::quip_getcwd(result.pin) < 0 {
-//         return result
-//     }
-//
-//     return result
+@pub @const {
+    make STDIN: i32 = 0
+    make STDOUT: i32 = 1
+    make STDERR: i32 = 2
 }
 
 @pub
-make getenv (name: str) -> str {
+make enum FileAccess {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+@impl FileAccess
+make translate () -> i32 {
     @target "macos" {
-        make result: str = ""
-        make key = name.copy()
-        key.push('\0')
-
-        @unsafe make value = macos::getenv(key.data)
-        @unsafe make null: ptr<char> = 0x0
-
-        if value == null { return result }
-
-        make i: uint = 0
-        while value[i] != '\0' { result.push(value[i]) i = i + 1 }
-
-        return result
+        return match this.* {
+            FileAccess.Read => 0
+            FileAccess.Write => 1
+            FileAccess.ReadWrite => 2
+            _ => -1
+        }
     }
 
-    @weak {
-        std::panic("unsupported platform", "std/os/pkg.quip", 61)
+    @target "linux" {
+        return match this.* {
+            FileAccess.Read => 0
+            FileAccess.Write => 1
+            FileAccess.ReadWrite => 2
+            _ => -1
+        }
+    }
+}
+
+@pub
+make enum SeekFrom {
+    Start,
+    Current,
+    End,
+}
+
+@impl SeekFrom
+make translate () -> i32 {
+    @target "macos" {
+        return match this.* {
+            SeekFrom.Start => 0
+            SeekFrom.Current => 1
+            SeekFrom.End => 2
+            _ => -1
+        }
+    }
+    @target "linux" {
+        return match this.* {
+            SeekFrom.Start => 0
+            SeekFrom.Current => 1
+            SeekFrom.End => 2
+            _ => -1
+        }
+    }
+}
+
+@pub
+make enum AccessMode {
+    Exists,
+    Execute,
+    Write,
+    WriteExecute,
+    Read,
+    ReadExecute,
+    ReadWrite,
+    ReadWriteExecute,
+}
+
+@impl AccessMode
+make translate () -> i32 {
+    @target "macos" {
+        return match this.* {
+            AccessMode.Exists => 0
+            AccessMode.Execute => 1
+            AccessMode.Write => 2
+            AccessMode.WriteExecute => 3
+            AccessMode.Read => 4
+            AccessMode.ReadExecute => 5
+            AccessMode.ReadWrite => 6
+            AccessMode.ReadWriteExecute => 7
+            _ => -1
+        }
+    }
+    @target "linux" {
+        return match this.* {
+            AccessMode.Exists => 0
+            AccessMode.Execute => 1
+            AccessMode.Write => 2
+            AccessMode.WriteExecute => 3
+            AccessMode.Read => 4
+            AccessMode.ReadExecute => 5
+            AccessMode.ReadWrite => 6
+            AccessMode.ReadWriteExecute => 7
+            _ => -1
+        }
+    }
+}
+
+@pub
+make enum FileKind {
+    Unknown,
+    Regular,
+    Directory,
+    Symlink,
+    BlockDevice,
+    CharacterDevice,
+    Fifo,
+    Socket,
+}
+
+@pub
+make enum LockKind {
+    Shared,
+    Exclusive,
+    Unlock,
+}
+
+@impl LockKind
+make translate () -> i32 {
+    @target "macos" {
+        return match this.* {
+            LockKind.Shared => 1
+            LockKind.Exclusive => 2
+            LockKind.Unlock => 8
+            _ => -1
+        }
+    }
+    @target "linux" {
+        return match this.* {
+            LockKind.Shared => 1
+            LockKind.Exclusive => 2
+            LockKind.Unlock => 8
+            _ => -1
+        }
+    }
+}
+
+@pub
+make enum MapKind {
+    Anonymous,
+    File,
+}
+
+@impl MapKind
+make translate () -> i32 {
+    @target "macos" {
+        return match this.* {
+            MapKind.Anonymous => 4096
+            MapKind.File => 0
+            _ => -1
+        }
+    }
+    @target "linux" {
+        return match this.* {
+            MapKind.Anonymous => 32
+            MapKind.File => 0
+            _ => -1
+        }
+    }
+}
+
+@pub
+make enum MapSharing {
+    Private,
+    Shared,
+}
+
+@impl MapSharing
+make translate () -> i32 {
+    @target "macos" {
+        return match this.* {
+            MapSharing.Private => 2
+            MapSharing.Shared => 1
+            _ => -1
+        }
+    }
+    @target "linux" {
+        return match this.* {
+            MapSharing.Private => 2
+            MapSharing.Shared => 1
+            _ => -1
+        }
+    }
+}
+
+@pub
+make enum Protection {
+    None,
+    Read,
+    Write,
+    ReadWrite,
+    Execute,
+    ReadExecute,
+    WriteExecute,
+    ReadWriteExecute,
+}
+
+@impl Protection
+make translate () -> i32 {
+    @target "macos" {
+        return match this.* {
+            Protection.None => 0
+            Protection.Read => 1
+            Protection.Write => 2
+            Protection.ReadWrite => 3
+            Protection.Execute => 4
+            Protection.ReadExecute => 5
+            Protection.WriteExecute => 6
+            Protection.ReadWriteExecute => 7
+            _ => -1
+        }
+    }
+    @target "linux" {
+        return match this.* {
+            Protection.None => 0
+            Protection.Read => 1
+            Protection.Write => 2
+            Protection.ReadWrite => 3
+            Protection.Execute => 4
+            Protection.ReadExecute => 5
+            Protection.WriteExecute => 6
+            Protection.ReadWriteExecute => 7
+            _ => -1
+        }
+    }
+}
+
+@pub
+make enum SyncMode {
+    Sync,
+    Async,
+}
+
+@impl SyncMode
+make translate () -> i32 {
+    @target "macos" {
+        return match this.* {
+            SyncMode.Sync => 16
+            SyncMode.Async => 1
+            _ => -1
+        }
+    }
+    @target "linux" {
+        return match this.* {
+            SyncMode.Sync => 4
+            SyncMode.Async => 1
+            _ => -1
+        }
+    }
+}
+
+@pub
+make enum MemoryAdvice {
+    Normal,
+    Random,
+    Sequential,
+    WillNeed,
+    DontNeed,
+    Free,
+}
+
+@impl MemoryAdvice
+make translate () -> i32 {
+    @target "macos" {
+        return match this.* {
+            MemoryAdvice.Normal => 0
+            MemoryAdvice.Random => 1
+            MemoryAdvice.Sequential => 2
+            MemoryAdvice.WillNeed => 3
+            MemoryAdvice.DontNeed => 4
+            MemoryAdvice.Free => 5
+            _ => -1
+        }
+    }
+    @target "linux" {
+        return match this.* {
+            MemoryAdvice.Normal => 0
+            MemoryAdvice.Random => 1
+            MemoryAdvice.Sequential => 2
+            MemoryAdvice.WillNeed => 3
+            MemoryAdvice.DontNeed => 4
+            MemoryAdvice.Free => 8
+            _ => -1
+        }
+    }
+}
+
+@pub
+make enum Clock {
+    Realtime,
+    Monotonic,
+    Process,
+    Thread,
+}
+
+@impl Clock
+make translate () -> i32 {
+    @target "macos" {
+        return match this.* {
+            Clock.Realtime => 0
+            Clock.Monotonic => 6
+            Clock.Process => 12
+            Clock.Thread => 16
+            _ => -1
+        }
+    }
+    @target "linux" {
+        return match this.* {
+            Clock.Realtime => 0
+            Clock.Monotonic => 1
+            Clock.Process => 2
+            Clock.Thread => 3
+            _ => -1
+        }
+    }
+}
+
+@pub
+make enum WaitMode {
+    Blocking,
+    NoHang,
+}
+
+@impl WaitMode
+make translate () -> i32 {
+    @target "macos" {
+        return match this.* {
+            WaitMode.Blocking => 0
+            WaitMode.NoHang => 1
+            _ => -1
+        }
+    }
+    @target "linux" {
+        return match this.* {
+            WaitMode.Blocking => 0
+            WaitMode.NoHang => 1
+            _ => -1
+        }
+    }
+}
+
+@pub
+make enum Signal {
+    None,
+    Unknown,
+    Hangup,
+    Interrupt,
+    Quit,
+    IllegalInstruction,
+    Trap,
+    Abort,
+    Bus,
+    FloatingPoint,
+    Kill,
+    User1,
+    SegmentationFault,
+    User2,
+    Pipe,
+    Alarm,
+    Terminate,
+    Child,
+    Continue,
+    Stop,
+    TerminalStop,
+    TerminalInput,
+    TerminalOutput,
+    Urgent,
+    CpuLimit,
+    FileLimit,
+    VirtualAlarm,
+    Profiling,
+    WindowChanged,
+    Io,
+    BadSystemCall,
+}
+
+@impl Signal
+make translate () -> i32 {
+    @target "macos" {
+        return match this.* {
+            Signal.None => 0
+            Signal.Hangup => 1
+            Signal.Interrupt => 2
+            Signal.Quit => 3
+            Signal.IllegalInstruction => 4
+            Signal.Trap => 5
+            Signal.Abort => 6
+            Signal.Bus => 10
+            Signal.FloatingPoint => 8
+            Signal.Kill => 9
+            Signal.User1 => 30
+            Signal.SegmentationFault => 11
+            Signal.User2 => 31
+            Signal.Pipe => 13
+            Signal.Alarm => 14
+            Signal.Terminate => 15
+            Signal.Child => 20
+            Signal.Continue => 19
+            Signal.Stop => 17
+            Signal.TerminalStop => 18
+            Signal.TerminalInput => 21
+            Signal.TerminalOutput => 22
+            Signal.Urgent => 16
+            Signal.CpuLimit => 24
+            Signal.FileLimit => 25
+            Signal.VirtualAlarm => 26
+            Signal.Profiling => 27
+            Signal.WindowChanged => 28
+            Signal.Io => 23
+            Signal.BadSystemCall => 12
+            _ => -1
+        }
+    }
+    @target "linux" {
+        return match this.* {
+            Signal.None => 0
+            Signal.Hangup => 1
+            Signal.Interrupt => 2
+            Signal.Quit => 3
+            Signal.IllegalInstruction => 4
+            Signal.Trap => 5
+            Signal.Abort => 6
+            Signal.Bus => 7
+            Signal.FloatingPoint => 8
+            Signal.Kill => 9
+            Signal.User1 => 10
+            Signal.SegmentationFault => 11
+            Signal.User2 => 12
+            Signal.Pipe => 13
+            Signal.Alarm => 14
+            Signal.Terminate => 15
+            Signal.Child => 17
+            Signal.Continue => 18
+            Signal.Stop => 19
+            Signal.TerminalStop => 20
+            Signal.TerminalInput => 21
+            Signal.TerminalOutput => 22
+            Signal.Urgent => 23
+            Signal.CpuLimit => 24
+            Signal.FileLimit => 25
+            Signal.VirtualAlarm => 26
+            Signal.Profiling => 27
+            Signal.WindowChanged => 28
+            Signal.Io => 29
+            Signal.BadSystemCall => 31
+            _ => -1
+        }
+    }
+}
+
+@pub
+make enum SignalMaskHow {
+    Block,
+    Unblock,
+    Set,
+}
+
+@impl SignalMaskHow
+make translate () -> i32 {
+    @target "macos" {
+        return match this.* {
+            SignalMaskHow.Block => 1
+            SignalMaskHow.Unblock => 2
+            SignalMaskHow.Set => 3
+            _ => -1
+        }
+    }
+    @target "linux" {
+        return match this.* {
+            SignalMaskHow.Block => 0
+            SignalMaskHow.Unblock => 1
+            SignalMaskHow.Set => 2
+            _ => -1
+        }
+    }
+}
+
+@pub
+make enum ErrorCode {
+    Interrupted,
+    NotFound,
+    AccessDenied,
+    AlreadyExists,
+    Invalid,
+    Range,
+    Overflow,
+    NotSupported,
+    OutOfMemory,
+    WouldBlock,
+}
+
+@impl ErrorCode
+make translate () -> i32 {
+    @target "macos" {
+        return match this.* {
+            ErrorCode.Interrupted => 4
+            ErrorCode.NotFound => 2
+            ErrorCode.AccessDenied => 13
+            ErrorCode.AlreadyExists => 17
+            ErrorCode.Invalid => 22
+            ErrorCode.Range => 34
+            ErrorCode.Overflow => 84
+            ErrorCode.NotSupported => 45
+            ErrorCode.OutOfMemory => 12
+            ErrorCode.WouldBlock => 35
+            _ => -1
+        }
+    }
+    @target "linux" {
+        return match this.* {
+            ErrorCode.Interrupted => 4
+            ErrorCode.NotFound => 2
+            ErrorCode.AccessDenied => 13
+            ErrorCode.AlreadyExists => 17
+            ErrorCode.Invalid => 22
+            ErrorCode.Range => 34
+            ErrorCode.Overflow => 75
+            ErrorCode.NotSupported => 95
+            ErrorCode.OutOfMemory => 12
+            ErrorCode.WouldBlock => 11
+            _ => -1
+        }
+    }
+}
+
+@pub
+make enum StreamMode {
+    Read,
+    Write,
+    Append,
+    ReadWrite,
+    WriteRead,
+    AppendRead,
+}
+
+@impl StreamMode
+make translate () -> str {
+    return match this.* {
+        StreamMode.Read => "r"
+        StreamMode.Write => "w"
+        StreamMode.Append => "a"
+        StreamMode.ReadWrite => "r+"
+        StreamMode.WriteRead => "w+"
+        StreamMode.AppendRead => "a+"
+        _ => ""
+    }
+}
+
+@pub
+make type OpenOptions {
+    @pub {
+        make access: FileAccess = FileAccess.Read
+        make create: bool = false
+        make exclusive: bool = false
+        make truncate: bool = false
+        make append: bool = false
+        make nonblocking: bool = false
+        make close_on_exec: bool = false
+        make permissions: u32 = 420
+    }
+}
+
+@impl OpenOptions
+make translate () -> i32 {
+    make flags = this.access.translate()
+    @target "macos" {
+        if this.create { flags = flags | 512 }
+        if this.exclusive { flags = flags | 2048 }
+        if this.truncate { flags = flags | 1024 }
+        if this.append { flags = flags | 8 }
+        if this.nonblocking { flags = flags | 4 }
+        if this.close_on_exec { flags = flags | 16777216 }
+    }
+    @target "linux" {
+        if this.create { flags = flags | 64 }
+        if this.exclusive { flags = flags | 128 }
+        if this.truncate { flags = flags | 512 }
+        if this.append { flags = flags | 1024 }
+        if this.nonblocking { flags = flags | 2048 }
+        if this.close_on_exec { flags = flags | 524288 }
+    }
+    return flags
+}
+
+@pub
+make type Directory {
+    @pub {
+        make fd: i32 = -1
+    }
+}
+
+// A default Directory selects the current working directory for *at calls.
+@impl Directory
+make translate () -> i32 {
+    if this.fd >= 0 { return this.fd }
+    @target "macos" { return -2 }
+    @target "linux" { return -100 }
+}
+
+@pub
+make type TimeSpec {
+    @pub {
+        make seconds: i64 = 0
+        make nanoseconds: i64 = 0
+    }
+}
+
+@pub
+make type FileInfo {
+    @pub {
+        make kind: FileKind = FileKind.Unknown
+        make permissions: u32 = 0
+        make device: u64 = 0
+        make inode: u64 = 0
+        make links: u64 = 0
+        make owner: u32 = 0
+        make group: u32 = 0
+        make size: i64 = 0
+        make blocks: i64 = 0
+        make block_size: i64 = 0
+        make accessed: TimeSpec = .{}
+        make modified: TimeSpec = .{}
+        make changed: TimeSpec = .{}
+    }
+}
+
+@pub
+make type MapOptions {
+    @pub {
+        make kind: MapKind = MapKind.Anonymous
+        make sharing: MapSharing = MapSharing.Private
+        make protection: Protection = Protection.ReadWrite
+        make fixed: bool = false
+    }
+}
+
+@pub
+make type PollEvents {
+    @pub {
+        make readable: bool = false
+        make priority: bool = false
+        make writable: bool = false
+        make failed: bool = false
+        make hangup: bool = false
+        make invalid: bool = false
+    }
+}
+
+@impl PollEvents
+make translate () -> u16 {
+    make flags: u16 = 0
+    if this.readable { flags = flags | 1 }
+    if this.priority { flags = flags | 2 }
+    if this.writable { flags = flags | 4 }
+    if this.failed { flags = flags | 8 }
+    if this.hangup { flags = flags | 16 }
+    if this.invalid { flags = flags | 32 }
+    return flags
+}
+make poll_events (flags: u16) -> PollEvents {
+    return PollEvents {
+        readable = (flags & 1) != 0,
+        priority = (flags & 2) != 0,
+        writable = (flags & 4) != 0,
+        failed = (flags & 8) != 0,
+        hangup = (flags & 16) != 0,
+        invalid = (flags & 32) != 0,
+    }
+}
+
+@pub
+make type PollFd {
+    @pub {
+        make fd: i32 = -1
+        make events: PollEvents = .{}
+        make returned: PollEvents = .{}
+    }
+}
+
+@pub
+make type Pipe {
+    @pub {
+        make read: i32 = -1
+        make write: i32 = -1
+    }
+}
+
+@pub
+make type TerminalSize {
+    @pub {
+        make rows: uint = 0
+        make columns: uint = 0
+        make width_pixels: uint = 0
+        make height_pixels: uint = 0
+    }
+}
+
+@pub @unsafe
+make errno_address () -> ptr<i32> {
+    @target "macos" { return native::__error() }
+    @target "linux" { return native::__errno_location() }
+}
+
+@pub
+make errno () -> i32 {
+    @unsafe make code = errno_address()
+    @unsafe return code.*
+}
+
+@pub
+make error_is (kind: ErrorCode) -> bool { return errno() == kind.translate() }
+
+@pub
+make set_errno (kind: ErrorCode) -> void {
+    @unsafe { make code = errno_address() code.* = kind.translate() }
+}
+
+@pub @unsafe
+make open (path: ptr<char>, options: OpenOptions) -> !i32 {
+    if options.permissions > 4095 { set_errno(ErrorCode.Invalid) return error.InvalidArgument }
+    make flags = options.translate()
+    @target "macos" {
+        make native_result = native::open(path, flags, options.permissions)
+        if native_result < 0 { return error.OSFailed }
+        return native_result
+    }
+    @target "linux" {
+        make native_result = native::open(path, flags, options.permissions)
+        if native_result < 0 { return error.OSFailed }
+        return native_result
+    }
+}
+
+@pub @unsafe
+make openat (directory: Directory, path: ptr<char>, options: OpenOptions) -> !i32 {
+    if options.permissions > 4095 { set_errno(ErrorCode.Invalid) return error.InvalidArgument }
+    make flags = options.translate()
+    make base = directory.translate()
+    @target "macos" {
+        make native_result = native::openat(base, path, flags, options.permissions)
+        if native_result < 0 { return error.OSFailed }
+        return native_result
+    }
+    @target "linux" {
+        make native_result = native::openat(base, path, flags, options.permissions)
+        if native_result < 0 { return error.OSFailed }
+        return native_result
+    }
+}
+
+@pub @unsafe
+make creat (path: ptr<char>, permissions: u32) -> !i32 {
+    return open(path, OpenOptions { access = FileAccess.Write, create = true, truncate = true, permissions = permissions })
+}
+
+@pub @unsafe
+make lseek (fd: i32, offset: i64, from: SeekFrom) -> !i64 {
+    make whence = from.translate()
+    @target "macos" {
+        make native_result = native::lseek(fd, offset, whence)
+        if native_result < 0 { return error.OSFailed }
+        return native_result
+    }
+    @target "linux" {
+        make native_result = native::lseek(fd, offset, whence)
+        if native_result < 0 { return error.OSFailed }
+        return native_result
+    }
+}
+
+@pub @unsafe
+make fseek (stream: ptr<any>, offset: i64, from: SeekFrom) -> !void {
+    make whence = from.translate()
+    @target "macos" {
+        make native_result = native::fseek(stream, offset, whence)
+        if native_result != 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" {
+        make native_result = native::fseek(stream, offset, whence)
+        if native_result != 0 { return error.OSFailed }
+        return
+    }
+}
+
+@pub @unsafe
+make access (path: ptr<char>, mode: AccessMode) -> !void {
+    make flags = mode.translate()
+    @target "macos" {
+        make native_result = native::access(path, flags)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" {
+        make native_result = native::access(path, flags)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+}
+
+@pub @unsafe
+make waitpid (pid: i32, status: ptr<i32>, mode: WaitMode) -> !i32 {
+    make flags = mode.translate()
+    @target "macos" {
+        make native_result = native::waitpid(pid, status, flags)
+        if native_result < 0 { return error.OSFailed }
+        return native_result
+    }
+    @target "linux" {
+        make native_result = native::waitpid(pid, status, flags)
+        if native_result < 0 { return error.OSFailed }
+        return native_result
+    }
+}
+
+@pub @unsafe
+make kill (pid: i32, signal: Signal) -> !void {
+    make flags = signal.translate()
+    @target "macos" {
+        make native_result = native::kill(pid, flags)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" {
+        make native_result = native::kill(pid, flags)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+}
+
+@pub @unsafe
+make raise (signal: Signal) -> !void {
+    make flags = signal.translate()
+    @target "macos" {
+        make native_result = native::raise(flags)
+        if native_result != 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" {
+        make native_result = native::raise(flags)
+        if native_result != 0 { return error.OSFailed }
+        return
+    }
+}
+
+@pub @unsafe
+make signal (signal: Signal, handler: ptr<any>) -> !ptr<any> {
+    make flags = signal.translate()
+    @target "macos" {
+        @unsafe make failed: ptr<any> = -1
+        make native_result = native::signal(flags, handler)
+        if native_result == failed { return error.OSFailed }
+        return native_result
+    }
+    @target "linux" {
+        @unsafe make failed: ptr<any> = -1
+        make native_result = native::signal(flags, handler)
+        if native_result == failed { return error.OSFailed }
+        return native_result
+    }
+}
+
+@pub @unsafe
+make mprotect (address: ptr<any>, length: u64, protection: Protection) -> !void {
+    make flags = protection.translate()
+    @target "macos" {
+        make native_result = native::mprotect(address, length, flags)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" {
+        make native_result = native::mprotect(address, length, flags)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+}
+
+@pub @unsafe
+make madvise (address: ptr<any>, length: u64, advice: MemoryAdvice) -> !void {
+    make flags = advice.translate()
+    @target "macos" {
+        make native_result = native::madvise(address, length, flags)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" {
+        make native_result = native::madvise(address, length, flags)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+}
+
+@pub @unsafe
+make faccessat (directory: Directory, path: ptr<char>, mode: AccessMode, effective_ids: bool, follow_symlinks: bool) -> !void {
+    make base = directory.translate()
+    make access_mode = mode.translate()
+    make flags: i32 = 0
+    @target "macos" {
+        if effective_ids { flags = flags | 16 }
+        if !follow_symlinks { flags = flags | 32 }
+        make native_result = native::faccessat(base, path, access_mode, flags)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" {
+        if effective_ids { flags = flags | 512 }
+        if !follow_symlinks { flags = flags | 256 }
+        make native_result = native::faccessat(base, path, access_mode, flags)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+}
+
+@pub @unsafe
+make unlinkat (directory: Directory, path: ptr<char>, remove_directory: bool) -> !void {
+    make base = directory.translate()
+    make flags: i32 = 0
+    @target "macos" {
+        if remove_directory { flags = 128 }
+        make native_result = native::unlinkat(base, path, flags)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" {
+        if remove_directory { flags = 512 }
+        make native_result = native::unlinkat(base, path, flags)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+}
+
+@pub @unsafe
+make renameat (old_directory: Directory, oldpath: ptr<char>, new_directory: Directory, newpath: ptr<char>) -> !void {
+    make old_base = old_directory.translate()
+    make new_base = new_directory.translate()
+    @target "macos" {
+        make native_result = native::renameat(old_base, oldpath, new_base, newpath)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" {
+        make native_result = native::renameat(old_base, oldpath, new_base, newpath)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+}
+
+@pub @unsafe
+make flock (fd: i32, kind: LockKind, nonblocking: bool) -> !void {
+    make flags = kind.translate()
+    if nonblocking { flags = flags | 4 }
+    @target "macos" {
+        make native_result = native::flock(fd, flags)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" {
+        make native_result = native::flock(fd, flags)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+}
+
+@pub @unsafe
+make close_on_exec (fd: i32, enabled: bool) -> !void {
+    make flags: i32 = 0
+    @target "macos" { flags = native::fcntl(fd, 1) }
+    @target "linux" { flags = native::fcntl(fd, 1) }
+    if flags < 0 { return error.OSFailed }
+    flags = flags & -2
+    if enabled { flags = flags | 1 }
+    @target "macos" {
+        make native_result = native::fcntl(fd, 2, flags)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" {
+        make native_result = native::fcntl(fd, 2, flags)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+}
+
+@pub @unsafe
+make is_close_on_exec (fd: i32) -> !bool {
+    make flags: i32 = 0
+    @target "macos" { flags = native::fcntl(fd, 1) }
+    @target "linux" { flags = native::fcntl(fd, 1) }
+    if flags < 0 { return error.DescriptorFailed }
+    return (flags & 1) != 0
+}
+
+// Only mutable status flags are changed, preserving all other native flags.
+@pub @unsafe
+make set_status (fd: i32, append: bool, nonblocking: bool) -> !void {
+    @target "macos" {
+        make flags = native::fcntl(fd, 3)
+        if flags < 0 { return error.OSFailed }
+        flags = flags & -13
+        if append { flags = flags | 8 }
+        if nonblocking { flags = flags | 4 }
+        make native_result = native::fcntl(fd, 4, flags)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" {
+        make flags = native::fcntl(fd, 3)
+        if flags < 0 { return error.OSFailed }
+        flags = flags & -3073
+        if append { flags = flags | 1024 }
+        if nonblocking { flags = flags | 2048 }
+        make native_result = native::fcntl(fd, 4, flags)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+}
+
+@pub @unsafe
+make open_options (fd: i32) -> !OpenOptions {
+    make flags: i32 = 0
+    @target "macos" { flags = native::fcntl(fd, 3) }
+    @target "linux" { flags = native::fcntl(fd, 3) }
+    if flags < 0 { return error.DescriptorFailed }
+    make options: OpenOptions = .{}
+    match flags & 3 {
+        0 { options.access = FileAccess.Read }
+        1 { options.access = FileAccess.Write }
+        2 { options.access = FileAccess.ReadWrite }
+        _ { return error.DescriptorFailed }
+    }
+    @target "macos" { options.append = (flags & 8) != 0 options.nonblocking = (flags & 4) != 0 }
+    @target "linux" { options.append = (flags & 1024) != 0 options.nonblocking = (flags & 2048) != 0 }
+    options.close_on_exec = is_close_on_exec(fd) catch err { return err }
+    return options
+}
+
+@pub @unsafe
+make mkdir (path: ptr<char>, mode: u32) -> !void {
+    if mode > 4095 { set_errno(ErrorCode.Invalid) return error.InvalidArgument }
+    @target "macos" {
+        @unsafe make permissions: u16 = mode
+        make native_result = native::mkdir(path, permissions)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" {
+        @unsafe make permissions: u32 = mode
+        make native_result = native::mkdir(path, permissions)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+}
+
+@pub @unsafe
+make mkdirat (directory: Directory, path: ptr<char>, mode: u32) -> !void {
+    if mode > 4095 { set_errno(ErrorCode.Invalid) return error.InvalidArgument }
+    make base = directory.translate()
+    @target "macos" {
+        @unsafe make permissions: u16 = mode
+        make native_result = native::mkdirat(base, path, permissions)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" {
+        @unsafe make permissions: u32 = mode
+        make native_result = native::mkdirat(base, path, permissions)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+}
+
+@pub @unsafe
+make chmod (path: ptr<char>, mode: u32) -> !void {
+    if mode > 4095 { set_errno(ErrorCode.Invalid) return error.InvalidArgument }
+    @target "macos" {
+        @unsafe make permissions: u16 = mode
+        make native_result = native::chmod(path, permissions)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" {
+        @unsafe make permissions: u32 = mode
+        make native_result = native::chmod(path, permissions)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+}
+
+@pub @unsafe
+make fchmod (fd: i32, mode: u32) -> !void {
+    if mode > 4095 { set_errno(ErrorCode.Invalid) return error.InvalidArgument }
+    @target "macos" {
+        @unsafe make permissions: u16 = mode
+        make native_result = native::fchmod(fd, permissions)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" {
+        @unsafe make permissions: u32 = mode
+        make native_result = native::fchmod(fd, permissions)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+}
+
+@pub @unsafe
+make umask (mask: u32) -> u32 {
+    @target "macos" {
+        @unsafe make value: u16 = mask & 511 return native::umask(value) }
+    @target "linux" { return native::umask(mask & 511) }
+}
+
+@pub @unsafe
+make write (fd: i32, buffer: ptr<any>, count: u64) -> !i64 {
+    @target "macos" {
+        make native_result = native::write(fd, buffer, count)
+        if native_result < 0 { return error.OSFailed }
+        return native_result
+    }
+    @target "linux" {
+        make native_result = native::write(fd, buffer, count)
+        if native_result < 0 { return error.OSFailed }
+        return native_result
+    }
+}
+
+@pub @unsafe
+make pipe (fds: ptr<i32>) -> !void {
+    @target "macos" {
+        make native_result = native::pipe(fds)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" {
+        make native_result = native::pipe(fds)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+}
+
+@pub @unsafe
+make realpath (path: ptr<char>, resolved: ptr<char>) -> !ptr<char> {
+    @target "macos" {
+        @unsafe make null: ptr<char> = 0
+        make native_result = native::realpath(path, resolved)
+        if native_result == null { return error.OSFailed }
+        return native_result
+    }
+    @target "linux" {
+        @unsafe make null: ptr<char> = 0
+        make native_result = native::realpath(path, resolved)
+        if native_result == null { return error.OSFailed }
+        return native_result
+    }
+}
+
+@pub @unsafe
+make rewinddir (directory: ptr<any>) -> void {
+    @target "macos" { native::rewinddir(directory) }
+    @target "linux" { native::rewinddir(directory) }
+}
+
+@pub @unsafe
+make seekdir (directory: ptr<any>, location: i64) -> void {
+    @target "macos" { native::seekdir(directory, location) }
+    @target "linux" { native::seekdir(directory, location) }
+}
+
+@pub @unsafe
+make calloc (count: u64, size: u64) -> !ptr<any> {
+    @target "macos" {
+        @unsafe make null: ptr<any> = 0
+        make native_result = native::calloc(count, size)
+        if native_result == null { return error.OSFailed }
+        return native_result
+    }
+    @target "linux" {
+        @unsafe make null: ptr<any> = 0
+        make native_result = native::calloc(count, size)
+        if native_result == null { return error.OSFailed }
+        return native_result
+    }
+}
+
+@pub @unsafe
+make free (memory: ptr<any>) -> void {
+    @target "macos" { native::free(memory) }
+    @target "linux" { native::free(memory) }
+}
+
+@pub @unsafe
+make mlock (address: ptr<any>, length: u64) -> i32 {
+    @target "macos" { return native::mlock(address, length) }
+    @target "linux" { return native::mlock(address, length) }
+}
+
+@pub @unsafe
+make munlock (address: ptr<any>, length: u64) -> i32 {
+    @target "macos" { return native::munlock(address, length) }
+    @target "linux" { return native::munlock(address, length) }
+}
+
+@pub @unsafe
+make memcpy (destination: ptr<any>, source: ptr<any>, count: u64) -> ptr<any> {
+    @target "macos" { return native::memcpy(destination, source, count) }
+    @target "linux" { return native::memcpy(destination, source, count) }
+}
+
+@pub @unsafe
+make memmove (destination: ptr<any>, source: ptr<any>, count: u64) -> ptr<any> {
+    @target "macos" { return native::memmove(destination, source, count) }
+    @target "linux" { return native::memmove(destination, source, count) }
+}
+
+@pub @unsafe
+make memset (destination: ptr<any>, value: i32, count: u64) -> ptr<any> {
+    @target "macos" { return native::memset(destination, value, count) }
+    @target "linux" { return native::memset(destination, value, count) }
+}
+
+@pub @unsafe
+make memcmp (left: ptr<any>, right: ptr<any>, count: u64) -> i32 {
+    @target "macos" { return native::memcmp(left, right, count) }
+    @target "linux" { return native::memcmp(left, right, count) }
+}
+
+@pub @unsafe
+make memchr (memory: ptr<any>, value: i32, count: u64) -> ptr<any> {
+    @target "macos" { return native::memchr(memory, value, count) }
+    @target "linux" { return native::memchr(memory, value, count) }
+}
+
+@pub @unsafe
+make strlen (text: ptr<char>) -> u64 {
+    @target "macos" { return native::strlen(text) }
+    @target "linux" { return native::strlen(text) }
+}
+
+@pub @unsafe
+make strnlen (text: ptr<char>, maximum: u64) -> u64 {
+    @target "macos" { return native::strnlen(text, maximum) }
+    @target "linux" { return native::strnlen(text, maximum) }
+}
+
+@pub @unsafe
+make strcmp (left: ptr<char>, right: ptr<char>) -> i32 {
+    @target "macos" { return native::strcmp(left, right) }
+    @target "linux" { return native::strcmp(left, right) }
+}
+
+@pub @unsafe
+make strncmp (left: ptr<char>, right: ptr<char>, count: u64) -> i32 {
+    @target "macos" { return native::strncmp(left, right, count) }
+    @target "linux" { return native::strncmp(left, right, count) }
+}
+
+@pub @unsafe
+make strcpy (destination: ptr<char>, source: ptr<char>) -> ptr<char> {
+    @target "macos" { return native::strcpy(destination, source) }
+    @target "linux" { return native::strcpy(destination, source) }
+}
+
+@pub @unsafe
+make strncpy (destination: ptr<char>, source: ptr<char>, count: u64) -> ptr<char> {
+    @target "macos" { return native::strncpy(destination, source, count) }
+    @target "linux" { return native::strncpy(destination, source, count) }
+}
+
+@pub @unsafe
+make strchr (text: ptr<char>, value: i32) -> ptr<char> {
+    @target "macos" { return native::strchr(text, value) }
+    @target "linux" { return native::strchr(text, value) }
+}
+
+@pub @unsafe
+make strrchr (text: ptr<char>, value: i32) -> ptr<char> {
+    @target "macos" { return native::strrchr(text, value) }
+    @target "linux" { return native::strrchr(text, value) }
+}
+
+@pub @unsafe
+make strstr (text: ptr<char>, needle: ptr<char>) -> ptr<char> {
+    @target "macos" { return native::strstr(text, needle) }
+    @target "linux" { return native::strstr(text, needle) }
+}
+
+@pub @unsafe
+make strtol (text: ptr<char>, end: ptr<ptr<char>>, base: i32) -> !i64 {
+    make code = errno_address()
+    make previous = code.*
+    code.* = 0
+    @unsafe make tail: ptr<char> = 0
+    make tail_address: ptr<ptr<char>> = tail.pin
+    make result = native::strtol(text, tail_address, base)
+    @unsafe make null: ptr<ptr<char>> = 0
+    if end != null { end.* = tail }
+    if tail == text { set_errno(ErrorCode.Invalid) return error.ConversionFailed }
+    if code.* != 0 { return error.ConversionFailed }
+    code.* = previous
+    return result
+}
+
+@pub @unsafe
+make strtoul (text: ptr<char>, end: ptr<ptr<char>>, base: i32) -> !u64 {
+    make code = errno_address()
+    make previous = code.*
+    code.* = 0
+    @unsafe make tail: ptr<char> = 0
+    make tail_address: ptr<ptr<char>> = tail.pin
+    make result = native::strtoul(text, tail_address, base)
+    @unsafe make null: ptr<ptr<char>> = 0
+    if end != null { end.* = tail }
+    if tail == text { set_errno(ErrorCode.Invalid) return error.ConversionFailed }
+    if code.* != 0 { return error.ConversionFailed }
+    code.* = previous
+    return result
+}
+
+@pub @unsafe
+make strtoll (text: ptr<char>, end: ptr<ptr<char>>, base: i32) -> !i64 {
+    make code = errno_address()
+    make previous = code.*
+    code.* = 0
+    @unsafe make tail: ptr<char> = 0
+    make tail_address: ptr<ptr<char>> = tail.pin
+    make result = native::strtoll(text, tail_address, base)
+    @unsafe make null: ptr<ptr<char>> = 0
+    if end != null { end.* = tail }
+    if tail == text { set_errno(ErrorCode.Invalid) return error.ConversionFailed }
+    if code.* != 0 { return error.ConversionFailed }
+    code.* = previous
+    return result
+}
+
+@pub @unsafe
+make strtoull (text: ptr<char>, end: ptr<ptr<char>>, base: i32) -> !u64 {
+    make code = errno_address()
+    make previous = code.*
+    code.* = 0
+    @unsafe make tail: ptr<char> = 0
+    make tail_address: ptr<ptr<char>> = tail.pin
+    make result = native::strtoull(text, tail_address, base)
+    @unsafe make null: ptr<ptr<char>> = 0
+    if end != null { end.* = tail }
+    if tail == text { set_errno(ErrorCode.Invalid) return error.ConversionFailed }
+    if code.* != 0 { return error.ConversionFailed }
+    code.* = previous
+    return result
+}
+
+@pub @unsafe
+make strtod (text: ptr<char>, end: ptr<ptr<char>>) -> !f64 {
+    make code = errno_address()
+    make previous = code.*
+    code.* = 0
+    @unsafe make tail: ptr<char> = 0
+    make tail_address: ptr<ptr<char>> = tail.pin
+    make result = native::strtod(text, tail_address)
+    @unsafe make null: ptr<ptr<char>> = 0
+    if end != null { end.* = tail }
+    if tail == text { set_errno(ErrorCode.Invalid) return error.ConversionFailed }
+    if code.* != 0 { return error.ConversionFailed }
+    code.* = previous
+    return result
+}
+
+@pub @unsafe
+make strtof (text: ptr<char>, end: ptr<ptr<char>>) -> !f32 {
+    make code = errno_address()
+    make previous = code.*
+    code.* = 0
+    @unsafe make tail: ptr<char> = 0
+    make tail_address: ptr<ptr<char>> = tail.pin
+    make result = native::strtof(text, tail_address)
+    @unsafe make null: ptr<ptr<char>> = 0
+    if end != null { end.* = tail }
+    if tail == text { set_errno(ErrorCode.Invalid) return error.ConversionFailed }
+    if code.* != 0 { return error.ConversionFailed }
+    code.* = previous
+    return result
+}
+
+@pub @unsafe
+make getpid () -> i32 {
+    @target "macos" { return native::getpid() }
+    @target "linux" { return native::getpid() }
+}
+
+@pub @unsafe
+make getppid () -> i32 {
+    @target "macos" { return native::getppid() }
+    @target "linux" { return native::getppid() }
+}
+
+@pub @unsafe
+make getuid () -> u32 {
+    @target "macos" { return native::getuid() }
+    @target "linux" { return native::getuid() }
+}
+
+@pub @unsafe
+make geteuid () -> u32 {
+    @target "macos" { return native::geteuid() }
+    @target "linux" { return native::geteuid() }
+}
+
+@pub @unsafe
+make getgid () -> u32 {
+    @target "macos" { return native::getgid() }
+    @target "linux" { return native::getgid() }
+}
+
+@pub @unsafe
+make getegid () -> u32 {
+    @target "macos" { return native::getegid() }
+    @target "linux" { return native::getegid() }
+}
+
+@pub @unsafe
+make sleep (seconds: u32) -> u32 {
+    @target "macos" { return native::sleep(seconds) }
+    @target "linux" { return native::sleep(seconds) }
+}
+
+@pub @unsafe
+make usleep (microseconds: u32) -> !void {
+    make result = native::usleep(microseconds)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe @noreturn
+make _exit (status: i32) -> void {
+    @target "macos" { native::_exit(status) }
+    @target "linux" { native::_exit(status) }
+}
+
+@pub @unsafe @noreturn
+make exit (status: i32) -> void {
+    @target "macos" { native::exit(status) }
+    @target "linux" { native::exit(status) }
+}
+
+@pub @unsafe @noreturn
+make abort () -> void {
+    @target "macos" { native::abort() }
+    @target "linux" { native::abort() }
+}
+
+@pub @unsafe
+make strerror (code: i32) -> ptr<char> {
+    @target "macos" { return native::strerror(code) }
+    @target "linux" { return native::strerror(code) }
+}
+
+@pub @unsafe
+make perror (prefix: ptr<char>) -> void {
+    @target "macos" { native::perror(prefix) }
+    @target "linux" { native::perror(prefix) }
+}
+
+@pub @unsafe
+make rewind (stream: ptr<any>) -> !void {
+    fseek(stream, 0, SeekFrom.Start) catch err { return err }
+    clearerr(stream)
+}
+
+@pub @unsafe
+make feof (stream: ptr<any>) -> i32 {
+    @target "macos" { return native::feof(stream) }
+    @target "linux" { return native::feof(stream) }
+}
+
+@pub @unsafe
+make ferror (stream: ptr<any>) -> i32 {
+    @target "macos" { return native::ferror(stream) }
+    @target "linux" { return native::ferror(stream) }
+}
+
+@pub @unsafe
+make clearerr (stream: ptr<any>) -> void {
+    @target "macos" { native::clearerr(stream) }
+    @target "linux" { native::clearerr(stream) }
+}
+
+@pub @unsafe
+make fileno (stream: ptr<any>) -> i32 {
+    @target "macos" { return native::fileno(stream) }
+    @target "linux" { return native::fileno(stream) }
+}
+
+@pub @unsafe
+make fgets (buffer: ptr<char>, size: i32, stream: ptr<any>) -> ptr<char> {
+    @target "macos" { return native::fgets(buffer, size, stream) }
+    @target "linux" { return native::fgets(buffer, size, stream) }
+}
+
+@pub @unsafe
+make clock_gettime (clock: Clock, output: ptr<TimeSpec>) -> !void {
+    make id = clock.translate()
+    make value: native::timespec = .{}
+    make result: i32 = 0
+    @target "macos" { result = native::clock_gettime(id, value.pin) }
+    @target "linux" { result = native::clock_gettime(id, value.pin) }
+    if result == 0 { output.*.seconds = value.tv_sec output.*.nanoseconds = value.tv_nsec }
+    if result < 0 { return error.OSFailed }
+    return
+}
+
+@pub @unsafe
+make clock_getres (clock: Clock, output: ptr<TimeSpec>) -> !void {
+    make id = clock.translate()
+    make value: native::timespec = .{}
+    make result: i32 = 0
+    @target "macos" { result = native::clock_getres(id, value.pin) }
+    @target "linux" { result = native::clock_getres(id, value.pin) }
+    if result == 0 { output.*.seconds = value.tv_sec output.*.nanoseconds = value.tv_nsec }
+    if result < 0 { return error.OSFailed }
+    return
+}
+
+@pub @unsafe
+make nanosleep (requested: ptr<TimeSpec>, remaining: ptr<TimeSpec>) -> !void {
+    @unsafe make null: ptr<TimeSpec> = 0
+    if requested == null { set_errno(ErrorCode.Invalid) return error.InvalidArgument }
+    if requested.*.seconds < 0 || requested.*.nanoseconds < 0 || requested.*.nanoseconds >= 1000000000 { set_errno(ErrorCode.Invalid) return error.InvalidArgument }
+    make input: native::timespec = .{}
+    input.tv_sec = requested.*.seconds
+    input.tv_nsec = requested.*.nanoseconds
+    make rest: native::timespec = .{}
+    make result: i32 = 0
+    @target "macos" { result = native::nanosleep(input.pin, rest.pin) }
+    @target "linux" { result = native::nanosleep(input.pin, rest.pin) }
+    if result < 0 && error_is(ErrorCode.Interrupted) && remaining != null {
+        remaining.*.seconds = rest.tv_sec
+        remaining.*.nanoseconds = rest.tv_nsec
+    }
+    if result < 0 { return error.OSFailed }
+    return
+}
+
+@pub
+make page_size () -> int {
+    make size: i32 = 0
+    @target "macos" { @unsafe size = native::getpagesize() }
+    @target "linux" { @unsafe size = native::getpagesize() }
+    return size
+}
+
+/// Full mapping interface: file/anonymous, private/shared, protections and fixed address.
+@pub @unsafe
+make map (address: ptr<any>, size: int, options: MapOptions, fd: i32, offset: i64) -> !ptr<any> {
+    @unsafe make null: ptr<any> = 0
+    if size <= 0 || offset < 0 { set_errno(ErrorCode.Invalid) return error.MappingFailed }
+    make flags = options.kind.translate() | options.sharing.translate()
+    if options.fixed { flags = flags | 16 }
+    make protection = options.protection.translate()
+    make descriptor = fd
+    if options.kind == MapKind.Anonymous { descriptor = -1 }
+    make mapped = null
+    @target "macos" { mapped = native::mmap(address, size, protection, flags, descriptor, offset) }
+    @target "linux" { mapped = native::mmap(address, size, protection, flags, descriptor, offset) }
+    @unsafe make failed: ptr<any> = -1
+    if mapped == failed { return error.MappingFailed }
+    return mapped
+}
+
+@pub @unsafe
+make munmap (address: ptr<any>, size: int) -> !void {
+    if size <= 0 { set_errno(ErrorCode.Invalid) return error.InvalidArgument }
+    @target "macos" {
+        make native_result = native::munmap(address, size)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" {
+        make native_result = native::munmap(address, size)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+}
+
+@pub @unsafe
+make msync (address: ptr<any>, size: u64, mode: SyncMode, invalidate: bool) -> !void {
+    make flags = mode.translate()
+    @target "macos" { if invalidate { flags = flags | 2 } make native_result = native::msync(address, size, flags)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" { if invalidate { flags = flags | 2 } make native_result = native::msync(address, size, flags)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+}
+
+@pub @unsafe
+make terminal_size (fd: i32) -> !TerminalSize {
+    make packed: u64 = 0
+    @unsafe make address: ptr<any> = packed.pin
+    make result: i32 = 0
+    @target "macos" { result = native::ioctl(fd, 1074295912, address) }
+    @target "linux" { result = native::ioctl(fd, 21523, address) }
+    if result < 0 { return error.TerminalFailed }
+    return TerminalSize {
+        rows = packed & 65535,
+        columns = (packed >> 16) & 65535,
+        width_pixels = (packed >> 32) & 65535,
+        height_pixels = (packed >> 48) & 65535,
+    }
+}
+
+// pollfd is packed as i32 + i16 + i16; Quip fields are not native C fields.
+@pub @unsafe
+make poll (fds: ptr<PollFd>, count: uint, timeout: i32) -> !i32 {
+    if count > 2147483647 { set_errno(ErrorCode.Invalid) return error.InvalidArgument }
+    make storage = calloc(count + 1, 8) catch err { return err }
+    @unsafe make descriptors: ptr<i32> = storage
+    @unsafe make events: ptr<u16> = storage
+    make i: uint = 0
+    while i < count {
+        descriptors[i * 2] = fds[i].fd
+        events[i * 4 + 2] = fds[i].events.translate()
+        i = i + 1
+    }
+    make result: i32 = 0
+    @target "macos" {
+        @unsafe make native_count: u32 = count
+        result = native::poll(storage, native_count, timeout)
+    }
+    @target "linux" { result = native::poll(storage, count, timeout) }
+    make saved_errno = errno()
+    if result >= 0 {
+        i = 0
+        while i < count { fds[i].returned = poll_events(events[i * 4 + 3]) i = i + 1 }
+    }
+    free(storage)
+    if result < 0 { make code = errno_address() code.* = saved_errno }
+    if result < 0 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make fopen (path: ptr<char>, mode: StreamMode) -> !ptr<any> {
+    make flags = mode.translate()
+    @target "macos" {
+        @unsafe make null: ptr<any> = 0
+        make native_result = native::fopen(path, flags.data)
+        if native_result == null { return error.OSFailed }
+        return native_result
+    }
+    @target "linux" {
+        @unsafe make null: ptr<any> = 0
+        make native_result = native::fopen(path, flags.data)
+        if native_result == null { return error.OSFailed }
+        return native_result
+    }
+}
+
+@pub @unsafe
+make fdopen (fd: i32, mode: StreamMode) -> !ptr<any> {
+    make flags = mode.translate()
+    @target "macos" {
+        @unsafe make null: ptr<any> = 0
+        make native_result = native::fdopen(fd, flags.data)
+        if native_result == null { return error.OSFailed }
+        return native_result
+    }
+    @target "linux" {
+        @unsafe make null: ptr<any> = 0
+        make native_result = native::fdopen(fd, flags.data)
+        if native_result == null { return error.OSFailed }
+        return native_result
+    }
+}
+
+@pub @unsafe
+make freopen (path: ptr<char>, mode: StreamMode, stream: ptr<any>) -> !ptr<any> {
+    make flags = mode.translate()
+    @target "macos" {
+        @unsafe make null: ptr<any> = 0
+        make native_result = native::freopen(path, flags.data, stream)
+        if native_result == null { return error.OSFailed }
+        return native_result
+    }
+    @target "linux" {
+        @unsafe make null: ptr<any> = 0
+        make native_result = native::freopen(path, flags.data, stream)
+        if native_result == null { return error.OSFailed }
+        return native_result
+    }
+}
+
+@pub @unsafe
+make getenv (name: ptr<char>) -> ptr<char> {
+    @target "macos" { return native::getenv(name) }
+    @target "linux" { return native::getenv(name) }
+}
+
+// putenv retains the pointer: caller must keep its allocation alive until replaced.
+
+@pub @unsafe
+make getcwd_into (buffer: ptr<char>, size: u64) -> !ptr<char> {
+    @target "macos" {
+        @unsafe make null: ptr<char> = 0
+        make native_result = native::getcwd(buffer, size)
+        if native_result == null { return error.OSFailed }
+        return native_result
+    }
+    @target "linux" {
+        @unsafe make null: ptr<char> = 0
+        make native_result = native::getcwd(buffer, size)
+        if native_result == null { return error.OSFailed }
+        return native_result
+    }
+}
+
+
+
+@pub @unsafe
+make strlcpy (destination: ptr<char>, source: ptr<char>, size: u64) -> u64 {
+    make length = strlen(source)
+    if size == 0 { return length }
+    make count = length
+    if count >= size { count = size - 1 }
+    make i: uint = 0
+    while i < count { destination[i] = source[i] i = i + 1 }
+    destination[count] = '\0'
+    return length
+}
+@pub @unsafe
+make strlcat (destination: ptr<char>, source: ptr<char>, size: u64) -> u64 {
+    make length = strnlen(destination, size)
+    if length == size { return size + strlen(source) }
+    return length + strlcpy(destination + length, source, size - length)
+}
+
+make type NativeStat {
+    make word0: u64 = 0
+    make word1: u64 = 0
+    make word2: u64 = 0
+    make word3: u64 = 0
+    make word4: u64 = 0
+    make word5: u64 = 0
+    make word6: u64 = 0
+    make word7: u64 = 0
+    make word8: u64 = 0
+    make word9: u64 = 0
+    make word10: u64 = 0
+    make word11: u64 = 0
+    make word12: u64 = 0
+    make word13: u64 = 0
+    make word14: u64 = 0
+    make word15: u64 = 0
+    make word16: u64 = 0
+    make word17: u64 = 0
+    make word18: u64 = 0
+    make word19: u64 = 0
+    make word20: u64 = 0
+    make word21: u64 = 0
+    make word22: u64 = 0
+    make word23: u64 = 0
+    make word24: u64 = 0
+    make word25: u64 = 0
+    make word26: u64 = 0
+    make word27: u64 = 0
+    make word28: u64 = 0
+    make word29: u64 = 0
+    make word30: u64 = 0
+    make word31: u64 = 0
+}
+
+@pub @unsafe
+make fstat (fd: i32, output: ptr<FileInfo>) -> !void {
+    make storage: NativeStat = .{}
+    @unsafe make address: ptr<any> = storage.pin
+    make result: i32 = 0
+    @target "macos" { result = native::fstat(fd, address) }
+    @target "linux" { result = native::fstat(fd, address) }
+    if result < 0 { return error.OSFailed }
+    @unsafe make words: ptr<u64> = storage.pin
+    make info: FileInfo = .{}
+    make mode: u64 = 0
+    @target "macos" {
+        mode = (words[0] >> 32) & 65535
+        info.device = words[0] & 4294967295
+        info.inode = words[1]
+        info.links = words[0] >> 48
+        @unsafe info.owner = words[2] & 4294967295
+        @unsafe info.group = words[2] >> 32
+        @unsafe info.size = words[12]
+        @unsafe info.blocks = words[13]
+        @unsafe info.block_size = words[14] & 4294967295
+        @unsafe info.accessed.seconds = words[4]
+        @unsafe info.accessed.nanoseconds = words[5]
+        @unsafe info.modified.seconds = words[8]
+        @unsafe info.modified.nanoseconds = words[9]
+        @unsafe info.changed.seconds = words[6]
+        @unsafe info.changed.nanoseconds = words[7]
+    }
+    @target "linux" {
+        // stat's mode/uid/gid/nlink placement differs on x86_64 and aarch64.
+        // utsname is 390 bytes, so reserve a separate 512-byte object.
+        make name: UnameStorage = .{}
+        @unsafe make name_address: ptr<any> = name.pin
+        if native::uname(name_address) != 0 { return error.OSFailed }
+        @unsafe make bytes: ptr<char> = name.pin
+        if bytes[260] == 'x' {
+            mode = words[3] & 4294967295
+            info.links = words[2]
+            @unsafe info.owner = words[3] >> 32
+            @unsafe info.group = words[4] & 4294967295
+        } elif bytes[260] == 'a' {
+            mode = words[2] & 4294967295
+            info.links = words[2] >> 32
+            @unsafe info.owner = words[3] & 4294967295
+            @unsafe info.group = words[3] >> 32
+        } else { set_errno(ErrorCode.NotSupported) return error.OSFailed }
+        info.device = words[0]
+        info.inode = words[1]
+        @unsafe info.size = words[6]
+        @unsafe info.block_size = words[7] & 4294967295
+        @unsafe info.blocks = words[8]
+        @unsafe info.accessed.seconds = words[9]
+        @unsafe info.accessed.nanoseconds = words[10]
+        @unsafe info.modified.seconds = words[11]
+        @unsafe info.modified.nanoseconds = words[12]
+        @unsafe info.changed.seconds = words[13]
+        @unsafe info.changed.nanoseconds = words[14]
+    }
+    @unsafe info.permissions = mode & 4095
+    match mode & 61440 {
+        32768 { info.kind = FileKind.Regular }
+        16384 { info.kind = FileKind.Directory }
+        40960 { info.kind = FileKind.Symlink }
+        24576 { info.kind = FileKind.BlockDevice }
+        8192 { info.kind = FileKind.CharacterDevice }
+        4096 { info.kind = FileKind.Fifo }
+        49152 { info.kind = FileKind.Socket }
+        _ {}
+    }
+    output.* = info
+    return
+}
+
+
+make type UnameStorage {
+    make block0: NativeStat = .{}
+    make block1: NativeStat = .{}
+    make block2: NativeStat = .{}
+    make block3: NativeStat = .{}
+    make block4: NativeStat = .{}
+}
+
+@pub
+make type SystemInfo {
+    @pub {
+        make system: str = ""
+        make node: str = ""
+        make release: str = ""
+        make version: str = ""
+        make machine: str = ""
+    }
+}
+
+@pub
+make system_info () -> !SystemInfo {
+    make storage: UnameStorage = .{}
+    @unsafe {
+        make address: ptr<any> = storage.pin
+        make result: i32 = 0
+        @target "macos" { result = native::uname(address) }
+        @target "linux" { result = native::uname(address) }
+        if result < 0 { return error.SystemInfoFailed }
+        make bytes: ptr<char> = storage.pin
+        make stride: uint = 0
+        @target "macos" { stride = 256 }
+        @target "linux" { stride = 65 }
+        make info = SystemInfo {}
+        make field: uint = 0
+        while field < 5 {
+            make text: str = ""
+            make offset = field * stride
+            make i: uint = 0
+            while i < stride && bytes[offset + i] != '\0' { text.push(bytes[offset + i]) i++ }
+            match field {
+                0 { info.system = text }
+                1 { info.node = text }
+                2 { info.release = text }
+                3 { info.version = text }
+                _ { info.machine = text }
+            }
+            field++
+        }
+        return info
+    }
+}
+
+// Convert status/foreign ABI signal numbers at the OS boundary.
+@pub
+make signal_from_number (number: i32) -> !Signal {
+    @target "macos" {
+        match number {
+            0 { return Signal.None }
+            1 { return Signal.Hangup }
+            2 { return Signal.Interrupt }
+            3 { return Signal.Quit }
+            4 { return Signal.IllegalInstruction }
+            5 { return Signal.Trap }
+            6 { return Signal.Abort }
+            10 { return Signal.Bus }
+            8 { return Signal.FloatingPoint }
+            9 { return Signal.Kill }
+            30 { return Signal.User1 }
+            11 { return Signal.SegmentationFault }
+            31 { return Signal.User2 }
+            13 { return Signal.Pipe }
+            14 { return Signal.Alarm }
+            15 { return Signal.Terminate }
+            20 { return Signal.Child }
+            19 { return Signal.Continue }
+            17 { return Signal.Stop }
+            18 { return Signal.TerminalStop }
+            21 { return Signal.TerminalInput }
+            22 { return Signal.TerminalOutput }
+            16 { return Signal.Urgent }
+            24 { return Signal.CpuLimit }
+            25 { return Signal.FileLimit }
+            26 { return Signal.VirtualAlarm }
+            27 { return Signal.Profiling }
+            28 { return Signal.WindowChanged }
+            23 { return Signal.Io }
+            12 { return Signal.BadSystemCall }
+            _ {}
+        }
+    }
+    @target "linux" {
+        match number {
+            0 { return Signal.None }
+            1 { return Signal.Hangup }
+            2 { return Signal.Interrupt }
+            3 { return Signal.Quit }
+            4 { return Signal.IllegalInstruction }
+            5 { return Signal.Trap }
+            6 { return Signal.Abort }
+            7 { return Signal.Bus }
+            8 { return Signal.FloatingPoint }
+            9 { return Signal.Kill }
+            10 { return Signal.User1 }
+            11 { return Signal.SegmentationFault }
+            12 { return Signal.User2 }
+            13 { return Signal.Pipe }
+            14 { return Signal.Alarm }
+            15 { return Signal.Terminate }
+            17 { return Signal.Child }
+            18 { return Signal.Continue }
+            19 { return Signal.Stop }
+            20 { return Signal.TerminalStop }
+            21 { return Signal.TerminalInput }
+            22 { return Signal.TerminalOutput }
+            23 { return Signal.Urgent }
+            24 { return Signal.CpuLimit }
+            25 { return Signal.FileLimit }
+            26 { return Signal.VirtualAlarm }
+            27 { return Signal.Profiling }
+            28 { return Signal.WindowChanged }
+            29 { return Signal.Io }
+            31 { return Signal.BadSystemCall }
+            _ {}
+        }
+    }
+    return error.UnknownSignal
+}
+
+// Opaque storage; construct and modify sets through sigemptyset/sigaddset.
+@pub
+make type SignalSet {
+    make word0: u64 = 0
+    make word1: u64 = 0
+    make word2: u64 = 0
+    make word3: u64 = 0
+    make word4: u64 = 0
+    make word5: u64 = 0
+    make word6: u64 = 0
+    make word7: u64 = 0
+    make word8: u64 = 0
+    make word9: u64 = 0
+    make word10: u64 = 0
+    make word11: u64 = 0
+    make word12: u64 = 0
+    make word13: u64 = 0
+    make word14: u64 = 0
+    make word15: u64 = 0
+}
+
+@pub
+make type SignalOptions {
+    @pub {
+        make restart: bool = false
+        make on_stack: bool = false
+        make reset_handler: bool = false
+        make no_defer: bool = false
+        make no_child_stop: bool = false
+        make no_child_wait: bool = false
+        make siginfo: bool = false
+    }
+}
+
+@impl SignalOptions
+make translate () -> i32 {
+    make flags: i32 = 0
+    @target "macos" {
+        if this.restart { flags = flags | 2 }
+        if this.on_stack { flags = flags | 1 }
+        if this.reset_handler { flags = flags | 4 }
+        if this.no_defer { flags = flags | 16 }
+        if this.no_child_stop { flags = flags | 8 }
+        if this.no_child_wait { flags = flags | 32 }
+        if this.siginfo { flags = flags | 64 }
+    }
+    @target "linux" {
+        if this.restart { flags = flags | 268435456 }
+        if this.on_stack { flags = flags | 134217728 }
+        if this.reset_handler { flags = flags | -2147483648 }
+        if this.no_defer { flags = flags | 1073741824 }
+        if this.no_child_stop { flags = flags | 1 }
+        if this.no_child_wait { flags = flags | 2 }
+        if this.siginfo { flags = flags | 4 }
+    }
+    return flags
+
+}
+
+make signal_options (flags: i32) -> SignalOptions {
+    make options: SignalOptions = .{}
+    @target "macos" {
+        options.restart = (flags & 2) != 0
+        options.on_stack = (flags & 1) != 0
+        options.reset_handler = (flags & 4) != 0
+        options.no_defer = (flags & 16) != 0
+        options.no_child_stop = (flags & 8) != 0
+        options.no_child_wait = (flags & 32) != 0
+        options.siginfo = (flags & 64) != 0
+    }
+    @target "linux" {
+        options.restart = (flags & 268435456) != 0
+        options.on_stack = (flags & 134217728) != 0
+        options.reset_handler = (flags & -2147483648) != 0
+        options.no_defer = (flags & 1073741824) != 0
+        options.no_child_stop = (flags & 1) != 0
+        options.no_child_wait = (flags & 2) != 0
+        options.siginfo = (flags & 4) != 0
+    }
+    return options
+}
+
+@pub
+make type SignalAction {
+    @pub {
+        // Native C callback; its signature must match options.siginfo.
+        make handler: ptr<any>
+        make mask: SignalSet = .{}
+        make options: SignalOptions = .{}
+    }
+}
+
+@pub @unsafe
+make sigemptyset (mask: ptr<SignalSet>) -> !void {
+    mask.* = SignalSet {}
+    @target "macos" {
+        make native_result = native::sigemptyset(mask)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" {
+        make native_result = native::sigemptyset(mask)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+}
+
+@pub @unsafe
+make sigaddset (mask: ptr<SignalSet>, signal: Signal) -> !void {
+    make number = signal.translate()
+    @target "macos" {
+        make native_result = native::sigaddset(mask, number)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" {
+        make native_result = native::sigaddset(mask, number)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+}
+
+@pub @unsafe
+make sigprocmask (how: SignalMaskHow, mask: ptr<SignalSet>, previous: ptr<SignalSet>) -> !void {
+    make operation = how.translate()
+    @target "macos" {
+        make native_result = native::sigprocmask(operation, mask, previous)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+    @target "linux" {
+        make native_result = native::sigprocmask(operation, mask, previous)
+        if native_result < 0 { return error.OSFailed }
+        return
+    }
+}
+
+// Marshal C sigaction explicitly: Darwin's mask/flags follow an 8-byte handler;
+// glibc's 128-byte mask precedes flags and the restorer pointer.
+@pub @unsafe
+make sigaction (signal: Signal, action: ptr<SignalAction>, previous: ptr<SignalAction>) -> !void {
+    make number = signal.translate()
+    make input: NativeStat = .{}
+    make output: NativeStat = .{}
+    @unsafe make null: ptr<any> = 0
+    @unsafe make no_action: ptr<SignalAction> = 0
+    @unsafe make input_bytes: ptr<char> = input.pin
+    @unsafe make output_bytes: ptr<char> = output.pin
+    make input_address = null
+    make output_address = null
+    if action != no_action {
+        input_address = input_bytes
+        @unsafe make handler: ptr<ptr<any>> = input_bytes
+        handler.* = action.*.handler
+        make flags = action.*.options.translate()
+        @target "macos" {
+            memcpy(input_bytes + 8, action.*.mask.pin, 4)
+            @unsafe make flag_address: ptr<i32> = input_bytes + 12
+            flag_address.* = flags
+        }
+        @target "linux" {
+            memcpy(input_bytes + 8, action.*.mask.pin, 128)
+            @unsafe make flag_address: ptr<i32> = input_bytes + 136
+            flag_address.* = flags
+        }
+    }
+    if previous != no_action { output_address = output_bytes }
+    make result: i32 = 0
+    @target "macos" { result = native::sigaction(number, input_address, output_address) }
+    @target "linux" { result = native::sigaction(number, input_address, output_address) }
+    if result == 0 && previous != no_action {
+        @unsafe make handler: ptr<ptr<any>> = output_bytes
+        previous.*.handler = handler.*
+        previous.*.mask = SignalSet {}
+        @target "macos" {
+            memcpy(previous.*.mask.pin, output_bytes + 8, 4)
+            @unsafe make flag_address: ptr<i32> = output_bytes + 12
+            previous.*.options = signal_options(flag_address.*)
+        }
+        @target "linux" {
+            memcpy(previous.*.mask.pin, output_bytes + 8, 128)
+            @unsafe make flag_address: ptr<i32> = output_bytes + 136
+            previous.*.options = signal_options(flag_address.*)
+        }
+    }
+    if result < 0 { return error.OSFailed }
+    return
+}
+
+@import "../../runtime/pkg.quip"
+
+
+@impl OpenOptions @pub @this @copy
+make copy () -> OpenOptions {
+    return OpenOptions {
+        access = this.access,
+        create = this.create,
+        exclusive = this.exclusive,
+        truncate = this.truncate,
+        append = this.append,
+        nonblocking = this.nonblocking,
+        close_on_exec = this.close_on_exec,
+        permissions = this.permissions,
+    }
+}
+
+@impl Directory @pub @this @copy
+make copy () -> Directory {
+    return Directory {
+        fd = this.fd,
+    }
+}
+
+@impl TimeSpec @pub @this @copy
+make copy () -> TimeSpec {
+    return TimeSpec {
+        seconds = this.seconds,
+        nanoseconds = this.nanoseconds,
+    }
+}
+
+@impl MapOptions @pub @this @copy
+make copy () -> MapOptions {
+    return MapOptions {
+        kind = this.kind,
+        sharing = this.sharing,
+        protection = this.protection,
+        fixed = this.fixed,
+    }
+}
+
+@impl PollEvents @pub @this @copy
+make copy () -> PollEvents {
+    return PollEvents {
+        readable = this.readable,
+        priority = this.priority,
+        writable = this.writable,
+        failed = this.failed,
+        hangup = this.hangup,
+        invalid = this.invalid,
+    }
+}
+
+@impl SignalOptions @pub @this @copy
+make copy () -> SignalOptions {
+    return SignalOptions {
+        restart = this.restart,
+        on_stack = this.on_stack,
+        reset_handler = this.reset_handler,
+        no_defer = this.no_defer,
+        no_child_stop = this.no_child_stop,
+        no_child_wait = this.no_child_wait,
+        siginfo = this.siginfo,
+    }
+}
+
+@pub
+make type DirectoryEntry {
+    @pub {
+        make inode: u64 = 0
+        make position: i64 = 0
+        make kind: FileKind = FileKind.Unknown
+        make name: str = ""
+    }
+}
+
+/// Reads an owned, normalized directory entry: 1 = entry, 0 = EOF; failures return an error.
+/// Native dirent storage is copied before the next call can invalidate it.
+@pub @unsafe
+make readdir (directory: ptr<any>, output: ptr<DirectoryEntry>) -> !i32 {
+    make code = errno_address()
+    code.* = 0
+    @unsafe make null: ptr<any> = 0
+    make entry = null
+    @target "macos" { entry = native::readdir(directory) }
+    @target "linux" { entry = native::readdir(directory) }
+    if entry == null {
+        if errno() != 0 { return error.OSFailed }
+        return 0
+    }
+    @unsafe make words: ptr<u64> = entry
+    @unsafe make lengths: ptr<u16> = entry
+    @unsafe make bytes: ptr<char> = entry
+    make record_size: uint = lengths[8]
+    make name_offset: uint = 0
+    make kind: uint = 0
+    @target "macos" { name_offset = 21 @unsafe make native_kind: uint = bytes[20] kind = native_kind }
+    @target "linux" { name_offset = 19 @unsafe make native_kind: uint = bytes[18] kind = native_kind }
+    if record_size <= name_offset { set_errno(ErrorCode.Invalid) return error.InvalidArgument }
+    make info: DirectoryEntry = .{}
+    info.inode = words[0]
+    @unsafe info.position = words[1]
+    match kind {
+        8 { info.kind = FileKind.Regular }
+        4 { info.kind = FileKind.Directory }
+        10 { info.kind = FileKind.Symlink }
+        6 { info.kind = FileKind.BlockDevice }
+        2 { info.kind = FileKind.CharacterDevice }
+        1 { info.kind = FileKind.Fifo }
+        12 { info.kind = FileKind.Socket }
+        _ {}
+    }
+    make i = name_offset
+    while i < record_size && bytes[i] != '\0' {
+        info.name.push(bytes[i])
+        i = i + 1
+    }
+    if i == record_size { set_errno(ErrorCode.Invalid) return error.InvalidArgument }
+    output.* = info
+    return 1
+}
+
+// Native signal numbers are only needed at a foreign/legacy ABI boundary.
+@pub
+make signal_number (signal: Signal) -> i32 { return signal.translate() }
+
+@pub @unsafe
+make duplicate_min (fd: i32, minimum: i32) -> !i32 {
+    make result = native::fcntl(fd, 0, minimum)
+    if result < 0 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make close (fd: i32) -> !void {
+    make result = native::close(fd)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make read (fd: i32, buffer: ptr<any>, count: u64) -> !i64 {
+    make result = native::read(fd, buffer, count)
+    if result < 0 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make pread (fd: i32, buffer: ptr<any>, count: u64, offset: i64) -> !i64 {
+    make result = native::pread(fd, buffer, count, offset)
+    if result < 0 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make pwrite (fd: i32, buffer: ptr<any>, count: u64, offset: i64) -> !i64 {
+    make result = native::pwrite(fd, buffer, count, offset)
+    if result < 0 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make dup (fd: i32) -> !i32 {
+    make result = native::dup(fd)
+    if result < 0 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make dup2 (oldfd: i32, newfd: i32) -> !i32 {
+    make result = native::dup2(oldfd, newfd)
+    if result < 0 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make fsync (fd: i32) -> !void {
+    make result = native::fsync(fd)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make isatty (fd: i32) -> !bool {
+    make result = native::isatty(fd)
+    if result == 0 { return error.TerminalFailed }
+    return true
+}
+
+@pub @unsafe
+make ttyname (fd: i32) -> !ptr<char> {
+    @unsafe make null: ptr<char> = 0
+    make result = native::ttyname(fd)
+    if result == null { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make rmdir (path: ptr<char>) -> !void {
+    make result = native::rmdir(path)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make unlink (path: ptr<char>) -> !void {
+    make result = native::unlink(path)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make rename (oldpath: ptr<char>, newpath: ptr<char>) -> !void {
+    make result = native::rename(oldpath, newpath)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make link (oldpath: ptr<char>, newpath: ptr<char>) -> !void {
+    make result = native::link(oldpath, newpath)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make symlink (target: ptr<char>, path: ptr<char>) -> !void {
+    make result = native::symlink(target, path)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make readlink (path: ptr<char>, buffer: ptr<char>, size: u64) -> !i64 {
+    make result = native::readlink(path, buffer, size)
+    if result < 0 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make truncate (path: ptr<char>, length: i64) -> !void {
+    make result = native::truncate(path, length)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make ftruncate (fd: i32, length: i64) -> !void {
+    make result = native::ftruncate(fd, length)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make chown (path: ptr<char>, owner: u32, group: u32) -> !void {
+    make result = native::chown(path, owner, group)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make fchown (fd: i32, owner: u32, group: u32) -> !void {
+    make result = native::fchown(fd, owner, group)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make chdir (path: ptr<char>) -> !void {
+    make result = native::chdir(path)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make fchdir (fd: i32) -> !void {
+    make result = native::fchdir(fd)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make mkdtemp (template: ptr<char>) -> !ptr<char> {
+    @unsafe make null: ptr<char> = 0
+    make result = native::mkdtemp(template)
+    if result == null { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make mkstemp (template: ptr<char>) -> !i32 {
+    make result = native::mkstemp(template)
+    if result < 0 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make opendir (path: ptr<char>) -> !ptr<any> {
+    @unsafe make null: ptr<any> = 0
+    make result = native::opendir(path)
+    if result == null { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make fdopendir (fd: i32) -> !ptr<any> {
+    @unsafe make null: ptr<any> = 0
+    make result = native::fdopendir(fd)
+    if result == null { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make closedir (directory: ptr<any>) -> !void {
+    make result = native::closedir(directory)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make dirfd (directory: ptr<any>) -> !i32 {
+    make result = native::dirfd(directory)
+    if result < 0 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make telldir (directory: ptr<any>) -> !i64 {
+    make result = native::telldir(directory)
+    if result < 0 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make malloc (size: u64) -> !ptr<any> {
+    @unsafe make null: ptr<any> = 0
+    make result = native::malloc(size)
+    if result == null { return error.AllocationFailed }
+    return result
+}
+
+@pub @unsafe
+make realloc (memory: ptr<any>, size: u64) -> !ptr<any> {
+    @unsafe make null: ptr<any> = 0
+    make result = native::realloc(memory, size)
+    if result == null { return error.AllocationFailed }
+    return result
+}
+
+@pub @unsafe
+make posix_memalign (memory: ptr<ptr<any>>, alignment: u64, size: u64) -> !void {
+    make result = native::posix_memalign(memory, alignment, size)
+    if result != 0 { make code = errno_address() code.* = result }
+    if result != 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make aligned_alloc (alignment: u64, size: u64) -> !ptr<any> {
+    @unsafe make null: ptr<any> = 0
+    make result = native::aligned_alloc(alignment, size)
+    if result == null { return error.AllocationFailed }
+    return result
+}
+
+@pub @unsafe
+make strdup (text: ptr<char>) -> !ptr<char> {
+    @unsafe make null: ptr<char> = 0
+    make result = native::strdup(text)
+    if result == null { return error.AllocationFailed }
+    return result
+}
+
+@pub @unsafe
+make strndup (text: ptr<char>, count: u64) -> !ptr<char> {
+    @unsafe make null: ptr<char> = 0
+    make result = native::strndup(text, count)
+    if result == null { return error.AllocationFailed }
+    return result
+}
+
+@pub @unsafe
+make setuid (uid: u32) -> !void {
+    make result = native::setuid(uid)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make setgid (gid: u32) -> !void {
+    make result = native::setgid(gid)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make fork () -> !i32 {
+    make result = native::fork()
+    if result < 0 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make execve (path: ptr<char>, argv: ptr<ptr<char>>, envp: ptr<ptr<char>>) -> !void {
+    make result = native::execve(path, argv, envp)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make execv (path: ptr<char>, argv: ptr<ptr<char>>) -> !void {
+    make result = native::execv(path, argv)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make execvp (file: ptr<char>, argv: ptr<ptr<char>>) -> !void {
+    make result = native::execvp(file, argv)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make wait (status: ptr<i32>) -> !i32 {
+    make result = native::wait(status)
+    if result < 0 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make system (command: ptr<char>) -> !i32 {
+    make result = native::system(command)
+    if result < 0 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make time (output: ptr<i64>) -> !i64 {
+    make result = native::time(output)
+    if result == -1 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make clock () -> !u64 {
+    make result = native::clock()
+    if result == 18446744073709551615 { return error.ClockFailed }
+    return result
+}
+
+@pub @unsafe
+make fclose (stream: ptr<any>) -> !void {
+    make result = native::fclose(stream)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make fflush (stream: ptr<any>) -> !void {
+    make result = native::fflush(stream)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make fread (buffer: ptr<any>, size: u64, count: u64, stream: ptr<any>) -> !u64 {
+    make result = native::fread(buffer, size, count, stream)
+    if result < count && ferror(stream) != 0 { return error.IOError }
+    return result
+}
+
+@pub @unsafe
+make fwrite (buffer: ptr<any>, size: u64, count: u64, stream: ptr<any>) -> !u64 {
+    make result = native::fwrite(buffer, size, count, stream)
+    if result < count && ferror(stream) != 0 { return error.IOError }
+    return result
+}
+
+@pub @unsafe
+make ftell (stream: ptr<any>) -> !i64 {
+    make result = native::ftell(stream)
+    if result < 0 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make fgetc (stream: ptr<any>) -> !i32 {
+    make result = native::fgetc(stream)
+    if result < 0 && ferror(stream) != 0 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make fputc (value: i32, stream: ptr<any>) -> !i32 {
+    make result = native::fputc(value, stream)
+    if result < 0 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make fputs (text: ptr<char>, stream: ptr<any>) -> !void {
+    make result = native::fputs(text, stream)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make puts (text: ptr<char>) -> !void {
+    make result = native::puts(text)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make remove (path: ptr<char>) -> !void {
+    make result = native::remove(path)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make atexit (callback: ptr<any>) -> !void {
+    make result = native::atexit(callback)
+    if result != 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make printf (text: ptr<char>) -> !i32 {
+    make result = native::printf("%s".data, text)
+    if result < 0 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make dprintf (fd: i32, text: ptr<char>) -> !i32 {
+    make result = native::dprintf(fd, "%s".data, text)
+    if result < 0 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make fprintf (stream: ptr<any>, text: ptr<char>) -> !i32 {
+    make result = native::fprintf(stream, "%s".data, text)
+    if result < 0 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make snprintf (buffer: ptr<char>, size: u64, text: ptr<char>) -> !i32 {
+    make result = native::snprintf(buffer, size, "%s".data, text)
+    if result < 0 { return error.OSFailed }
+    return result
+}
+
+@pub @unsafe
+make putenv (assignment: ptr<char>) -> !void {
+    make result = native::putenv(assignment)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make setenv (name: ptr<char>, value: ptr<char>, overwrite: bool) -> !void {
+    make replace: i32 = 0
+    if overwrite { replace = 1 }
+    make result = native::setenv(name, value, replace)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make unsetenv (name: ptr<char>) -> !void {
+    make result = native::unsetenv(name)
+    if result < 0 { return error.OSFailed }
+}
+
+@pub @unsafe
+make _NSGetExecutablePath (buffer: ptr<char>, size: ptr<u32>) -> !void {
+    @target "macos" {
+        if native::_NSGetExecutablePath(buffer, size) != 0 { return error.OSFailed }
+        return
     }
 }

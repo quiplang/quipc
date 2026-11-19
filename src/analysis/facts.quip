@@ -19,6 +19,14 @@ make type UseCheck {
 }
 
 @pub
+make noreturn_function (function: ref<hir::HirFunc>) -> bool {
+    for tag : function.*.tags {
+        if tag == "noreturn" { return true }
+    }
+    return false
+}
+
+@pub
 make unsafe_function (function: ref<hir::HirFunc>) -> bool {
     for tag : function.*.tags {
         if tag == "unsafe" { return true }

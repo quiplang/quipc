@@ -1,4 +1,4 @@
-@pure @const {
+@pub {
     @import "memory.quip"
     @import "str.quip"
     @import "array.quip"

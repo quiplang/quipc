@@ -105,7 +105,7 @@ make target_triple () -> str {
             i++
         }
 
-        make minimum = std::os::getenv("MACOSX_DEPLOYMENT_TARGET")
+        make minimum = std::process::Environment.get("MACOSX_DEPLOYMENT_TARGET", "")
         if minimum.len() == 0 {
             minimum = "10.15"
             if arch == "arm64" || arch == "aarch64" { minimum = "11.0" }

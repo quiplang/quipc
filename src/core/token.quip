@@ -404,7 +404,7 @@ make tokenize_at (content: str, failure_offset: ref<uint>) -> !Token[] {
                 if content[pos + 1] == '/' { // line comment (//)
                     pos = pos + 2
 
-                    while content[pos] != '\n' && content[pos] != '\0' {
+                    while pos < content.len() && content[pos] != '\n' && content[pos] != '\r' && content[pos] != '\0' {
                         pos = pos + 1
                     }
                 } elif content[pos + 1] == '=' { // slash equal (/=)

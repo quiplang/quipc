@@ -1,11 +1,8 @@
 @pure @const {
-    make process = @import "../internal/process.quip"
-    make env = @import "../os/pkg.quip"
-    make time = @import "../internal/time.quip"
+    make process = @import "../process/pkg.quip"
+    make time = @import "../time/pkg.quip"
 
-    @target "macos" make os = @import "../os/macos.quip"
-    @target "linux" make os = @import "../os/linux.quip"
-    @target "windows" make os = @import "../os/windows.quip"
+    make os: unit = @import "../os/pkg.quip"
 }
 
 @pub
@@ -42,14 +39,14 @@ make finish (success: bool) {
 
 @pub
 make run (name: str, args: str[]) -> int {
-    @unsafe make arguments: ptr<process::Arguments> = args.pin
+    @unsafe make arguments: ptr<str[]> = args.pin
     @unsafe return progress_run(name.pin, arguments)
 }
 
 // Start a script-owned progress session using the invoking build's preferences.
 @pub
 make start (title: str) {
-    begin(title, env::getenv("QUIPC_NO_PROGRESS") != "1", env::getenv("QUIPC_VERBOSE") == "1")
+    begin(title, process::Environment.get("QUIPC_NO_PROGRESS", "") != "1", process::Environment.get("QUIPC_VERBOSE", "") == "1")
 }
 
 @pub
@@ -105,13 +102,9 @@ make quip_progress_state () -> ptr<Progress>
 make progress_write (fd: i32, data: ptr<char>, length: uint) -> void {
     make offset: uint = 0
     while offset < length {
-        make written = os::write(fd, data + offset, length - offset)
-
-        if written < 0 { make code = time::time_errno()
-
-            if code.* == 4 { continue }
-
-            break
+        make written = os::write(fd, data + offset, length - offset) catch {
+            if os::error_is(os::ErrorCode.Interrupted) { continue }
+            return
         }
 
         if written == 0 { break }
@@ -165,12 +158,8 @@ make ansi (code: str) -> str {
 
 @unsafe
 make progress_now () -> uint {
-    make now: uint = 0
-    @unsafe make address: ptr<uint> = now.pin
-
-    if time::time_monotonic(address) != 0 { return 0 }
-
-    return now
+    make now = time::Instant.now() catch { return 0 }
+    return now.nanoseconds
 }
 
 @unsafe
@@ -306,15 +295,7 @@ make progress_input (value: ptr<str>, limit: uint) -> str {
 
 @unsafe
 make progress_panel (state: ptr<Progress>, file_phases: uint, label: ref<str>, detail: ref<str>, completed: bool) -> void {
-    make dimensions: uint = 0
-    @unsafe make address: ptr<any> = dimensions.pin
-    make columns: uint = 80
-
-    if os::ioctl(2, os::TIOCGWINSZ, address) == 0 {
-        make measured: uint = (dimensions >> 16) & 65535
-
-        if measured != 0 { columns = measured }
-    }
+    make columns = progress_columns()
 
     make width: uint = 1
 
@@ -419,10 +400,9 @@ make progress_begin (title: ptr<str>, enabled: int, verbose: int) -> void {
     state.*.compiled = 0
     state.*.file_index = 0
     state.*.file_total = 0
-    @unsafe make null: ptr<char> = 0
-    make term = os::getenv("TERM".data)
-    state.*.interactive = os::isatty(2) != 0 && term != null && os::strcmp(term, "dumb".data) != 0
-    state.*.color = state.*.interactive && os::getenv("NO_COLOR".data) == null
+    make terminal = progress_is_terminal()
+    state.*.interactive = terminal && progress_has_env("TERM") && process::Environment.get("TERM", "") != "dumb"
+    state.*.color = state.*.interactive && !progress_has_env("NO_COLOR")
     make safe_title = progress_input(title, 63)
     save_text(state, state.*.title.pin, safe_title.pin, 63)
     state.*.started = progress_now()
@@ -602,45 +582,83 @@ make progress_message (message: ptr<str>, level: int) -> void {
 }
 
 make type PollStorage {
-    make stdout: uint
-    make stderr: uint
+    make stdout: os::PollFd
+    make stderr: os::PollFd
 }
 
 @pub @unsafe @export "quip_progress_run"
-make progress_run (name: ptr<str>, args: ptr<process::Arguments>) -> int {
+make progress_run (name: ptr<str>, args: ptr<str[]>) -> int {
     make state = quip_progress_state()
 
-    if !state.*.panel_visible { return process::process_run(name, args, -1, -1, -1) }
+    make arguments: str[] = []
+    for arg : args.* ! { arguments.push(arg.copy()) }
+    make command = process::Command.create(name.*.copy(), arguments)
+    if !state.*.panel_visible { return process::Process.run(command) }
 
-    make stdout_pipe: uint = 0
-    make stderr_pipe: uint = 0
-    @unsafe make stdout_fds: ptr<i32> = stdout_pipe.pin
-    @unsafe make stderr_fds: ptr<i32> = stderr_pipe.pin
+    make stdout_pipe_storage: uint = 0
+    @unsafe make stdout_pipe_fds: ptr<i32> = stdout_pipe_storage.pin
+    make stdout_pipe = os::Pipe {}
+    @unsafe os::pipe(stdout_pipe_fds) catch { return -1 }
+    stdout_pipe.read = stdout_pipe_fds[0]
+    stdout_pipe.write = stdout_pipe_fds[1]
+    make stderr_pipe_storage: uint = 0
+    @unsafe make stderr_pipe_fds: ptr<i32> = stderr_pipe_storage.pin
+    make stderr_pipe = os::Pipe {}
+    @unsafe os::pipe(stderr_pipe_fds) catch {
+        os::close(stdout_pipe.read) catch {}
+        os::close(stdout_pipe.write) catch {}
+        return -1
+    }
+    stderr_pipe.read = stderr_pipe_fds[0]
+    stderr_pipe.write = stderr_pipe_fds[1]
 
-    if os::pipe(stdout_fds) != 0 { return -1 }
-
-    if os::pipe(stderr_fds) != 0 {
-        os::close(stdout_fds[0])
-        os::close(stdout_fds[1])
+    os::close_on_exec(stdout_pipe.read, true) catch {
+        os::close(stdout_pipe.read) catch {}
+        os::close(stdout_pipe.write) catch {}
+        os::close(stderr_pipe.read) catch {}
+        os::close(stderr_pipe.write) catch {}
+        return -1
+    }
+    os::close_on_exec(stdout_pipe.write, true) catch {
+        os::close(stdout_pipe.read) catch {}
+        os::close(stdout_pipe.write) catch {}
+        os::close(stderr_pipe.read) catch {}
+        os::close(stderr_pipe.write) catch {}
+        return -1
+    }
+    os::close_on_exec(stderr_pipe.read, true) catch {
+        os::close(stdout_pipe.read) catch {}
+        os::close(stdout_pipe.write) catch {}
+        os::close(stderr_pipe.read) catch {}
+        os::close(stderr_pipe.write) catch {}
+        return -1
+    }
+    os::close_on_exec(stderr_pipe.write, true) catch {
+        os::close(stdout_pipe.read) catch {}
+        os::close(stdout_pipe.write) catch {}
+        os::close(stderr_pipe.read) catch {}
+        os::close(stderr_pipe.write) catch {}
         return -1
     }
 
-    os::fcntl(stdout_fds[0], os::F_SETFD, os::FD_CLOEXEC)
-    os::fcntl(stdout_fds[1], os::F_SETFD, os::FD_CLOEXEC)
-    os::fcntl(stderr_fds[0], os::F_SETFD, os::FD_CLOEXEC)
-    os::fcntl(stderr_fds[1], os::F_SETFD, os::FD_CLOEXEC)
-    make pid = process::process_spawn(name, args, -1, stdout_fds[1], stderr_fds[1])
-    os::close(stdout_fds[1])
-    os::close(stderr_fds[1])
-    // Each pollfd contains an i32 descriptor followed by two 16-bit event masks.
+    command.fd_out = stdout_pipe.write
+    command.fd_err = stderr_pipe.write
+    make child = process::Process.spawn(command) catch {
+        os::close(stdout_pipe.read) catch {}
+        os::close(stdout_pipe.write) catch {}
+        os::close(stderr_pipe.read) catch {}
+        os::close(stderr_pipe.write) catch {}
+        return -1
+    }
+    make pid = child.pid
+    os::close(stdout_pipe.write) catch {}
+    os::close(stderr_pipe.write) catch {}
     make streams: PollStorage = .{}
-    @unsafe make raw: ptr<i32> = streams.pin
-    raw[0] = stdout_fds[0]
-    raw[2] = stderr_fds[0]
-    @unsafe make events: ptr<u16> = raw
-    make poll_in: u16 = 1
-    events[2] = poll_in
-    events[6] = poll_in
+    streams.stdout.fd = stdout_pipe.read
+    streams.stderr.fd = stderr_pipe.read
+    streams.stdout.events.readable = true
+    streams.stderr.events.readable = true
+    @unsafe make raw: ptr<os::PollFd> = streams.pin
     make remaining: uint = 2
 
     if pid < 0 { remaining = 0 }
@@ -649,28 +667,27 @@ make progress_run (name: ptr<str>, args: ptr<process::Arguments>) -> int {
     buffer.reserve(4096) catch { remaining = 0 }
 
     while remaining > 0 {
-        if os::poll(raw, 2, -1) < 0 { make code = time::time_errno()
-
-            if code.* == 4 { continue }
-
+        os::poll(raw, 2, -1) catch {
+            if os::error_is(os::ErrorCode.Interrupted) { continue }
             break
         }
 
         make i: uint = 0
         while i < 2 {
-            make fd_slot = i * 2
-            make ready_slot = i * 4 + 3
-            if raw[fd_slot] >= 0 && events[ready_slot] != 0 {
-                make count = os::read(raw[fd_slot], buffer.data, 4096)
-
-                if count < 0 { make code = time::time_errno()
-
-                    if code.* == 4 { i = i + 1 continue }
+            if raw[i].fd >= 0 && (raw[i].returned.readable || raw[i].returned.hangup || raw[i].returned.failed || raw[i].returned.invalid) {
+                make count: i64 = 0
+                count = os::read(raw[i].fd, buffer.data, 4096) catch {
+                    if os::error_is(os::ErrorCode.Interrupted) { i = i + 1 continue }
+                    os::close(raw[i].fd) catch {}
+                    raw[i].fd = -1
+                    remaining = remaining - 1
+                    i += 1
+                    continue
                 }
 
                 if count <= 0 {
-                    os::close(raw[fd_slot])
-                    raw[fd_slot] = -1
+                    os::close(raw[i].fd) catch {}
+                    raw[i].fd = -1
                     remaining = remaining - 1
                 } else {
                     progress_clear()
@@ -683,13 +700,16 @@ make progress_run (name: ptr<str>, args: ptr<process::Arguments>) -> int {
         }
     }
 
-    if raw[0] >= 0 { os::close(raw[0]) }
+    if raw[0].fd >= 0 { os::close(raw[0].fd) catch {} }
 
-    if raw[2] >= 0 { os::close(raw[2]) }
+    if raw[1].fd >= 0 { os::close(raw[1].fd) catch {} }
 
     if pid < 0 { return -1 }
 
-    return process::process_wait(pid)
+    child.wait()
+    if child.state == process::ProcessState.Exited { return child.exit_code }
+    if child.state == process::ProcessState.Signaled { return -child.signal_code }
+    return -1
 }
 
 
@@ -715,3 +735,18 @@ make progress_number (value: uint) -> str {
 
 @unsafe @external make quip_runtime_string_free (value: ptr<str>) -> void
 @unsafe @external make quip_runtime_memory_persist (buffer: ptr<any>) -> void
+
+@unsafe
+make progress_is_terminal () -> bool {
+    return os::isatty(2) catch { return false }
+}
+
+make progress_columns () -> uint {
+    @unsafe make size = os::terminal_size(2) catch { return 80 }
+    if size.columns == 0 { return 80 }
+    return size.columns
+}
+
+make progress_has_env (name: str) -> bool {
+    return process::Environment.contains(name)
+}

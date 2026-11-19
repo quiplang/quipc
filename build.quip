@@ -77,7 +77,7 @@ make add_link_inputs (exe: ref<std::Executable>, args: str[]) -> bool {
         return true
     }
 
-    @weak {
+    @target "unknown" {
         std::panic("unsupported platform", @file, @line)
     }
 
@@ -93,8 +93,7 @@ make macos_llvm_inputs () -> !str[] {
     make llvm = prefix.copy() + "/opt/llvm@22/bin/llvm-config"
     make llvm_path = llvm.copy()
     llvm_path.push('\0')
-    @unsafe make llvm_missing = std::os::platform::access(llvm_path.data, 1) != 0
-    if llvm_missing { llvm = prefix.copy() + "/opt/llvm/bin/llvm-config" }
+    @unsafe std::os::access(llvm_path.data, std::os::AccessMode.Execute) catch { llvm = prefix.copy() + "/opt/llvm/bin/llvm-config" }
 
     make version = command_output(llvm.copy(), ["--version"]) catch err { return err }
     if version.len() < 3 || version[0] != '2' || version[1] != '2' || version[2] != '.' {
@@ -118,8 +117,7 @@ make macos_llvm_inputs () -> !str[] {
     for path : inputs.iter() {
         make native_path = path.copy()
         native_path.push('\0')
-        @unsafe make missing = std::os::platform::access(native_path.data, 4) != 0
-        if missing {
+        @unsafe std::os::access(native_path.data, std::os::AccessMode.Read) catch {
             progress::fail("missing linker input " + path)
             return error.MissingLinkInput
         }
@@ -129,22 +127,25 @@ make macos_llvm_inputs () -> !str[] {
 }
 
 make command_output (name: str, args: str[]) -> !str {
-    make storage: uint = 0
-    @unsafe make fds: ptr<i32> = storage.pin
-    @unsafe if std::os::platform::pipe(fds) != 0 { return error.PipeFailed }
-    @unsafe make input: int = fds[0]
-    @unsafe make output_fd: int = fds[1]
+    make descriptors_storage: uint = 0
+    @unsafe make descriptors_fds: ptr<i32> = descriptors_storage.pin
+    make descriptors = std::os::Pipe {}
+    @unsafe std::os::pipe(descriptors_fds) catch { return error.PipeFailed }
+    descriptors.read = descriptors_fds[0]
+    descriptors.write = descriptors_fds[1]
+    make input: int = descriptors.read
+    make output_fd: int = descriptors.write
 
     make command = std::process::Command.create(name, args)
     command.fd_out = output_fd
     make process = std::process::Process.spawn(command) catch err {
         @unsafe {
-            std::os::platform::close(fds[0])
-            std::os::platform::close(fds[1])
+            std::os::close(descriptors.read) catch {}
+            std::os::close(descriptors.write) catch {}
         }
         return err
     }
-    @unsafe std::os::platform::close(fds[1])
+    @unsafe std::os::close(descriptors.write) catch {}
 
     make file = std::io::File { fd = input }
     file.read() catch err {
@@ -274,10 +275,12 @@ make install_link (stage: str, target: str, dest: str) -> bool {
 
 make install_rename (source: str, destination: str) -> bool {
     @unsafe {
-        if std::os::platform::rename(source.data, destination.data) == 0 { return true }
+        std::os::rename(source.data, destination.data) catch {
+            progress::fail("unable to publish " + destination)
+            return false
+        }
+        return true
     }
-    progress::fail("unable to publish " + destination)
-    return false
 }
 
 make install_command(name: str, args: str[]) -> bool {

@@ -1887,6 +1887,12 @@ make type Builder {
         t.target = next
         this.terminate(t)
         this.cur = next
+        if ex.*.is_noreturn {
+            make dead = mir::MirTerm {}
+            dead.kind = mir::MirTermKind.Unreachable
+            this.terminate(dead)
+            return dest
+        }
 
         if ex.*.has_catch {
             make success = this.new_block()

@@ -6,13 +6,8 @@
     make path: unit = @import "./path.quip"
     make dir: unit = @import "./dir.quip"
 
-    @target "macos" {
-        make os: unit = @import "../os/macos.quip"
-    }
+    make os = @import "../os/pkg.quip"
 
-    @target "linux" {
-        make os: unit = @import "../os/linux.quip"
-    }
 }
 
 @pub @const @nomangle {
@@ -44,7 +39,7 @@ make println (fmt: variant<String, str, ref<str>>) -> void {
     print(fmt)
 
     make new_line: String = "\n"
-    @unsafe os::write(os::STDOUT_FILENO, new_line.data, 1)
+    @unsafe os::write(os::STDOUT, new_line.data, 1) catch { return }
 }
 
 /// prints text to standard output
@@ -56,19 +51,19 @@ make print (fmt: variant<String, str, ref<str>>) -> void {
     match fmt {
 
         a: String {
-            @unsafe os::write(os::STDOUT_FILENO, a.data, a.length)
+            @unsafe os::write(os::STDOUT, a.data, a.length) catch { return }
         }
 
         b: str {
-            @unsafe os::write(os::STDOUT_FILENO, b.data, b.len())
+            @unsafe os::write(os::STDOUT, b.data, b.len()) catch { return }
         }
 
         c: ref<str> {
-            @unsafe os::write(os::STDOUT_FILENO, c.*.data, c.*.len())
+            @unsafe os::write(os::STDOUT, c.*.data, c.*.len()) catch { return }
         }
 
         _ {
-            @unsafe os::write(os::STDOUT_FILENO, bad_fmt.data, bad_fmt.len())
+            @unsafe os::write(os::STDOUT, bad_fmt.data, bad_fmt.len()) catch { return }
             return
         }
     }

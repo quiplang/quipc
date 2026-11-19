@@ -6,7 +6,15 @@
 make lexical_path (text: str) -> str {
     make full = text
 
-    if full.len() > 0 && full[0] != '/' { full = std::os::getcwd() + "/" + full }
+
+    make cwd = std::io::Path.cwd() catch {
+        std::panic("unable to read current directory", @file, @line)
+    }
+
+    if full.len() > 0 && full[0] != '/' {
+        full = cwd.get() + "/" + full
+    }
+
 
     make path = std::io::Path.create(full)
     make normalized = std::io::Path {}
@@ -40,7 +48,7 @@ make resolve_links (path: str) -> str {
         buffer.reserve(4096) catch { return path }
         @unsafe make null: ptr<char> = 0
 
-        if std::os::platform::realpath(input.data, buffer.data) == null { return path }
+        std::os::realpath(input.data, buffer.data) catch { return path }
 
         return from_cstr(buffer.data)
     }
@@ -57,4 +65,3 @@ make from_cstr (data: ptr<char>) -> str {
 
     return result
 }
-

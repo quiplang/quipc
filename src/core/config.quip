@@ -3,31 +3,10 @@
     make c = @import "../../library/std/ffi/c.quip"
 }
 
-@unsafe @external make uname (buffer: ptr<any>) -> i32
-
 make native_platform_name () -> str {
-    @target "macos" {
-        return unix_platform_name()
-    }
-
-    @target "linux" {
-        return unix_platform_name()
-    }
-
-    return ""
-}
-
-make unix_platform_name () -> str {
-    // Darwin's utsname has five 256-byte fields. Linux's is smaller.
-    // The NUL-terminated sysname is the first field on both systems.
-    make buffer: str = ""
-    buffer.reserve(1280) catch { return "" }
-    @unsafe {
-        if uname(buffer.data) != 0 { return "" }
-        make system = c::to_str(buffer.data)
-        if system == "Darwin" { return "macos" }
-        if system == "Linux" { return "linux" }
-    }
+    make info = std::os::system_info() catch { return "" }
+    if info.system == "Darwin" { return "macos" }
+    if info.system == "Linux" { return "linux" }
     return ""
 }
 
@@ -87,7 +66,7 @@ make type Config {
         config.output = std::io::Path.create("target/debug/")
 
         config.options = std::Options {}
-        if std::os::getenv("QUIPC_NO_PROGRESS") == "1" { config.options.progress_enabled = false }
+        if std::process::Environment.get("QUIPC_NO_PROGRESS", "") == "1" { config.options.progress_enabled = false }
         config.platform = std::Platform.Native
         config.platform_name = native_platform_name()
 

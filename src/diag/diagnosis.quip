@@ -423,6 +423,31 @@ make type Diagnostic {
         for edit : d.*.edits {
             if this.has_source && edit.offset <= this.source.len() && edit.removed <= this.source.len() - edit.offset {
                 make line = this.map.resolve(edit.offset).line
+                // Deletions may cover a complete statement or tagged block.
+                // Render every affected line, including its closing delimiter.
+                if edit.removed > 0 && edit.text.len() == 0 {
+                    make stop = edit.offset + edit.removed
+                    make last_line = this.map.resolve(stop - 1).line
+                    make width = last_line.to_str().len()
+                    while line <= last_line {
+                        make start = this.map.line_start(line)
+                        make end = this.map.line_end(line)
+                        make marker: str = ""
+                        make pos = start
+                        while pos < end && pos < stop {
+                            if pos < edit.offset {
+                                if this.source[pos] == '\t' { marker.push('\t') }
+                                else { marker.push(' ') }
+                            } else { marker.push('-') }
+                            pos++
+                        }
+                        std::io::println(gutter(width))
+                        this.source_line(width, line)
+                        std::io::println(gutter(width) + " " + paint(C_RED() + C_BOLD(), marker))
+                        line++
+                    }
+                    continue
+                }
                 make start = this.map.line_start(line)
                 make end = this.map.line_end(line)
                 make preview: str = ""
@@ -702,7 +727,11 @@ make type Diagnostic {
                 if ch == '-' {
                     row = row + C_BLUE() + '-' + C_RESET()
                 } else {
-                    row = row + ' '
+                    // Match tabs in the source so terminal tab stops keep carets aligned.
+                    make offset = this.map.line_start(line) + col - 1
+                    if offset < this.map.line_end(line) && this.source[offset] == '\t' {
+                        row.push('\t')
+                    } else { row.push(' ') }
                 }
             }
 

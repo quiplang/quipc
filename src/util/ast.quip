@@ -74,6 +74,8 @@ make enum ExprKind {
 make type AST_Head {
     @pub {
         make range: util::Range = .{}
+        // Full enclosing tagged block, retained when its statements are flattened.
+        make group_range: util::Range = .{}
         make kind: AST_Kind = AST_Kind.None
         make status: AST_Status = AST_Status.None
         make tags: owned<AST_Tag>[] = []
@@ -99,6 +101,7 @@ make type AST_Head {
         c.* = AST_Head {}
 
         c.*.range = this.range
+        c.*.group_range = this.group_range
         c.*.kind = this.kind
         c.*.status = this.status
         c.*.tags = []

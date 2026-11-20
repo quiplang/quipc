@@ -1,0 +1,773 @@
+@pure @const {
+    make lexer = @import "../core/token.quip"
+    make context = @import "../diag/context.quip"
+    make facts = @import "../analysis/facts.quip"
+    make hir = @import "../hir/hir.quip"
+    make util = @import "../util/pkg.quip"
+    make ty = @import "../ty/ty.quip"
+    make diags = @import "../diag/diagnosis.quip"
+    make e = @import "../diag/err.quip"
+}
+
+
+
+// Track distinct exits so a loop consumes its own break/continue edges.
+make type Flow {
+    @pub make next: bool = true
+    @pub make returns: bool = false
+    @pub make breaks: bool = false
+    @pub make continues: bool = false
+}
+
+make block_flow (body: ref<hir::HirBody>, block: uint) -> Flow {
+    make flow = Flow {}
+    for index : body.*.blocks[block].stmts {
+        if !flow.next { break }
+        make step = statement_flow(body, body.*.stmts[index].pin)
+        flow.next = step.next
+        flow.returns = flow.returns || step.returns
+        flow.breaks = flow.breaks || step.breaks
+        flow.continues = flow.continues || step.continues
+    }
+    return flow
+}
+
+@pub
+make block_exits (body: ref<hir::HirBody>, block: uint) -> bool {
+    make flow = block_flow(body, block)
+    return !flow.next
+}
+
+// Evaluate only operands guaranteed to run; short-circuit RHSs are conditional.
+make expression_exits (body: ref<hir::HirBody>, index: uint) -> bool {
+    make ex = body.*.exprs[index].pin
+    if ex.*.kind == hir::HirExprKind.Call {
+        if ex.*.is_noreturn || expression_exits(body, ex.*.lhs) { return true }
+        for argument : ex.*.args {
+            if expression_exits(body, argument) { return true }
+        }
+    } elif ex.*.kind == hir::HirExprKind.Binary {
+        if expression_exits(body, ex.*.lhs) { return true }
+        if ex.*.lit.lexeme != "&&" && ex.*.lit.lexeme != "||" {
+            return expression_exits(body, ex.*.rhs)
+        }
+    } elif ex.*.kind == hir::HirExprKind.Unary || ex.*.kind == hir::HirExprKind.Copy
+        || ex.*.kind == hir::HirExprKind.Deref || ex.*.kind == hir::HirExprKind.Pin
+        || ex.*.kind == hir::HirExprKind.Field {
+        return expression_exits(body, ex.*.lhs)
+    } elif ex.*.kind == hir::HirExprKind.Index {
+        return expression_exits(body, ex.*.lhs) || expression_exits(body, ex.*.rhs)
+    }
+    return false
+}
+
+make statement_flow (body: ref<hir::HirBody>, stmt: ref<hir::HirStmt>) -> Flow {
+    make flow = Flow {}
+    if stmt.*.kind == hir::HirStmtKind.Return {
+        flow.next = false
+        flow.returns = !stmt.*.has_value || !expression_exits(body, stmt.*.value)
+        return flow
+    }
+    if stmt.*.kind == hir::HirStmtKind.Break || stmt.*.kind == hir::HirStmtKind.Continue {
+        flow.next = false
+        flow.breaks = stmt.*.kind == hir::HirStmtKind.Break
+        flow.continues = stmt.*.kind == hir::HirStmtKind.Continue
+        return flow
+    }
+    if (stmt.*.kind == hir::HirStmtKind.Expr || stmt.*.kind == hir::HirStmtKind.Let
+        || stmt.*.kind == hir::HirStmtKind.Assign || stmt.*.kind == hir::HirStmtKind.If
+        || stmt.*.kind == hir::HirStmtKind.Match) && stmt.*.has_value {
+        if expression_exits(body, stmt.*.value) { flow.next = false return flow }
+    }
+    if stmt.*.kind == hir::HirStmtKind.Expr && expression_exits(body, stmt.*.value) {
+        flow.next = false
+        return flow
+    }
+    if stmt.*.kind == hir::HirStmtKind.Block { return block_flow(body, stmt.*.then_block) }
+    if stmt.*.kind == hir::HirStmtKind.Loop {
+        make inner = block_flow(body, stmt.*.then_block)
+        flow.next = inner.breaks
+        flow.returns = inner.returns
+        return flow
+    }
+    if stmt.*.kind == hir::HirStmtKind.If {
+        make condition = body.*.exprs[stmt.*.value].pin
+        if condition.*.kind == hir::HirExprKind.Literal {
+            if condition.*.lit.lexeme == "true" { return block_flow(body, stmt.*.then_block) }
+            if condition.*.lit.lexeme == "false" {
+                if stmt.*.has_else { return block_flow(body, stmt.*.else_block) }
+                return flow
+            }
+        }
+        make left = block_flow(body, stmt.*.then_block)
+        make right = Flow {}
+        if stmt.*.has_else { right = block_flow(body, stmt.*.else_block) }
+        flow.next = left.next || right.next
+        flow.returns = left.returns || right.returns
+        flow.breaks = left.breaks || right.breaks
+        flow.continues = left.continues || right.continues
+        return flow
+    }
+    if stmt.*.kind == hir::HirStmtKind.Match {
+        flow.next = false
+        make exhaustive = false
+        make has_some = false
+        make has_none = false
+        make has_true = false
+        make has_false = false
+        for index : stmt.*.cases {
+            make arm = body.*.cases[index].pin
+            if arm.*.kind == hir::HirPatternKind.Some { has_some = true }
+            if arm.*.kind == hir::HirPatternKind.None { has_none = true }
+            if arm.*.kind == hir::HirPatternKind.Literal {
+                if arm.*.lit.lexeme == "true" { has_true = true }
+                if arm.*.lit.lexeme == "false" { has_false = true }
+            }
+            make branch = Flow {}
+            if arm.*.has_body { branch = block_flow(body, arm.*.body) }
+            if branch.next && arm.*.has_result && expression_exits(body, arm.*.result) { branch.next = false }
+            flow.next = flow.next || branch.next
+            flow.returns = flow.returns || branch.returns
+            flow.breaks = flow.breaks || branch.breaks
+            flow.continues = flow.continues || branch.continues
+            if arm.*.kind == hir::HirPatternKind.Wildcard || arm.*.kind == hir::HirPatternKind.Binding {
+                exhaustive = true
+                break
+            }
+        }
+        flow.next = flow.next || !(exhaustive || (has_some && has_none) || (has_true && has_false))
+    }
+    return flow
+}
+
+make statement_exits (body: ref<hir::HirBody>, stmt: ref<hir::HirStmt>) -> bool {
+    make flow = statement_flow(body, stmt)
+    return !flow.next
+}
+
+
+/// checks whether a hir function carries the unsafe tag.
+
+
+// A resolved use is recorded during type inference and checked in the semantic phase.
+make writable_place (body: ref<hir::HirBody>, index: uint, types: ref<uint[]>, tys: ref<ty::TyInterner>) -> bool {
+    make expression = body.*.exprs[index].pin
+    if expression.*.kind == hir::HirExprKind.Local || expression.*.kind == hir::HirExprKind.Deref { return true }
+
+    if expression.*.kind == hir::HirExprKind.Field || expression.*.kind == hir::HirExprKind.Index {
+        make kind = tys.*.kind_of(types.*[expression.*.lhs])
+        if kind == ty::TyKind.StrBuf || kind == ty::TyKind.Text { return false }
+        if kind == ty::TyKind.Ptr || kind == ty::TyKind.Ref || kind == ty::TyKind.Owned { return true }
+        return writable_place(body, expression.*.lhs, types, tys)
+    }
+    return false
+}
+
+@pub
+make check_uses (body: ref<hir::HirBody>, checks: ref<facts::UseCheck[]>, types: ref<uint[]>, tys: ref<ty::TyInterner>, structs: ref<hir::HirStructSig[]>, diag: ref<diags::Diagnostic>) -> void {
+    for check : checks.* {
+        if check.kind == 0 {
+            make d = diags::Diag.err(e::Err.UnsafeRequired, check.range.copy(), "use of an @unsafe declaration requires an unsafe context")
+            d.help("use an @unsafe statement, block, or function; a safe wrapper must contain an explicit unsafe block")
+            diag.*.report(d)
+        } elif check.kind == 1 {
+            make d = diags::Diag.err(e::Err.UnsafeRequired, check.range.copy(), "call or reference to an @unsafe function requires an unsafe context")
+            d.attach(diags::Label.create(util::Range.of(check.span.start, check.span.end), "@unsafe function declared here"))
+            d.note("the caller is responsible for establishing this function's safety preconditions")
+            d.help("use an @unsafe statement/block/function, or provide a safe wrapper with an explicit unsafe block")
+            diag.*.report(d)
+        } elif check.kind == 2 {
+            make d = diags::Diag.err(e::Err.UnsafeRequired, check.range.copy(), "use of an @unsafe declaration requires an unsafe context")
+
+            if check.has_source && check.span.end > check.span.start {
+                d.attach(diags::Label.in_file(check.path.copy(), check.source.copy(), util::Range.of(check.span.start, check.span.end), "@unsafe declaration is here"))
+            }
+
+            d.note("the caller must establish the declaration's safety preconditions")
+            d.help("use an @unsafe statement/block/function, or a safe wrapper that performs the unsafe operation internally")
+            diag.*.report(d)
+        } elif check.kind == 3 {
+            make d = diags::Diag.err(e::Err.UnsafeRequired, check.range.copy(), "access to an @unsafe field requires an unsafe context")
+            d.label("unsafe field `" + check.name.copy() + "` accessed here")
+            context::attach_field_context(structs, d.*.pin, check.owner.copy(), check.name.copy())
+            d.help("establish the field's safety requirements in an @unsafe context or use a safe accessor")
+            diag.*.report(d)
+        } elif check.kind == 10 {
+            make d = diags::Diag.err(e::Err.PureRequired, check.range.copy(), "use of an `@pure` declaration requires an `@pure` context")
+            d.help("tag the receiving binding or enclosing function with `@pure`")
+            diag.*.report(d)
+        } elif check.kind == 11 {
+            make d = diags::Diag.err(e::Err.ConstMutation, check.range.copy(), "cannot mutate an `@const` binding")
+            diag.*.suggest_line(d.*.pin, check.range.start.start, "")
+            diag.*.report(d)
+        } elif check.kind == 8 || check.kind == 9 {
+            if !writable_place(body, check.target, types, tys) {
+                make message = "assignment requires a writable place"
+                if check.kind == 9 { message = "increment/decrement requires a writable place" }
+                diag.*.report(diags::Diag.err(e::Err.TypeMismatch, body.*.exprs[check.target].range.copy(), message))
+            }
+        } elif check.kind == 7 {
+            for structure : structs.* {
+                if structure.name == check.owner {
+                    for field : structure.fields {
+                        if field.name == check.name && !field.is_pub {
+                            private_field(structs, diag, check.owner.copy(), check.name.copy(), check.range.copy())
+                        }
+                    }
+                }
+            }
+        } elif check.kind == 5 && !block_exits(body, check.block) {
+            make d = diags::Diag.err(e::Err.TypeMismatch, check.range.copy(), "catch must exit when a success value is required")
+            d.help("return, break, or continue from the error handler")
+            diag.*.report(d)
+        } elif check.kind == 6 {
+            make d = diags::Diag.err(e::Err.InvalidSyntax, check.range.copy(), "match pattern must be a literal or enum variant")
+            diag.*.report(d)
+        } elif check.kind == 4 {
+            make d = diags::Diag.err(e::Err.UnsafeRequired, check.range.copy(), "call to `__syscall` requires an `@unsafe` block")
+            d.label("`__syscall` is an unsafe builtin")
+            d.help("wrap this call in an `@unsafe { ... }` block")
+            diag.*.report(d)
+        }
+    }
+}
+
+/// attaches the field context.
+
+
+/// attaches the origin.
+
+
+/// checks whether a resolved type is supported as a native export scalar.
+make native_export_scalar (tys: ref<ty::TyInterner>, resolved: uint) -> bool {
+    make kind = tys.*.kind_of(resolved)
+
+    return tys.*.is_numeric(resolved) || kind == ty::TyKind.Bool
+        || kind == ty::TyKind.Char || kind == ty::TyKind.Ptr || kind == ty::TyKind.Ref
+}
+
+@pub
+make check_native_intrinsic (tys: ref<ty::TyInterner>, diag: ref<diags::Diagnostic>, function: ref<hir::HirFunc>, params: ref<uint[]>, ret_ty: uint, resolved_ret: uint) {
+    make operation = function.*.intrinsic_name.copy()
+    make count = function.*.body.param_count
+    make valid = function.*.is_external && !function.*.is_variadic && !function.*.is_attached && function.*.export_name.len() == 0
+    make result = tys.*.kind_of(resolved_ret)
+    make address_intrinsic = operation.len() > 15
+    make prefix: str = "native_address:"
+    make pi: uint = 0
+
+    while pi < prefix.len() && address_intrinsic {
+        if operation[pi] != prefix[pi] { address_intrinsic = false }
+
+        pi = pi + 1
+    }
+
+    make constant_intrinsic = operation.len() >= 17
+    make constant_prefix: str = "constant_address:"
+    pi = 0
+
+    while pi < constant_prefix.len() && constant_intrinsic {
+        if operation[pi] != constant_prefix[pi] { constant_intrinsic = false }
+
+        pi = pi + 1
+    }
+
+    if constant_intrinsic {
+        if count != 0 || result != ty::TyKind.Ptr { valid = false }
+    } elif address_intrinsic {
+        if count != 0 || result != ty::TyKind.Ptr { valid = false }
+
+        pi = 15
+
+        while pi < operation.len() {
+            make c = operation[pi]
+            make letter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+
+            if !letter && (pi == 15 || c < '0' || c > '9') { valid = false }
+
+            pi = pi + 1
+        }
+    } elif operation == "global_address" {
+        if count != 0 || result != ty::TyKind.Ptr { valid = false }
+    } elif operation == "native_call" {
+        if count == 0 { valid = false }
+
+        make i: uint = 0
+
+        while i < count {
+            if !native_export_scalar(tys, params.*[i]) { valid = false }
+
+            if i == 0 && tys.*.kind_of(params.*[i]) != ty::TyKind.Ptr { valid = false }
+
+            i = i + 1
+        }
+
+        if ret_ty != ty::TY_VOID && !native_export_scalar(tys, resolved_ret) { valid = false }
+    } else { valid = false }
+
+    if !valid {
+        make d = diags::Diag.err(e::Err.TypeMismatch, function.*.range.copy(), "invalid runtime intrinsic signature")
+        d.help("storage intrinsics return a pointer; native_call takes a raw function pointer followed by scalar arguments")
+        diag.*.report(d)
+    }
+}
+
+@pub
+make check_native_export (module: ref<hir::HirModule>, tys: ref<ty::TyInterner>, diag: ref<diags::Diagnostic>, function: ref<hir::HirFunc>, params: ref<uint[]>, ret_ty: uint, resolved_ret: uint) {
+    make valid = !function.*.is_external && !function.*.is_attached && !function.*.is_lambda
+
+    for tag : function.*.tags {
+        if tag == "entry" || tag == "variadic" { valid = false }
+    }
+
+    if ret_ty != ty::TY_VOID && !native_export_scalar(tys, resolved_ret) { valid = false }
+
+    make i: uint = 0
+
+    while i < function.*.body.param_count {
+        if !native_export_scalar(tys, params.*[i]) { valid = false }
+
+        i = i + 1
+    }
+
+    make name = function.*.export_name.copy()
+    i = 0
+
+    while i < name.len() {
+        make c = name[i]
+        make letter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+
+        if !letter && (i == 0 || c < '0' || c > '9') { valid = false }
+
+        i = i + 1
+    }
+
+    for other : module.*.funcs {
+        if other.name != function.*.name && other.export_name == name { valid = false }
+    }
+
+    if !valid {
+        make d = diags::Diag.err(e::Err.TypeMismatch, function.*.range.copy(), "invalid native export")
+        d.help("use a unique C identifier on a free function with scalar or pointer parameters and a scalar, pointer or void result")
+        diag.*.report(d)
+    }
+}
+
+
+
+
+make check_case_flow (body: ref<hir::HirBody>, cases: ref<uint[]>, diag: ref<diags::Diagnostic>) {
+    for index : cases.* {
+        make arm = body.*.cases[index].pin
+        if arm.*.has_body { check_block_flow(body, arm.*.body, diag) }
+        if arm.*.has_result { check_expr_flow(body, arm.*.result, diag) }
+        if arm.*.has_pattern { check_expr_flow(body, arm.*.pattern, diag) }
+    }
+}
+
+// A loop owns every jump inside it. Nested functions have separate HIR bodies,
+// so only blocks reachable without crossing a loop can contain invalid jumps.
+make check_block_flow (body: ref<hir::HirBody>, block: uint, diag: ref<diags::Diagnostic>) {
+    for index : body.*.blocks[block].stmts {
+        make stmt = body.*.stmts[index].pin
+        if stmt.*.kind == hir::HirStmtKind.Break || stmt.*.kind == hir::HirStmtKind.Continue {
+            make word = "break"
+            if stmt.*.kind == hir::HirStmtKind.Continue { word = "continue" }
+            diag.*.report(diags::Diag.err(e::Err.InvalidSyntax, stmt.*.range.copy(), "`" + word + "` requires an enclosing loop"))
+        }
+        if stmt.*.has_value { check_expr_flow(body, stmt.*.value, diag) }
+        if stmt.*.kind == hir::HirStmtKind.Assign { check_expr_flow(body, stmt.*.target, diag) }
+        if stmt.*.kind == hir::HirStmtKind.If || stmt.*.kind == hir::HirStmtKind.Block {
+            check_block_flow(body, stmt.*.then_block, diag)
+        }
+        if stmt.*.has_else { check_block_flow(body, stmt.*.else_block, diag) }
+        if stmt.*.kind == hir::HirStmtKind.Match { check_case_flow(body, stmt.*.cases.pin, diag) }
+    }
+}
+
+make check_expr_flow (body: ref<hir::HirBody>, index: uint, diag: ref<diags::Diagnostic>) {
+    make ex = body.*.exprs[index].pin
+    make kind = ex.*.kind
+    if kind == hir::HirExprKind.Binary || kind == hir::HirExprKind.Index { check_expr_flow(body, ex.*.rhs, diag) }
+    if kind == hir::HirExprKind.Binary || kind == hir::HirExprKind.Index || kind == hir::HirExprKind.Unary
+        || kind == hir::HirExprKind.Update || kind == hir::HirExprKind.Call || kind == hir::HirExprKind.Field
+        || kind == hir::HirExprKind.Deref || kind == hir::HirExprKind.Pin || kind == hir::HirExprKind.Copy
+        || kind == hir::HirExprKind.Match { check_expr_flow(body, ex.*.lhs, diag) }
+    for arg : ex.*.args { check_expr_flow(body, arg, diag) }
+    if ex.*.has_catch { check_block_flow(body, ex.*.catch_block, diag) }
+    if kind == hir::HirExprKind.Match { check_case_flow(body, ex.*.cases.pin, diag) }
+}
+
+make check_body (body: ref<hir::HirBody>, diag: ref<diags::Diagnostic>) {
+    if body.*.root < body.*.blocks.len() { check_block_flow(body, body.*.root, diag) }
+
+    for ex : body.*.exprs {
+        if ex.kind == hir::HirExprKind.Constructor {
+            make i: uint = 0
+            while i < ex.field_names.len() {
+                make j: uint = 0
+                while ex.field_names[i].len() > 0 && j < i {
+                    if ex.field_names[i] == ex.field_names[j] {
+                        make d = diags::Diag.err(e::Err.DuplicateSymbol, body.*.exprs[ex.args[i]].range.copy(), "field `" + ex.field_names[i].copy() + "` initialized twice")
+                        d.attach(diags::Label.create(body.*.exprs[ex.args[j]].range.copy(), "first initializer"))
+                        diag.*.report(d)
+                        break
+                    }
+                    j++
+                }
+                i++
+            }
+        }
+    }
+}
+
+@pub
+make check_bodies (module: ref<hir::HirModule>, diag: ref<diags::Diagnostic>) {
+    make i: uint = 0
+    while i < module.*.funcs.len() {
+        check_body(module.*.funcs[i].body.pin, diag)
+        i++
+    }
+    i = 0
+    while i < module.*.structs.len() {
+        check_body(module.*.structs[i].body.pin, diag)
+        i++
+    }
+}
+
+/// Checks declarations whose validity does not depend on inferred types.
+@pub
+make check_module (module: ref<hir::HirModule>, diag: ref<diags::Diagnostic>) -> void {
+    for item : module.*.items {
+        if item.kind == hir::HirItemKind.Alias && !item.is_pure {
+            make d = diags::Diag.err(e::Err.TypeAliasNotPure, item.range.copy(), "type alias must be '@pure'")
+            d.label("compile-time Type aliases are evaluated during compilation")
+            d.help("add the `@pure` tag to this declaration")
+            d.suggest_insert(item.range.start.start, "@pure ")
+            diag.*.report(d)
+        }
+    }
+}
+
+
+
+@pub
+make check_array_copy_return (function: ref<hir::HirFunc>, owner: str, returned: str, diag: ref<diags::Diagnostic>) -> void {
+    if returned == owner { return }
+
+    make d = diags::Diag.err(e::Err.TypeMismatch, function.*.range.copy(), "invalid array copy implementation")
+    d.label("`@copy` must take only its implicit receiver and return `" + owner + "`")
+    diag.*.report(d)
+}
+
+/// Checks array-copy declaration shape and uniqueness across the signature registry.
+@pub
+make check_array_copies (module: ref<hir::HirModule>, sigs: ref<hir::HirAttachedSig[]>, diag: ref<diags::Diagnostic>) -> void {
+    for method : module.*.attached_funcs {
+        if method.func < module.*.funcs.len() {
+            make function = module.*.funcs[method.func].pin
+            make owner = method.type_name.copy()
+
+            if facts::is_array_copy(function, owner.copy()) {
+                if !function.*.has_this || function.*.body.param_count != 1 || !function.*.has_ret_ty {
+                    make d = diags::Diag.err(e::Err.TypeMismatch, function.*.range.copy(), "invalid array copy implementation")
+                    d.label("`@copy` must take only its implicit receiver and return `" + owner.copy() + "`")
+                    diag.*.report(d)
+                }
+
+                for other : sigs.* {
+                    if other.is_copy_fn && other.type_name == owner && other.symbol != function.*.name {
+                        make d = diags::Diag.err(e::Err.DuplicateSymbol, function.*.range.copy(), "duplicate array copy implementation")
+                        d.label("`" + owner.copy() + "` has more than one `@copy` implementation")
+                        context::attach_origin(d.*.pin, other.path.copy(), other.source, other.name_span.copy(), "other implementation declared here")
+                        diag.*.report(d)
+                        break
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Checks function declarations after their parameter and return types are resolved.
+@pub
+make check_typed_function (module: ref<hir::HirModule>, index: uint, tys: ref<ty::TyInterner>, params: ref<uint[]>, ret_ty: uint, diag: ref<diags::Diagnostic>) -> void {
+    if index >= module.*.funcs.len() { return }
+
+    make function = module.*.funcs[index].pin
+
+    if !function.*.is_external {
+        make noreturn = facts::noreturn_function(function)
+        make needs_value = ret_ty != ty::TY_VOID && ret_ty != ty::TY_ERROR
+        if tys.*.kind_of(ret_ty) == ty::TyKind.Fallible && tys.*.elem_of(ret_ty) == ty::TY_VOID { needs_value = false }
+        make flow = block_flow(function.*.body.pin, function.*.body.root)
+        if (flow.next || flow.breaks || flow.continues) && (noreturn || needs_value) {
+            make end = function.*.body.blocks[function.*.body.root].end_span.copy()
+            make d = diags::Diag.err(e::Err.TypeMismatch, util::Range.of(end.start, end.end), "function can reach its end without returning a value")
+            if noreturn { d.msg = "`@noreturn` function can reach its end" }
+            d.attach(diags::Label.create(util::Range.of(function.*.name_span.start, function.*.name_span.end), "function declared here"))
+            d.help("return a value on every path, or end the path with a call to an `@noreturn` function")
+            diag.*.report(d)
+        }
+        if noreturn {
+            if flow.returns {
+                make d = diags::Diag.err(e::Err.TypeMismatch, function.*.range.copy(), "`@noreturn` function must not return to its caller")
+                d.help("terminate execution, or remove `@noreturn` from the function")
+                diag.*.report(d)
+            }
+        }
+    }
+
+    if function.*.export_name.len() > 0 { check_native_export(module, tys, diag, function, params, ret_ty, ret_ty) }
+
+    if function.*.intrinsic_name.len() > 0 { check_native_intrinsic(tys, diag, function, params, ret_ty, ret_ty) }
+
+}
+
+/// reports an attempt to access a private field from another module.
+@pub
+make private_field (structs: ref<hir::HirStructSig[]>, diag: ref<diags::Diagnostic>, owner: str, name: str, range: util::Range) {
+    make display = owner.copy()
+    make sid: uint = 0
+
+    while sid < structs.*.len() && structs.*[sid].name != owner { sid = sid + 1 }
+
+    if sid < structs.*.len() && structs.*[sid].display_name.len() > 0 { display = structs.*[sid].display_name.copy() }
+
+    make d = diags::Diag.err(e::Err.PrivateField, range, "field `" + name + "` of type `" + display + "` is private")
+    d.label("cannot access this field from another module")
+    context::attach_field_context(structs, d.*.pin, owner, name.copy())
+    d.note("@pub on a type does not make its fields public")
+    d.help("add @pub to `" + display + "." + name + "` if external access is intended, or use a public accessor")
+    diag.*.report(d)
+}
+
+
+
+
+
+
+// Record resolved imported field uses; visibility policy runs in check_uses.
+
+@pub
+make warn_import (tokens: ref<lexer::Token[]>, alias: str, span: util::Span, path: str, provides_methods: bool, diag: ref<diags::Diagnostic>) {
+    if alias.len() == 0 || alias == "_" { return }
+
+    // Count any other occurrence of the identifier conservatively, including
+    // occurrences in type syntax, tags and source selected for other targets.
+    for token : tokens.* {
+        if token.kind == lexer::TokenKind.Identifier && token.span.start != span.start && token.lexeme == alias { return }
+    }
+
+    make warning = diags::Diag.warn(e::Warn.UnusedImport, util::Range.of(span.start, span.end), "unused import `" + alias + "`")
+    if provides_methods {
+        warning.help("use a standalone import to register attached functions")
+        diag.*.suggest_line(warning.*.pin, span.start, "@import \"" + path + "\"")
+    } else {
+        warning.help("remove this unused import")
+        diag.*.suggest_line(warning.*.pin, span.start, "")
+    }
+    diag.*.report(warning)
+}
+
+make warn_match_arms (body: ref<hir::HirBody>, cases: ref<uint[]>, diag: ref<diags::Diagnostic>) {
+    make covered = false
+    for index : cases.* {
+        make arm = body.*.cases[index].pin
+        if covered {
+            make warning = diags::Diag.warn(e::Warn.Unreachable, arm.*.range.copy(), "match arm follows a catch-all pattern")
+            warning.help("remove this unreachable code or change the preceding control flow so it can run")
+            warning.suggest_replace(arm.*.range.start.start, arm.*.range.end.end, "")
+            diag.*.report(warning)
+            return
+        }
+        covered = arm.*.kind == hir::HirPatternKind.Wildcard || arm.*.kind == hir::HirPatternKind.Binding
+    }
+}
+
+// Returns the local ID plus one for plain writes. Compound assignments and
+// writes through projections read their destination.
+make local_write (body: ref<hir::HirBody>, stmt: ref<hir::HirStmt>) -> uint {
+    if stmt.*.kind == hir::HirStmtKind.Let && stmt.*.has_value { return stmt.*.local + 1 }
+    if stmt.*.kind == hir::HirStmtKind.Assign && stmt.*.op.kind == lexer::TokenKind.Equal {
+        make target = body.*.exprs[stmt.*.target].pin
+        if target.*.kind == hir::HirExprKind.Local { return target.*.local + 1 }
+    }
+    return 0
+}
+
+@pub
+make warn_body (body: ref<hir::HirBody>, types: ref<uint[]>, tys: ref<ty::TyInterner>, diag: ref<diags::Diagnostic>, extra: bool) {
+    make reads: bool[] = []
+    make write_targets: bool[] = []
+    for local : body.*.locals { reads.push(false) }
+    for expression : body.*.exprs { write_targets.push(false) }
+
+    for stmt : body.*.stmts {
+        if stmt.kind == hir::HirStmtKind.Assign && stmt.op.kind == lexer::TokenKind.Equal {
+            write_targets[stmt.target] = true
+        }
+    }
+
+    make i: uint = 0
+    while i < body.*.exprs.len() {
+        make ex = body.*.exprs[i].pin
+        if ex.*.kind == hir::HirExprKind.Local && !write_targets[i] { reads[ex.*.local] = true }
+        if ex.*.kind == hir::HirExprKind.Match { warn_match_arms(body, ex.*.cases.pin, diag) }
+        i++
+    }
+
+    i = 0
+    while i < body.*.locals.len() {
+        make local = body.*.locals[i].pin
+        make span = local.*.name_span.copy()
+        if span.end > span.start && local.*.name.len() > 0 && local.*.name != "_" {
+            make range = util::Range.of(span.start, span.end)
+            if !reads[i] {
+                make warning = diags::Diag.warn(e::Warn.UnusedBinding, range.copy(), "unused binding `" + local.*.name + "`")
+                warning.help("use this binding, remove it, or replace its name with `_` to discard its value")
+                warning.suggest_replace(span.start, span.end, "_")
+                diag.*.report(warning)
+            }
+
+        }
+        i++
+    }
+
+    for block : body.*.blocks {
+        make unreachable = false
+        make previous: uint = 0
+        make previous_local: uint = 0
+        make exit_end: uint = 0
+        for index : block.stmts {
+            make stmt = body.*.stmts[index].pin
+            if unreachable {
+                // Only selected HIR statements participate: source for other targets
+                // must never be swept into a deletion spanning the whole tail.
+                make range = stmt.*.range.copy()
+                if stmt.*.group_range.end.end > 0 && stmt.*.group_range.start.start >= exit_end {
+                    range = stmt.*.group_range.copy()
+                }
+                make warning = diags::Diag.warn(e::Warn.Unreachable, range.copy(), "unreachable statement")
+                warning.help("remove this unreachable code or change the preceding control flow so it can run")
+                warning.attach(diags::Label.create(body.*.stmts[previous].range.copy(), "control flow exits here for the selected target"))
+                make deleting = false
+                make deleted_end: uint = 0
+                for dead_index : block.stmts {
+                    if dead_index == index { deleting = true }
+                    if deleting {
+                        make dead = body.*.stmts[dead_index].pin
+                        make removal = dead.*.range.copy()
+                        if dead.*.group_range.end.end > 0 && dead.*.group_range.start.start >= exit_end {
+                            removal = dead.*.group_range.copy()
+                        }
+                        if removal.start.start >= deleted_end {
+                            warning.suggest_replace(removal.start.start, removal.end.end, "")
+                            deleted_end = removal.end.end
+                        }
+                    }
+                }
+                diag.*.report(warning)
+                break
+            }
+
+            make written = local_write(body, stmt)
+            if written != 0 && written == previous_local && stmt.*.kind == hir::HirStmtKind.Assign {
+                // An adjacent literal overwrite cannot read the previous value.
+                make local = body.*.locals[written - 1].pin
+                if local.*.name_span.end > local.*.name_span.start && local.*.name != "_"
+                    && body.*.exprs[stmt.*.value].kind == hir::HirExprKind.Literal {
+                    make warning = diags::Diag.warn(e::Warn.UnusedAssignment, body.*.stmts[previous].range.copy(), "value assigned to `" + local.*.name + "` is overwritten before it is read")
+                    warning.help("use this value before overwriting it, or replace the earlier assignment with an explicit discard to preserve side effects")
+                    make earlier = body.*.stmts[previous].pin
+                    if earlier.*.kind == hir::HirStmtKind.Assign {
+                        warning.suggest_replace(earlier.*.range.start.start, body.*.exprs[earlier.*.value].range.start.start, "_ = ")
+                    }
+                    diag.*.report(warning)
+                }
+            }
+            previous_local = written
+            previous = index
+
+            if stmt.*.kind == hir::HirStmtKind.Match { warn_match_arms(body, stmt.*.cases.pin, diag) }
+            if stmt.*.kind == hir::HirStmtKind.Expr && body.*.exprs[stmt.*.value].kind == hir::HirExprKind.Call {
+                make id = types.*[stmt.*.value]
+                make kind = tys.*.kind_of(id)
+                if kind == ty::TyKind.Fallible {
+                    make warning = diags::Diag.warn(e::Warn.IgnoredFallible, stmt.*.range.copy(), "discarded fallible result")
+                    warning.help("handle the error with `catch`, return the result, or write `_ =` to discard it explicitly")
+                    warning.suggest_insert(stmt.*.range.start.start, "_ = ")
+                    diag.*.report(warning)
+                } elif extra && id != ty::TY_ERROR && kind != ty::TyKind.Void {
+                    make warning = diags::Diag.warn(e::Warn.IgnoredResult, stmt.*.range.copy(), "discarded return value")
+                    warning.help("use the returned value or write `_ =` to discard it explicitly")
+                    warning.suggest_insert(stmt.*.range.start.start, "_ = ")
+                    diag.*.report(warning)
+                }
+            }
+            unreachable = statement_exits(body, stmt)
+            if unreachable { exit_end = stmt.*.range.end.end }
+        }
+    }
+}
+
+// Standalone imports register implementations while their exported names
+// require an explicit namespace binding at every source use.
+make check_unbound_name (module: ref<hir::HirModule>, exports: ref<hir::HirExport[]>, path: str, import_offset: uint, name: str, range: util::Range, diag: ref<diags::Diagnostic>) {
+    if ty::TyInterner.prim(name.copy()) != ty::TY_ERROR { return }
+    for item : module.*.items { if item.name == name { return } }
+    for exported : exports.* {
+        if exported.name == name {
+            make d = diags::Diag.err(e::Err.UnknownSymbol, range.copy(), "symbol `" + name.copy() + "` requires a named import")
+            d.help("bind the import to a name and qualify this symbol")
+            d.suggest_insert(import_offset, "@pure @const make imported = ")
+            d.suggest_insert(range.start.start, "imported::")
+            diag.*.report(d)
+            return
+        }
+    }
+}
+
+make check_unbound_body (module: ref<hir::HirModule>, body: ref<hir::HirBody>, exports: ref<hir::HirExport[]>, path: str, import_offset: uint, diag: ref<diags::Diagnostic>) {
+    for expression : body.*.exprs {
+        if expression.kind == hir::HirExprKind.Path || expression.kind == hir::HirExprKind.Constructor {
+            make local_name = false
+            for local : body.*.locals { if local.name == expression.name { local_name = true } }
+            if !local_name { check_unbound_name(module, exports, path.copy(), import_offset, expression.name.copy(), expression.range.copy(), diag) }
+        }
+    }
+    make qualified_children: bool[] = []
+    for signature : body.*.types { qualified_children.push(false) }
+    for signature : body.*.types {
+        if signature.is_namespace {
+            for child : signature.args { qualified_children[child] = true }
+        }
+    }
+    make i: uint = 0
+    while i < body.*.types.len() {
+        make signature = body.*.types[i].pin
+        if !signature.*.is_namespace && !qualified_children[i] {
+            check_unbound_name(module, exports, path.copy(), import_offset, signature.*.name.copy(), signature.*.range.copy(), diag)
+        }
+        i++
+    }
+}
+
+@pub
+make check_unbound_import (module: ref<hir::HirModule>, exports: ref<hir::HirExport[]>, path: str, import_offset: uint, diag: ref<diags::Diagnostic>) {
+    make i: uint = 0
+    while i < module.*.funcs.len() {
+        check_unbound_body(module, module.*.funcs[i].body.pin, exports, path.copy(), import_offset, diag)
+        i++
+    }
+    i = 0
+    while i < module.*.structs.len() {
+        check_unbound_body(module, module.*.structs[i].body.pin, exports, path.copy(), import_offset, diag)
+        i++
+    }
+    i = 0
+    while i < module.*.type_aliases.len() {
+        check_unbound_body(module, module.*.type_aliases[i].body.pin, exports, path.copy(), import_offset, diag)
+        i++
+    }
+}

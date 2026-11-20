@@ -1,0 +1,153 @@
+@pure @const {
+    make api = @import "bindings.quip"
+    make floating = @import "floating.quip"
+    make mir = @import "../mir/mir.quip"
+}
+
+// LLVMTypeKind values from llvm-c/Core.h.
+@const {
+    make Void: i32 = 0
+    make Float: i32 = 2
+    make Double: i32 = 3
+    make Pointer: i32 = 12
+}
+
+@pub
+make raw_pointer (ty: str) -> bool {
+    return ty.len() > 5 && ty[0] == 'p' && ty[1] == 't' && ty[2] == 'r' && ty[3] == '<' && ty[ty.len() - 1] == '>'
+}
+
+@pub
+make reference (ty: str) -> bool {
+    return ty.len() > 5 && ty[0] == 'r' && ty[1] == 'e' && ty[2] == 'f' && ty[3] == '<' && ty[ty.len() - 1] == '>'
+}
+
+@pub
+make pointee (ty: str) -> str {
+    make result: str = ""
+    make i: uint = 4
+    while i + 1 < ty.len() {
+        result.push(ty[i])
+        i++
+    }
+    return result
+}
+
+@pub
+make signed_narrow (ty: str) -> bool {
+    return ty == "i8" || ty == "i16" || ty == "i32"
+}
+
+/// Size of a scalar in raw C memory. Quip stack slots remain eight bytes.
+@pub
+make size (ty: str) -> uint {
+    if ty == "bool" || ty == "char" || ty == "i8" || ty == "u8" { return 1 }
+    if ty == "i16" || ty == "u16" { return 2 }
+    if ty == "i32" || ty == "u32" || ty == "f32" { return 4 }
+    return 8
+}
+
+@pub @unsafe
+make type_of (context: ptr<any>, ty: str) -> ptr<any> {
+    if ty == "" || ty == "void" { return api::LLVMVoidTypeInContext(context) }
+    if raw_pointer(ty.copy()) || reference(ty.copy()) { return api::LLVMPointerTypeInContext(context, 0) }
+    if ty == "bool" { return api::LLVMInt1TypeInContext(context) }
+    if ty == "f32" { return api::LLVMFloatTypeInContext(context) }
+    if floating::is_float(ty.copy()) { return api::LLVMDoubleTypeInContext(context) }
+    make width = size(ty)
+    if width == 1 { return api::LLVMInt8TypeInContext(context) }
+    if width == 2 { return api::LLVMInt16TypeInContext(context) }
+    if width == 4 { return api::LLVMInt32TypeInContext(context) }
+    return api::LLVMInt64TypeInContext(context)
+}
+
+
+@pub
+make type Conversion {
+    make context: ptr<any>
+    make builder: ptr<any>
+    make word: ptr<any>
+    make i32_type: ptr<any>
+    make unnamed: str = ""
+
+    @pub @unsafe
+    make create (context: ptr<any>, builder: ptr<any>) -> Conversion {
+        return Conversion {
+            context = context, builder = builder, word = api::LLVMInt64TypeInContext(context),
+            i32_type = api::LLVMInt32TypeInContext(context),
+        }
+    }
+
+    @pub @this @unsafe
+    make narrow (value: ptr<any>, ty: ptr<any>) -> ptr<any> {
+        if ty == this.word { return value }
+
+        make kind = api::LLVMGetTypeKind(ty)
+        if kind == Pointer { return api::LLVMBuildIntToPtr(this.builder, value, ty, this.unnamed.data) }
+        if kind == Float {
+            make bits = api::LLVMBuildTrunc(this.builder, value, this.i32_type, this.unnamed.data)
+            return api::LLVMBuildBitCast(this.builder, bits, ty, this.unnamed.data)
+        }
+        if kind == Double { return api::LLVMBuildBitCast(this.builder, value, ty, this.unnamed.data) }
+        return api::LLVMBuildTrunc(this.builder, value, ty, this.unnamed.data)
+    }
+
+    @pub @this @unsafe
+    make widen (value: ptr<any>, ty: ptr<any>, signed: bool) -> ptr<any> {
+        if ty == this.word { return value }
+
+        make kind = api::LLVMGetTypeKind(ty)
+        if kind == Pointer { return api::LLVMBuildPtrToInt(this.builder, value, this.word, this.unnamed.data) }
+        if kind == Float {
+            make bits = api::LLVMBuildBitCast(this.builder, value, this.i32_type, this.unnamed.data)
+            return api::LLVMBuildZExt(this.builder, bits, this.word, this.unnamed.data)
+        }
+        if kind == Double { return api::LLVMBuildBitCast(this.builder, value, this.word, this.unnamed.data) }
+        if signed { return api::LLVMBuildSExt(this.builder, value, this.word, this.unnamed.data) }
+        return api::LLVMBuildZExt(this.builder, value, this.word, this.unnamed.data)
+    }
+
+    @pub @this @unsafe
+    make promote (value: ptr<any>, original: ptr<any>, ty: str) -> ptr<any> {
+        make arg = this.narrow(value, original)
+        if ty == "f32" {
+            return api::LLVMBuildFPExt(this.builder, arg, api::LLVMDoubleTypeInContext(this.context), this.unnamed.data)
+        }
+        if size(ty.copy()) >= 4 { return arg }
+        if signed_narrow(ty) { return api::LLVMBuildSExt(this.builder, arg, this.i32_type, this.unnamed.data) }
+        return api::LLVMBuildZExt(this.builder, arg, this.i32_type, this.unnamed.data)
+    }
+
+    /// Emits a native call and leaves the result in the Quip word representation.
+    @pub @this @unsafe
+    make call (callee: ptr<any>, term: ref<mir::MirTerm>, words: ref<ptr<any>[]>, destination: ptr<any>) {
+        make signature = api::LLVMGlobalGetValueType(callee)
+        make fixed = api::LLVMCountParamTypes(signature)
+        make args: ptr<any>[] = []
+        make i: uint = 0
+        while i < words.*.len() {
+            if i < fixed {
+                @unsafe make index: u32 = i
+                make ty = api::LLVMTypeOf(api::LLVMGetParam(callee, index))
+                args.push(this.narrow(words.*[i], ty))
+            } else {
+                make ty = term.*.arg_tys[i].copy()
+                args.push(this.promote(words.*[i], type_of(this.context, ty.copy()), ty))
+            }
+            i++
+        }
+
+        @unsafe make first: ptr<ptr<any>> = 0
+        if args.len() > 0 {
+            @unsafe make address: ptr<ptr<any>> = args[0].pin
+            first = address
+        }
+        @unsafe make count: u32 = args.len()
+        make result = api::LLVMBuildCall2(this.builder, signature, callee, first, count, this.unnamed.data)
+        make result_type = api::LLVMGetReturnType(signature)
+        if api::LLVMGetTypeKind(result_type) != Void {
+            make value = this.widen(result, result_type, signed_narrow(term.*.ret_ty.copy()))
+            api::LLVMSetAlignment(api::LLVMBuildStore(this.builder, value, destination), 8)
+        }
+    }
+}

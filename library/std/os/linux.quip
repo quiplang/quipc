@@ -1,0 +1,208 @@
+// Linux LP64 libc bindings. Quip buffers must be released by their allocator.
+@target "linux" {
+    @pub @unsafe @external make strtod (text: ptr<char>, end: ptr<ptr<char>>) -> f64
+    @pub make type timespec { @pub make tv_sec: i64 = 0 @pub make tv_nsec: i64 = 0 }
+
+    @pub @const {
+        make STDIN_FILENO: i32 = 0
+        make STDOUT_FILENO: i32 = 1
+        make STDERR_FILENO: i32 = 2
+        make O_RDONLY: i32 = 0
+        make O_WRONLY: i32 = 1
+        make O_RDWR: i32 = 2
+        make MAP_PRIVATE: i32 = 2
+        make MAP_ANON: i32 = 32
+        make CLOCK_REALTIME: u32 = 0
+        make CLOCK_MONOTONIC: u32 = 1
+        make ERANGE: i32 = 34
+        make EOVERFLOW: i32 = 75
+        make F_DUPFD: i32 = 0
+    }
+
+    @pub @unsafe @external make getpagesize () -> i32
+
+    @pub @unsafe @external make mmap (address: ptr<any>, length: u64, protection: i32, flags: i32, descriptor: i32, offset: i64) -> ptr<any>
+
+    @pub @unsafe @external make munmap (address: ptr<any>, length: u64) -> i32
+
+    @pub @unsafe @external make clock_gettime (clock: u32, output: ptr<timespec>) -> i32
+
+    @pub @unsafe @external make nanosleep (requested: ptr<timespec>, remaining: ptr<timespec>) -> i32
+
+    @pub @unsafe @external make __errno_location () -> ptr<i32>
+
+    @pub @unsafe @external make fork () -> i32
+
+    @pub @unsafe @external make execvp (path: ptr<char>, arguments: ptr<ptr<char>>) -> i32
+
+    @pub @unsafe @external make waitpid (pid: i32, status: ptr<i32>, options: i32) -> i32
+
+    @pub @unsafe @external make kill (pid: i32, signal: i32) -> i32
+
+    @pub @unsafe @external make dup2 (source: i32, destination: i32) -> i32
+    @pub @unsafe @external @variadic make fcntl (fd: i32, command: i32) -> i32
+
+    @pub @unsafe @external make close (fd: i32) -> i32
+
+    @pub @unsafe @external make pipe (output: ptr<i32>) -> i32
+
+    @pub @unsafe @external @noreturn make _exit (status: i32) -> void
+
+    @pub @unsafe @external @noreturn make exit (status: i32) -> void
+
+    @pub @unsafe @external @noreturn make abort () -> void
+
+    @pub @unsafe @external make strerror (code: i32) -> ptr<char>
+
+    @pub @unsafe @external make getcwd (buffer: ptr<char>, size: u64) -> ptr<char>
+
+    @pub @unsafe @external make getenv (name: ptr<char>) -> ptr<char>
+
+    @pub @unsafe @external make read (fd: i32, buffer: ptr<any>, size: u64) -> i64
+
+    @pub @unsafe @external @variadic make printf (format: ptr<char>) -> i32
+
+    @pub @unsafe @external @variadic make dprintf (fd: i32, format: ptr<char>) -> i32
+    @pub @unsafe @external @variadic make open (path: ptr<char>, flags: i32) -> i32
+    @pub @unsafe @external make fstat (fd: i32, buffer: ptr<any>) -> i32
+    @pub @unsafe @external make uname (buffer: ptr<any>) -> i32
+    @pub @unsafe @external make write (fd: i32, buffer: ptr<any>, size: u64) -> i64
+    @pub @unsafe @external make access (path: ptr<char>, mode: i32) -> i32
+    @pub @unsafe @external make mkstemp (template: ptr<char>) -> i32
+    @pub @unsafe @external make fsync (fd: i32) -> i32
+    @pub @unsafe @external make rename (source: ptr<char>, destination: ptr<char>) -> i32
+    @pub @unsafe @external make unlink (path: ptr<char>) -> i32
+    @pub @unsafe @external make readlink (path: ptr<char>, buffer: ptr<char>, size: u64) -> i64
+    @pub @unsafe @external make realpath (path: ptr<char>, resolved: ptr<char>) -> ptr<char>
+    @pub @unsafe @external make setenv (name: ptr<char>, value: ptr<char>, overwrite: i32) -> i32
+
+    @pub @pure @const make nfds_t: Type = u64
+    @pub @const {
+        make SIG_BLOCK: i32 = 0
+        make SIG_SETMASK: i32 = 2
+        make SIGTSTP: i32 = 20
+        make TIOCGWINSZ: u64 = 21523
+        make FD_CLOEXEC: i32 = 1
+    }
+    @pub @unsafe @external make sigemptyset (mask: ptr<any>) -> i32
+    @pub @unsafe @external make sigaddset (mask: ptr<any>, signal: i32) -> i32
+    @pub @unsafe @external make sigprocmask (operation: i32, mask: ptr<any>, previous: ptr<any>) -> i32
+    @pub @unsafe @external make sigaction (signal: i32, action: ptr<any>, previous: ptr<any>) -> i32
+    @pub @unsafe @external make signal (signal: i32, handler: ptr<any>) -> ptr<any>
+    @pub @unsafe @external make raise (signal: i32) -> i32
+    @pub @unsafe @external make atexit (callback: ptr<any>) -> i32
+    @pub @unsafe @external @variadic make ioctl (fd: i32, request: u64) -> i32
+    @pub @unsafe @external make poll (fds: ptr<any>, count: nfds_t, timeout: i32) -> i32
+    @pub @unsafe @external make isatty (fd: i32) -> i32
+    @pub @unsafe @external make strlen (text: ptr<char>) -> u64
+    @pub @unsafe @external make strcmp (left: ptr<char>, right: ptr<char>) -> i32
+    @pub @const make F_SETFD: i32 = 2
+
+    // POSIX/libc operations used by the portable OS interface.
+    @pub @unsafe @external @variadic make openat (directory: i32, path: ptr<char>, flags: i32) -> i32
+    @pub @unsafe @external make creat (path: ptr<char>, mode: u32) -> i32
+    @pub @unsafe @external make pread (fd: i32, buffer: ptr<any>, count: u64, offset: i64) -> i64
+    @pub @unsafe @external make pwrite (fd: i32, buffer: ptr<any>, count: u64, offset: i64) -> i64
+    @pub @unsafe @external make lseek (fd: i32, offset: i64, whence: i32) -> i64
+    @pub @unsafe @external make dup (fd: i32) -> i32
+    @pub @unsafe @external make flock (fd: i32, operation: i32) -> i32
+    @pub @unsafe @external make ttyname (fd: i32) -> ptr<char>
+    @pub @unsafe @external make faccessat (directory: i32, path: ptr<char>, mode: i32, flags: i32) -> i32
+    @pub @unsafe @external make mkdir (path: ptr<char>, mode: u32) -> i32
+    @pub @unsafe @external make mkdirat (directory: i32, path: ptr<char>, mode: u32) -> i32
+    @pub @unsafe @external make rmdir (path: ptr<char>) -> i32
+    @pub @unsafe @external make unlinkat (directory: i32, path: ptr<char>, flags: i32) -> i32
+    @pub @unsafe @external make renameat (old_directory: i32, oldpath: ptr<char>, new_directory: i32, newpath: ptr<char>) -> i32
+    @pub @unsafe @external make link (oldpath: ptr<char>, newpath: ptr<char>) -> i32
+    @pub @unsafe @external make symlink (target: ptr<char>, path: ptr<char>) -> i32
+    @pub @unsafe @external make truncate (path: ptr<char>, length: i64) -> i32
+    @pub @unsafe @external make ftruncate (fd: i32, length: i64) -> i32
+    @pub @unsafe @external make chmod (path: ptr<char>, mode: u32) -> i32
+    @pub @unsafe @external make fchmod (fd: i32, mode: u32) -> i32
+    @pub @unsafe @external make umask (mask: u32) -> u32
+    @pub @unsafe @external make chown (path: ptr<char>, owner: u32, group: u32) -> i32
+    @pub @unsafe @external make fchown (fd: i32, owner: u32, group: u32) -> i32
+    @pub @unsafe @external make chdir (path: ptr<char>) -> i32
+    @pub @unsafe @external make fchdir (fd: i32) -> i32
+    @pub @unsafe @external make mkdtemp (template: ptr<char>) -> ptr<char>
+    @pub @unsafe @external make opendir (path: ptr<char>) -> ptr<any>
+    @pub @unsafe @external make fdopendir (fd: i32) -> ptr<any>
+    @pub @unsafe @external make readdir (directory: ptr<any>) -> ptr<any>
+    @pub @unsafe @external make closedir (directory: ptr<any>) -> i32
+    @pub @unsafe @external make rewinddir (directory: ptr<any>) -> void
+    @pub @unsafe @external make dirfd (directory: ptr<any>) -> i32
+    @pub @unsafe @external make telldir (directory: ptr<any>) -> i64
+    @pub @unsafe @external make seekdir (directory: ptr<any>, location: i64) -> void
+    @pub @unsafe @external make unsetenv (name: ptr<char>) -> i32
+    @pub @unsafe @external make putenv (assignment: ptr<char>) -> i32
+    @pub @unsafe @external make malloc (size: u64) -> ptr<any>
+    @pub @unsafe @external make calloc (count: u64, size: u64) -> ptr<any>
+    @pub @unsafe @external make realloc (memory: ptr<any>, size: u64) -> ptr<any>
+    @pub @unsafe @external make free (memory: ptr<any>) -> void
+    @pub @unsafe @external make posix_memalign (memory: ptr<ptr<any>>, alignment: u64, size: u64) -> i32
+    @pub @unsafe @external make aligned_alloc (alignment: u64, size: u64) -> ptr<any>
+    @pub @unsafe @external make mprotect (address: ptr<any>, length: u64, protection: i32) -> i32
+    @pub @unsafe @external make msync (address: ptr<any>, length: u64, flags: i32) -> i32
+    @pub @unsafe @external make madvise (address: ptr<any>, length: u64, advice: i32) -> i32
+    @pub @unsafe @external make mlock (address: ptr<any>, length: u64) -> i32
+    @pub @unsafe @external make munlock (address: ptr<any>, length: u64) -> i32
+    @pub @unsafe @external make memcpy (destination: ptr<any>, source: ptr<any>, count: u64) -> ptr<any>
+    @pub @unsafe @external make memmove (destination: ptr<any>, source: ptr<any>, count: u64) -> ptr<any>
+    @pub @unsafe @external make memset (destination: ptr<any>, value: i32, count: u64) -> ptr<any>
+    @pub @unsafe @external make memcmp (left: ptr<any>, right: ptr<any>, count: u64) -> i32
+    @pub @unsafe @external make memchr (memory: ptr<any>, value: i32, count: u64) -> ptr<any>
+    @pub @unsafe @external make strnlen (text: ptr<char>, maximum: u64) -> u64
+    @pub @unsafe @external make strncmp (left: ptr<char>, right: ptr<char>, count: u64) -> i32
+    @pub @unsafe @external make strcpy (destination: ptr<char>, source: ptr<char>) -> ptr<char>
+    @pub @unsafe @external make strncpy (destination: ptr<char>, source: ptr<char>, count: u64) -> ptr<char>
+    @pub @unsafe @external make strchr (text: ptr<char>, value: i32) -> ptr<char>
+    @pub @unsafe @external make strrchr (text: ptr<char>, value: i32) -> ptr<char>
+    @pub @unsafe @external make strstr (text: ptr<char>, needle: ptr<char>) -> ptr<char>
+    @pub @unsafe @external make strdup (text: ptr<char>) -> ptr<char>
+    @pub @unsafe @external make strndup (text: ptr<char>, count: u64) -> ptr<char>
+    @pub @unsafe @external make strtol (text: ptr<char>, end: ptr<ptr<char>>, base: i32) -> i64
+    @pub @unsafe @external make strtoul (text: ptr<char>, end: ptr<ptr<char>>, base: i32) -> u64
+    @pub @unsafe @external make strtoll (text: ptr<char>, end: ptr<ptr<char>>, base: i32) -> i64
+    @pub @unsafe @external make strtoull (text: ptr<char>, end: ptr<ptr<char>>, base: i32) -> u64
+    @pub @unsafe @external make strtof (text: ptr<char>, end: ptr<ptr<char>>) -> f32
+    @pub @unsafe @external make getpid () -> i32
+    @pub @unsafe @external make getppid () -> i32
+    @pub @unsafe @external make getuid () -> u32
+    @pub @unsafe @external make geteuid () -> u32
+    @pub @unsafe @external make getgid () -> u32
+    @pub @unsafe @external make getegid () -> u32
+    @pub @unsafe @external make setuid (uid: u32) -> i32
+    @pub @unsafe @external make setgid (gid: u32) -> i32
+    @pub @unsafe @external make execve (path: ptr<char>, argv: ptr<ptr<char>>, envp: ptr<ptr<char>>) -> i32
+    @pub @unsafe @external make execv (path: ptr<char>, argv: ptr<ptr<char>>) -> i32
+    @pub @unsafe @external make wait (status: ptr<i32>) -> i32
+    @pub @unsafe @external make sleep (seconds: u32) -> u32
+    @pub @unsafe @external make usleep (microseconds: u32) -> i32
+    @pub @unsafe @external make system (command: ptr<char>) -> i32
+    @pub @unsafe @external make time (result: ptr<i64>) -> i64
+    @pub @unsafe @external make clock () -> u64
+    @pub @unsafe @external make clock_getres (clock_id: u32, result: ptr<timespec>) -> i32
+    @pub @unsafe @external make perror (prefix: ptr<char>) -> void
+    @pub @unsafe @external make fopen (path: ptr<char>, mode: ptr<char>) -> ptr<any>
+    @pub @unsafe @external make fdopen (fd: i32, mode: ptr<char>) -> ptr<any>
+    @pub @unsafe @external make freopen (path: ptr<char>, mode: ptr<char>, stream: ptr<any>) -> ptr<any>
+    @pub @unsafe @external make fclose (stream: ptr<any>) -> i32
+    @pub @unsafe @external make fflush (stream: ptr<any>) -> i32
+    @pub @unsafe @external make fread (buffer: ptr<any>, size: u64, count: u64, stream: ptr<any>) -> u64
+    @pub @unsafe @external make fwrite (buffer: ptr<any>, size: u64, count: u64, stream: ptr<any>) -> u64
+    @pub @unsafe @external make fseek (stream: ptr<any>, offset: i64, whence: i32) -> i32
+    @pub @unsafe @external make ftell (stream: ptr<any>) -> i64
+    @pub @unsafe @external make rewind (stream: ptr<any>) -> void
+    @pub @unsafe @external make feof (stream: ptr<any>) -> i32
+    @pub @unsafe @external make ferror (stream: ptr<any>) -> i32
+    @pub @unsafe @external make clearerr (stream: ptr<any>) -> void
+    @pub @unsafe @external make fileno (stream: ptr<any>) -> i32
+    @pub @unsafe @external make fgetc (stream: ptr<any>) -> i32
+    @pub @unsafe @external make fputc (value: i32, stream: ptr<any>) -> i32
+    @pub @unsafe @external make fgets (buffer: ptr<char>, size: i32, stream: ptr<any>) -> ptr<char>
+    @pub @unsafe @external make fputs (text: ptr<char>, stream: ptr<any>) -> i32
+    @pub @unsafe @external make puts (text: ptr<char>) -> i32
+    @pub @unsafe @external make remove (path: ptr<char>) -> i32
+    @pub @unsafe @external @variadic make fprintf (stream: ptr<any>, format: ptr<char>) -> i32
+    @pub @unsafe @external @variadic make snprintf (buffer: ptr<char>, size: u64, format: ptr<char>) -> i32
+}

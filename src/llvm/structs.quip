@@ -1,0 +1,47 @@
+// Layouts for plain structs whose fields have no managed ownership.
+@pub
+make type Field {
+    @pub make name: str = ""
+    @pub make ty: str = ""
+    @pub make offset: uint = 0
+    @pub make has_default: bool = false
+}
+
+@pub
+make type Layout {
+    @pub make name: str = ""
+    @pub make fields: Field[] = []
+    @pub make size: uint = 8
+    @pub make managed: bool = false
+    @pub make descriptor: str = ""
+    @pub make fallible_payload: str = ""
+    @pub make array_element: str = ""
+    @pub make variant_members: str[] = []
+
+    @pub @this
+    make field_index (name: str) -> uint {
+        make i: uint = 0
+        while i < this.fields.len() {
+            if this.fields[i].name == name { return i }
+            i++
+        }
+        return i
+    }
+}
+
+@pub
+make find (layouts: ref<Layout[]>, name: str) -> uint {
+    make i: uint = 0
+    while i < layouts.*.len() {
+        if layouts.*[i].name == name { return i }
+        i++
+    }
+    return i
+}
+
+@pub
+make size (layouts: ref<Layout[]>, name: str) -> uint {
+    make i = find(layouts, name)
+    if i == layouts.*.len() { return 0 }
+    return layouts.*[i].size
+}

@@ -1,0 +1,47 @@
+@pure @const {
+    make memory = @import "../memory/report.quip"
+}
+
+@pub
+make type SlotPlan {
+    @pub make locals: uint[] = []
+    @pub make next_slot: uint = 0
+}
+
+/// Gives locals their planned slot, or reserves a distinct slot when the
+/// memory report has no entry. Managed storage can be reserved after this.
+@pub
+make plan (count: uint, report: ref<memory::MemReport>, index: uint) -> SlotPlan {
+    make result = SlotPlan {}
+    make assigned: bool[] = []
+
+    make i: uint = 0
+    while i < count {
+        result.locals.push(0)
+        assigned.push(false)
+        i++
+    }
+
+    make max_slot: uint = 0
+    if index < report.*.funcs.len() {
+        for slot : report.*.funcs[index].slots {
+            if slot.local < count {
+                result.locals[slot.local] = slot.slot
+                assigned[slot.local] = true
+                if slot.slot > max_slot { max_slot = slot.slot }
+            }
+        }
+    }
+
+    result.next_slot = max_slot + 1
+    i = 0
+    while i < count {
+        if !assigned[i] {
+            result.locals[i] = result.next_slot
+            result.next_slot++
+        }
+        i++
+    }
+
+    return result
+}

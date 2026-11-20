@@ -1,0 +1,46 @@
+@pure @const {
+    make hir = @import "../hir/hir.quip"
+    make util = @import "../util/pkg.quip"
+    make diags = @import "diagnosis.quip"
+}
+
+@pub
+make attach_field_context (structs: ref<hir::HirStructSig[]>, d: ref<diags::Diag>, owner: str, name: str) {
+    make sid: uint = 0
+
+    while sid < structs.*.len() && structs.*[sid].name != owner { sid = sid + 1 }
+
+    if sid >= structs.*.len() { return }
+
+    make structure = structs.*[sid].pin
+
+    match structure.*.source {
+        none {}
+        some {
+            make i: uint = 0
+
+            while i < structure.*.fields.len() {
+                make field = structure.*.fields[i].pin
+
+                if field.*.name == name {
+                    d.*.attach(diags::Label.in_file(structure.*.path.copy(), some.*.copy(), util::Range.of(field.*.name_span.start, field.*.name_span.end), "field `" + name + "` declared here"))
+                    break
+                }
+
+                i = i + 1
+            }
+
+            d.*.attach(diags::Label.in_file(structure.*.path.copy(), some.*.copy(), util::Range.of(structure.*.name_span.start, structure.*.name_span.end), "type `" + structure.*.display_name + "` defined here"))
+        }
+    }
+}
+
+@pub
+make attach_origin (d: ref<diags::Diag>, path: str, source: ref<str>?, span: util::Span, message: str) {
+    if span.end <= span.start { return }
+
+    match source {
+        none {}
+        some { d.*.attach(diags::Label.in_file(path, some.*.copy(), util::Range.of(span.start, span.end), message)) }
+    }
+}

@@ -1,10 +1,6 @@
 // the process library
 @pure @const {
-make os: unit = @import "../os/pkg.quip"
-
-make io: unit = @import "../io/pkg.quip"
-
-make to_str: unit = @import "../fmt/pkg.quip"
+    make os: unit = @import "../os/pkg.quip"
 }
 
 @pub
@@ -18,37 +14,39 @@ make enum ProcessState {
 @pub
 make type Command {
 
-    make name: str
-    make args: str[]
+    @pub {
+        make name: str = ""
+        make args: str[] = []
 
-    make env: str[] = []
-    make work_dir: str = none
+        make env: str[] = []
+        make work_dir: str? = none
 
-    make fd_in: int = none
-    make fd_out: int = none
-    make fd_err: int = none
+        // Negative descriptors inherit the parent stream, including with older runtimes.
+        make fd_in: int = -1
+        make fd_out: int = -1
+        make fd_err: int = -1
+    }
 
     @pub
     make create (name: str, args: str[]) -> Command {
         make command: Command = Command {}
         command.name = name
         command.args = args
-
         return command
     }
 
     @pub @this
     make get () -> str {
-
         make result: str = ""
 
-        result.push(this.name)
-        result = result + " "
+        result.push(this.name.copy())
+        result.push(" ")
 
-
-        for arg : this.args {
-            result.push(arg)
-            result = result + " "
+        make i: int = 0
+        while i < this.args.len() {
+            result.push(this.args[i])
+            result.push(" ")
+            i = i + 1
         }
 
         return result
@@ -63,67 +61,191 @@ make type Command {
 @pub
 make type Process {
 
-    make command: Command
+    @pub {
+        make command: Command = .{}
 
-    make pid: int = none
+        make pid: int = 0
 
-    make state: ProcessState = ProcessState.None
+        make state: ProcessState = ProcessState.None
 
-    make exit_code: int = 0
-    make signal_code: int = 0
+        make exit_code: int = 0
+        make signal_code: int = 0
+    }
+
 
     @pub
     make spawn (command: Command) -> !Process {
-        make pid: int = os::syscall::quip_spawn_process_qp(
-            command.name.pin, command.args.pin,
-            command.fd_in, command.fd_out, command.fd_err)
-
-        if pid < 0 {
-            return error.ProcessSpawnFailed
+        if command.name.len() == 0 { return error.ProcessSpawnFailed }
+        // Prepare native argv before fork. The child only performs OS calls.
+        @unsafe {
+            make count = command.args.len() + 1
+            make argv: ptr<ptr<char>> = os::calloc(count + 1, 8) catch { return error.ProcessSpawnFailed }
+            make allocated: uint = 0
+            make failed = false
+            while allocated < count {
+                make item = command.name.copy()
+                if allocated > 0 { item = command.args[allocated - 1].copy() }
+                make invalid = false
+                make position: uint = 0
+                while position < item.len() {
+                    if item[position] == '\0' { invalid = true }
+                    position++
+                }
+                if invalid { failed = true break }
+                make data: ptr<char> = os::malloc(item.len() + 1) catch { failed = true break }
+                os::memcpy(data, item.data, item.len())
+                data[item.len()] = '\0'
+                argv[allocated] = data
+                allocated++
+            }
+            make pid: i32 = -1
+            if !failed {
+                pid = os::fork() catch {
+                    make i: uint = 0
+                    while i < allocated { os::free(argv[i]) i++ }
+                    os::free(argv)
+                    return error.ProcessSpawnFailed
+                }
+            }
+            if !failed && pid == 0 {
+                // Duplicate all sources before redirection to preserve descriptor swaps.
+                make input: i32 = -1
+                make output: i32 = -1
+                make errors: i32 = -1
+                if command.fd_in >= 0 { @unsafe make fd: i32 = command.fd_in input = os::duplicate_min(fd, 3) catch { os::_exit(127) } }
+                if command.fd_out >= 0 { @unsafe make fd: i32 = command.fd_out output = os::duplicate_min(fd, 3) catch { os::_exit(127) } }
+                if command.fd_err >= 0 { @unsafe make fd: i32 = command.fd_err errors = os::duplicate_min(fd, 3) catch { os::_exit(127) } }
+                if input >= 0 { os::dup2(input, 0) catch { os::_exit(127) } os::close(input) catch {} }
+                if output >= 0 { os::dup2(output, 1) catch { os::_exit(127) } os::close(output) catch {} }
+                if errors >= 0 { os::dup2(errors, 2) catch { os::_exit(127) } os::close(errors) catch {} }
+                if command.fd_in > 2 { @unsafe make fd: i32 = command.fd_in os::close(fd) catch {} }
+                if command.fd_out > 2 && command.fd_out != command.fd_in { @unsafe make fd: i32 = command.fd_out os::close(fd) catch {} }
+                if command.fd_err > 2 && command.fd_err != command.fd_in && command.fd_err != command.fd_out { @unsafe make fd: i32 = command.fd_err os::close(fd) catch {} }
+                os::execvp(argv[0], argv) catch {
+                    make message = os::strerror(os::errno())
+                    os::write(os::STDERR, "quip: exec '".data, 12) catch {}
+                    os::write(os::STDERR, argv[0], os::strlen(argv[0])) catch {}
+                    os::write(os::STDERR, "' failed: ".data, 10) catch {}
+                    os::write(os::STDERR, message, os::strlen(message)) catch {}
+                    os::write(os::STDERR, "\n".data, 1) catch {}
+                }
+                os::_exit(127)
+            }
+            make i: uint = 0
+            while i < allocated { os::free(argv[i]) i++ }
+            os::free(argv)
+            if failed { return error.ProcessSpawnFailed }
+            make proc = Process { pid = pid, state = ProcessState.Running, command = command }
+            return proc
         }
 
-        make proc: Process = Process {}
-        proc.pid = pid
-        proc.state = ProcessState.Running
-        proc.command = command
-
-        return proc
     }
 
     @pub @this
     make wait () {
-        make result: int = os::syscall::quip_wait_process(this.pid)
-
-        if result >= 0 {
+        @unsafe make pid: i32 = this.pid
+        make status: i32 = 0
+        while true {
+            @unsafe os::waitpid(pid, status.pin, os::WaitMode.Blocking) catch {
+                if os::error_is(os::ErrorCode.Interrupted) { continue }
+                return
+            }
+            break
+        }
+        make signal = status & 127
+        if signal == 0 {
             this.state = ProcessState.Exited
-            this.exit_code = result
-        } else {
+            this.exit_code = (status >> 8) & 255
+        } elif signal != 127 {
             this.state = ProcessState.Signaled
-            this.signal_code = 0 - result
+            this.signal_code = signal
         }
     }
 
     @pub @this
     make kill () {
-        os::syscall::quip_kill_process(this.pid, 9)
+
+
+        @unsafe {
+            @unsafe make pid: i32 = this.pid
+            os::kill(pid, os::Signal.Kill) catch { return }
+        }
         this.state = ProcessState.Signaled
         this.signal_code = 9
     }
 
     @pub
     make run (command: Command) -> int {
-        return os::syscall::quip_run_process_qp(
-            command.name.pin, command.args.pin,
-            command.fd_in, command.fd_out, command.fd_err)
+
+        make child = Process.spawn(command) catch { return -1 }
+        child.wait()
+        if child.state == ProcessState.Exited { return child.exit_code }
+        if child.state == ProcessState.Signaled { return -child.signal_code }
+        return -1
     }
 }
 
 @pub
+@noreturn
 make exit (code: int) -> int {
-    return os::syscall::exit(code)
+    @unsafe {
+        @unsafe make status: i32 = code
+        os::exit(status)
+    }
 }
 
 @pub
+@noreturn
 make abort () -> void {
-    os::syscall::quip_abort()
+    @unsafe { os::abort() }
+}
+
+@pub
+make type Environment {
+    @pub
+    make get (name: str, fallback: str) -> str {
+        if name.len() == 0 { return fallback }
+        for ch : name ! { if ch == '\0' { return fallback } }
+        make key = name.copy()
+        key.push('\0')
+        @unsafe {
+            make value = os::getenv(key.data)
+            make null: ptr<char> = 0
+            if value == null { return fallback }
+            make result: str = ""
+            make i: uint = 0
+            while value[i] != '\0' { result.push(value[i]) i++ }
+            return result
+        }
+    }
+
+    @pub
+    make contains (name: str) -> bool {
+        for ch : name ! { if ch == '\0' { return false } }
+        make key = name.copy()
+        key.push('\0')
+        @unsafe make null: ptr<char> = 0
+        @unsafe return os::getenv(key.data) != null
+    }
+
+    @pub
+    make set (name: str, value: str, overwrite: bool) -> !void {
+        if name.len() == 0 { return error.InvalidEnvironment }
+        for ch : name ! { if ch == '\0' { return error.InvalidEnvironment } }
+        for ch : value ! { if ch == '\0' { return error.InvalidEnvironment } }
+        make key = name.copy()
+        make data = value.copy()
+        key.push('\0')
+        data.push('\0')
+        @unsafe os::setenv(key.data, data.data, overwrite) catch err { return err }
+    }
+
+    @pub
+    make unset (name: str) -> !void {
+        if name.len() == 0 { return error.InvalidEnvironment }
+        for ch : name ! { if ch == '\0' { return error.InvalidEnvironment } }
+        make key = name.copy()
+        key.push('\0')
+        @unsafe os::unsetenv(key.data) catch err { return err }
+    }
 }

@@ -1,0 +1,213 @@
+// MIR - Mid-level Intermediate Representation
+//
+// a control-flow graph per function, built from HIR
+// - local `_0` is the return place, `_1.._n` are the parameters, temporaries follow the user locals
+// - every statement belongs to exactly one basic block, `MirBody.terms[b]` is the terminator of block `b`
+// - calls are terminators, so fallible calls (`catch`) and `await` can later branch off them
+//
+// liveness (Birth/Kill Lines), memory obligations, stack slot recycling and LLVM codegen run on MIR
+
+@pure @const {
+make lexer = @import "../core/token.quip"
+make util = @import "../util/pkg.quip"
+}
+
+/// describes a local, parameter, or temporary in a mir body.
+@pub
+make type MirLocal {
+    @pub make name: str = ""             // empty for temporaries
+    @pub make ty: str = ""               // written type signature, empty until type inference exists
+    @pub make is_param: bool = false
+    @pub make is_temp: bool = false
+    @pub make is_copy: bool = false      // value semantics: reads never consume it
+    @pub make range: util::Range = .{}   // declaration site
+}
+
+@pub
+make enum MirProjKind {
+    Field,
+    Index,
+    Deref,
+}
+
+/// describes one field, index, or dereference projection of a place.
+@pub
+make type MirProj {
+    @pub make kind: MirProjKind = MirProjKind.Field
+    @pub make name: str = ""             // Field
+    @pub make index: uint = 0            // Index: local holding the index
+}
+
+/// identifies a local and the projections used to reach a value within it.
+@pub
+make type MirPlace {
+    @pub make local: uint = 0
+    @pub make projs: MirProj[] = []
+}
+
+@pub
+make enum MirOperandKind {
+    Const,
+    Copy,
+    Move,
+    Path,                           // item or imported name, resolved after name resolution exists
+}
+
+/// describes a constant, copied or moved place, or item path.
+@pub
+make type MirOperand {
+    @pub make range: util::Range = .{}
+    @pub make function_ret: str = ""
+    @pub make function_args: str[] = []
+    @pub make kind: MirOperandKind = MirOperandKind.Const
+    @pub make place: MirPlace = .{}      // Copy, Move
+    @pub make lit: lexer::Token = .{}    // Const
+    @pub make name: str = ""             // Path
+    @pub make ty: str = ""               // resolved type for constants and backend ABI details
+    @pub make is_sizeof: bool = false
+}
+
+@pub
+make enum MirRvalueKind {
+    Use,
+    OptionalPayload,
+    Binary,
+    Unary,
+    Pin,
+    Aggregate,
+    Unsupported,
+}
+
+/// describes a value computed by a mir statement.
+@pub
+make type MirRvalue {
+    @pub make kind: MirRvalueKind = MirRvalueKind.Use
+    @pub make op: str = ""               // Binary, Unary
+    @pub make a: MirOperand = .{}        // Use, Binary, Unary
+    @pub make b: MirOperand = .{}        // Binary
+    @pub make place: MirPlace = .{}      // Pin
+    @pub make ops: MirOperand[] = []     // Aggregate
+    @pub make field_names: str[] = []    // Aggregate: name of each `ops` entry ("" when positional)
+    @pub make name: str = ""             // Unsupported
+}
+
+@pub
+make enum MirStmtKind {
+    Assign,
+    StorageLive,
+    StorageDead,
+    Unsupported,
+}
+
+/// describes an action within a basic block.
+@pub
+make type MirStmt {
+    @pub make block: uint = 0
+    @pub make kind: MirStmtKind = MirStmtKind.Assign
+    @pub make place: MirPlace = .{}      // Assign
+    @pub make rvalue: MirRvalue = .{}    // Assign
+    @pub make local: uint = 0            // StorageLive, StorageDead
+    @pub make name: str = ""             // Unsupported
+    @pub make range: util::Range = .{}   // source range of the construct
+}
+
+@pub
+make enum MirTermKind {
+    None,                           // block under construction
+    Goto,
+    Branch,
+    Call,
+    Return,
+    Unreachable,
+}
+
+/// describes how a basic block ends and transfers control.
+@pub
+make type MirTerm {
+    @pub make kind: MirTermKind = MirTermKind.None
+    @pub make target: uint = 0           // Goto, Call: continuation, Branch: true
+    @pub make other: uint = 0            // Branch: false
+    @pub make cond: MirOperand = .{}     // Branch
+    @pub make func: MirOperand = .{}     // Call
+    @pub make args: MirOperand[] = []    // Call
+    @pub make arg_tys: str[] = []       // Call: rendered argument types, including an attached receiver
+    @pub make arg_aggs: bool[] = []     // Call: aggregate ABI classification, parallel to `args`
+    @pub make c_abi: bool = false
+    @pub make variadic_fixed: int = -1
+    @pub make has_receiver: bool = false // Call: first argument is an attached-function receiver
+    @pub make ret_ty: str = ""          // Call: rendered result type
+    @pub make ret_agg: bool = false     // Call: aggregate return uses the hidden sret pointer
+    @pub make dest: MirPlace = .{}       // Call
+    @pub make name: str = ""             // Call: reconstructed callee path (`std.heap.alloc`)
+    @pub make range: util::Range = .{}   // source range of the construct
+}
+
+/// owns a function's locals, statements, and block terminators.
+@pub
+make type MirBody {
+    @pub make locals: MirLocal[] = []
+    @pub make stmts: MirStmt[] = []
+    @pub make terms: MirTerm[] = []
+    @pub make param_count: uint = 0
+    @pub make capture_locals: uint[] = []
+}
+
+/// describes a function and its mir body.
+@pub
+make type MirFunc {
+    @pub make name: str = ""
+    @pub make ret_ty: str = ""
+    // `@external`: declared but not defined here (FFI)
+    @pub make is_external: bool = false
+    @pub make is_variadic: bool = false
+    @pub make export_name: str = ""
+    @pub make intrinsic_name: str = ""
+    // an attached function: its `name` is already `owner__name` and its symbol is not a plain
+    // identifier, so the emitter must not module-mangle it
+    @pub make is_attached: bool = false
+    @pub make is_lambda: bool = false
+    @pub make body: MirBody = .{}
+    @pub make range: util::Range = .{}
+}
+
+// a declared field of a struct: its name and rendered type signature
+@pub
+make type MirField {
+    @pub make default_init: str = ""
+    @pub make default_lit: lexer::Token = .{}
+    @pub make has_default: bool = false
+    @pub make name: str = ""
+    @pub make ty: str = ""
+}
+
+// a `Type` declaration as seen by codegen: field order defines the runtime layout
+@pub
+make type MirStruct {
+    @pub make name: str = ""
+    @pub make fields: MirField[] = []
+}
+
+@pub
+make type MirGlobal {
+    @pub make name: str = ""
+    @pub make initializer: uint = 0
+    @pub make is_default_allocator: bool = false
+    @pub make is_external: bool = false
+}
+
+@pub
+make type MirAttachedSymbol {
+    @pub make owner: str
+    @pub make name: str
+    @pub make symbol: str
+}
+
+/// collects the functions, types, and globals needed by later passes.
+@pub
+make type MirModule {
+    @pub make reused_functions: uint = 0
+    @pub make attached_symbols: MirAttachedSymbol[] = []
+    @pub make globals: MirGlobal[] = []
+    @pub make funcs: MirFunc[] = []
+    @pub make structs: MirStruct[] = []
+}

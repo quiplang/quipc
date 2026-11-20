@@ -1,0 +1,99 @@
+@pure @const {
+    make facts = @import "../analysis/facts.quip"
+    make hir = @import "../hir/hir.quip"
+    make ty = @import "../ty/ty.quip"
+    make util = @import "../util/pkg.quip"
+    make diags = @import "../diag/diagnosis.quip"
+    make e = @import "../diag/err.quip"
+}
+
+// Resolved ownership inputs retained alongside cached function results.
+make has_borrow (tys: ref<ty::TyInterner>, shapes: ref<facts::ClosureShape[]>, id: uint, depth: uint) -> bool {
+    if depth > 32 { return true }
+
+    make kind = tys.*.kind_of(id)
+
+    if kind == ty::TyKind.Ptr || kind == ty::TyKind.Ref { return true }
+
+    for shape : shapes.* {
+        if shape.ty == id {
+            for child : shape.children {
+                if has_borrow(tys, shapes, child, depth + 1) { return true }
+            }
+
+            return false
+        }
+    }
+
+    return false
+}
+
+/// Validates closure ownership after inference, including reused function facts.
+@pub
+make check (function: ref<hir::HirFunc>, tys: ref<ty::TyInterner>, checks: ref<facts::ClosureCheck[]>, shapes: ref<facts::ClosureShape[]>, uses: ref<uint[]>, expr_tys: ref<uint[]>, diag: ref<diags::Diagnostic>) {
+    for fact : checks.* {
+        if has_borrow(tys, shapes, fact.ty, 0) {
+            make message = "a moved closure capture cannot contain a borrowed or raw pointer"
+            make help = "capture the owning value, then borrow it inside the lambda"
+
+            if fact.kind == 1 {
+                message = "capturing lambdas cannot return borrowed or raw pointers"
+                help = "return an owning value or an explicit copy instead"
+            }
+
+            make d = diags::Diag.err(e::Err.TypeMismatch, fact.range.copy(), message)
+            d.help(help)
+            diag.*.report(d)
+        }
+    }
+
+    make body = function.*.body.pin
+
+    for index : uses.* {
+        if index < expr_tys.*.len() && !tys.*.is_copy(expr_tys.*[index]) {
+            make expression = body.*.exprs[index].pin
+            make root = index
+
+            while body.*.exprs[root].kind == hir::HirExprKind.Field || body.*.exprs[root].kind == hir::HirExprKind.Index || body.*.exprs[root].kind == hir::HirExprKind.Deref {
+                root = body.*.exprs[root].lhs
+            }
+
+            if body.*.exprs[root].kind == hir::HirExprKind.Local && expression.*.kind != hir::HirExprKind.Copy {
+                for capture : function.*.capture_locals {
+                    if body.*.exprs[root].local == capture {
+                        make d = diags::Diag.err(e::Err.TypeMismatch, expression.*.range.copy(), "cannot move a value out of persistent capture storage")
+                        d.help("borrow the capture or explicitly copy it with `!`")
+                        diag.*.report(d)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Layout shared by closure construction, access, and the runtime drop descriptor.
+@pub
+make type CaptureField {
+    @pub make local: uint = 0
+    @pub make size: uint = 0
+    @pub make flag_offset: uint = 0
+    @pub make value_offset: uint = 0
+}
+
+@pub
+make type CaptureLayout {
+    @pub make fields: CaptureField[] = []
+    @pub make size: uint = 0
+
+    @pub @this
+    make add (local: uint, size: uint) {
+        make value_offset = this.size + 8
+        this.fields.push(CaptureField {
+            local = local,
+            size = size,
+            flag_offset = this.size,
+            value_offset = value_offset,
+        })
+        this.size = value_offset + ((size + 7) / 8) * 8
+    }
+}

@@ -1,0 +1,49 @@
+@pure @const {
+    make std = @import "../library/std/pkg.quip"
+}
+
+make type Stack <T> {
+
+    @pub {
+        make data: T[64] = [] // empty array
+        make len: int = 0
+    }
+
+    @pub
+    make create () -> Stack <T> {
+        return Stack<T> {}
+    }
+
+    @pub @this
+    make push (item: T) -> !void {
+        if  this.len() >=64 {
+            return error.StackOverflow
+        }
+
+        this.data[this.len] = item
+        this.len = this.len + 1
+    }
+
+    @pub @this
+    make pop () -> !T {
+        if this.len == 0 {
+            return error.StackUnderflow
+        }
+
+        this.len = this.len - 1
+        // remove the last item from the `data` array
+        // and move ownership of this item
+        return this.data[this.len] ! // explicitly copy
+    }
+}
+
+@pub @entry
+make main () -> int {
+
+    // such generic Type is later compiled to a concrete type (Stack_int)
+    make numbers = Stack<int>.create()
+    numbers.push(42) catch { return 1 }
+    numbers.pop() catch { return 1 }
+
+    return 0
+}

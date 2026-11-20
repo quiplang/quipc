@@ -1,0 +1,7 @@
+@pub {
+    @import "memory.quip"
+    @import "str.quip"
+    @import "array.quip"
+    @import "closure.quip"
+    @import "panic.quip"
+}

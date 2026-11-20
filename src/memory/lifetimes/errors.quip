@@ -1,0 +1,230 @@
+// diagnostics raised by the memory pass; each function only *builds* the
+// diagnostic, the inference pass decides when it is reported
+
+@pure @const {
+    make util = @import "../../util/pkg.quip"
+    make graph = @import "graph.quip"
+    make mir = @import "../../mir/mir.quip"
+    make diags = @import "../../diag/diagnosis.quip"
+    make e = @import "../../diag/err.quip"
+}
+
+/// returns a readable name for a mir local in a diagnostic.
+@pub
+make local_name (body: ref<mir::MirBody>, local: uint) -> str {
+    if local < body.*.locals.len() {
+        make n = body.*.locals[local].name !
+
+        if n.len() > 0 && !body.*.locals[local].is_temp && n[0] != '$' {
+            return n
+        }
+    }
+
+    return "temporary value"
+}
+
+/// Finds a source-level value carrying a reference to its recorded last use.
+@pub
+make reference_carrier_name (body: ref<mir::MirBody>, g: ref<graph::LivenessGraph>, holder: uint) -> str {
+    make local = holder
+    make steps = 0
+    make found: str = ""
+
+    while local < g.*.nlocals && steps < g.*.nlocals {
+        make name = local_name(body, local)
+
+        if name != "temporary value" { found = name }
+
+        if local >= g.*.last_via.len() { break }
+
+        local = g.*.last_via[local]
+        steps = steps + 1
+    }
+
+    return found
+}
+
+/// creates a diagnostic for using an uninitialized local.
+@pub
+make uninitialized (body: ref<mir::MirBody>, range: util::Range, local: uint) -> owned<diags::Diag> {
+    make name = local_name(body, local)
+
+    make d = diags::Diag.err(e::Err.UseOfUninitialized, range, "use of uninitialized value")
+    d.label("`" + (name !) + "` is declared but never assigned")
+    d.help("assign a value to `" + name + "` before using it")
+    return d
+}
+
+/// creates a diagnostic for using a local after its value was moved.
+@pub
+make after_move (body: ref<mir::MirBody>, range: util::Range, local: uint) -> owned<diags::Diag> {
+    make name = local_name(body, local)
+
+    make d = diags::Diag.err(e::Err.UseAfterMove, range, "use of value after it was moved")
+    d.label("`" + (name !) + "` no longer owns its value")
+    d.help("assign a fresh value to `" + name.copy() + "`, or copy it before the earlier move if its type supports copying")
+    return d
+}
+
+/// reports a value moved on a previous iteration and used again in a loop.
+@pub
+make after_loop_move (body: ref<mir::MirBody>, range: util::Range, local: uint) -> owned<diags::Diag> {
+    make name = local_name(body, local)
+    make d = diags::Diag.err(e::Err.UseAfterMove, range, "use of value moved in a previous loop iteration")
+    d.label("`" + name.copy() + "` may no longer own its value on this iteration")
+    d.help("copy `" + name + "` before the move if its type supports copying, or restructure the loop so it is not moved between iterations")
+    return d
+}
+
+/// creates a diagnostic for using a local after its storage ended.
+@pub
+make after_scope (body: ref<mir::MirBody>, range: util::Range, local: uint) -> owned<diags::Diag> {
+    make name = local_name(body, local)
+
+    make d = diags::Diag.err(e::Err.UseAfterScope, range, "use of value outside of its scope")
+    d.label("storage of `" + (name !) + "` is dead here")
+    d.help("declare `" + name + "` in an enclosing scope")
+    return d
+}
+
+/// moves the pinned.
+@pub
+make move_pinned (body: ref<mir::MirBody>, range: util::Range, local: uint) -> owned<diags::Diag> {
+    make name = local_name(body, local)
+
+    make d = diags::Diag.err(e::Err.MoveWhilePinned, range, "cannot move ownership while pinned")
+    d.label("a `.pin` borrow of `" + (name !) + "` is still active")
+    d.help("finish using the reference before moving `" + name + "`")
+    return d
+}
+
+/// creates a diagnostic for pinning an already pinned local.
+@pub
+make already_pinned (body: ref<mir::MirBody>, range: util::Range, local: uint) -> owned<diags::Diag> {
+    make name = local_name(body, local)
+
+    make d = diags::Diag.err(e::Err.AlreadyPinned, range, "cannot pin a value twice")
+    d.label("`" + name + "` is already pinned")
+    d.help("drop the active reference first, or chain from the reference itself")
+    return d
+}
+
+/// assigns the pinned.
+@pub
+make assign_pinned (body: ref<mir::MirBody>, range: util::Range, local: uint) -> owned<diags::Diag> {
+    make name = local_name(body, local)
+
+    make d = diags::Diag.err(e::Err.AssignWhilePinned, range, "cannot assign while pinned")
+    d.label("a `.pin` borrow of `" + (name !) + "` is still active")
+    d.help("finish using the reference before writing to `" + name + "`")
+    return d
+}
+
+/// rejects a collection mutation that may invalidate a live reference.
+@pub
+make mutate_pinned_collection (body: ref<mir::MirBody>, range: util::Range, local: uint) -> owned<diags::Diag> {
+    make name = local_name(body, local)
+    make d = diags::Diag.err(e::Err.AssignWhilePinned, range, "cannot modify collection while a reference is active")
+    d.label("this operation may invalidate a reference into `" + name.copy() + "`")
+    d.help("finish using the reference before modifying `" + name + "`")
+    return d
+}
+
+/// returns the stack reference.
+@pub
+make return_stack_ref (body: ref<mir::MirBody>, range: util::Range, local: uint) -> owned<diags::Diag> {
+    make name = local_name(body, local)
+
+    make d = diags::Diag.err(e::Err.ReturnStackRef, range, "cannot return reference to stack-local data")
+    d.label("`" + (name !) + "` dies when the function returns")
+    d.note("the returned ref would outlive `" + name + "`")
+    d.help("return `owned<T>` instead, or accept that the caller owns the data")
+    return d
+}
+
+/// frees the active.
+@pub
+make free_active (body: ref<mir::MirBody>, range: util::Range, local: uint) -> owned<diags::Diag> {
+    make name = local_name(body, local)
+
+    make d = diags::Diag.err(e::Err.FreeWhileReferenced, range, "cannot free heap data while refs are active")
+    d.label("`" + (name !) + "` is still pinned here")
+    d.note("freeing `" + name + "` would leave the reference dangling")
+    d.help("drop or finish using the reference before freeing")
+    return d
+}
+
+/// creates a diagnostic for a reference that outlives its source.
+@pub
+make ref_outlives (body: ref<mir::MirBody>, range: util::Range, holder: uint, src: uint, holder_kill: uint, src_dead: uint) -> owned<diags::Diag> {
+    make holder_name = local_name(body, holder)
+    make src_name = local_name(body, src)
+
+    make d = diags::Diag.err(e::Err.RefOutlivesSource, range, "ref outlives its source variable")
+    d.label("this ref is still live when `" + (src_name !) + "` dies")
+    d.note("`" + holder_name.copy() + "` is used after the storage of `" + src_name.copy() + "` ends")
+    d.help("restructure so `" + holder_name + "` dies before `" + src_name + "`")
+    return d
+}
+
+
+@pub
+make last_use_range (body: ref<mir::MirBody>, g: ref<graph::LivenessGraph>, local: uint) -> util::Range {
+    if local >= g.*.nlocals { return util::Range {} }
+
+    if g.*.has_use[local] != 0 {
+        make block = g.*.last_block[local]
+
+        if g.*.last_in_term[local] != 0 && block < body.*.terms.len() { return body.*.terms[block].range.copy() }
+
+        make index = g.*.last[local]
+
+        if index < body.*.stmts.len() { return body.*.stmts[index].range.copy() }
+    }
+
+    if local < body.*.locals.len() { return body.*.locals[local].range.copy() }
+
+    return util::Range {}
+}
+
+
+// Encoded source provenance: even sites name statements, odd sites terminators.
+// Keep compact IDs in every dataflow state instead of copying source ranges.
+@pub
+make event_range (body: ref<mir::MirBody>, site: uint) -> util::Range {
+    if site == 0 { return util::Range {} }
+
+    make index = site / 2 - 1
+
+    if site % 2 == 0 {
+        if index < body.*.stmts.len() { return body.*.stmts[index].range.copy() }
+    } else {
+        if index < body.*.terms.len() { return body.*.terms[index].range.copy() }
+    }
+
+    return util::Range {}
+}
+
+/// locates the moved argument, rather than an unrelated argument of the call.
+@pub
+make move_event_range (body: ref<mir::MirBody>, site: uint, local: uint) -> util::Range {
+    if site > 0 && site % 2 != 0 {
+        make index = site / 2 - 1
+
+        if index < body.*.terms.len() {
+            make term = body.*.terms[index].pin
+            make i = 0
+            while i < term.*.args.len() {
+                make arg = term.*.args[i].pin
+
+                if arg.*.kind == mir::MirOperandKind.Move && arg.*.place.local == local && arg.*.range.start.end > arg.*.range.start.start {
+                    return arg.*.range.copy()
+                }
+
+                i = i + 1
+            }
+        }
+    }
+
+    return event_range(body, site)
+}

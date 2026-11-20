@@ -1,0 +1,23 @@
+@pure @const {
+    make std: unit = @import "std/pkg.quip"
+}
+
+@pub @entry
+make build (argc: int, argv: ptr<char>[]) -> int {
+    make b = std::Build.from_args(argv) catch {
+        return 1
+    }
+
+    // b.options.hide_warnings = true
+
+    make exe = std::Executable.default()
+    exe.add_import("std", "~/.quip/current/lib/std/pkg.quip") // creates global alias to standard library
+
+    b.add_executable(exe)
+
+    b.proceed() catch {
+        return 1
+    }
+
+    return 0
+}

@@ -1,0 +1,160 @@
+@pure @const {
+    make std = @import "std"
+    make api = @import "bindings.quip"
+    make native = @import "native.quip"
+    make mir = @import "../mir/mir.quip"
+}
+
+@pub
+make enum Kind {
+    Unsupported,
+    Export,
+    NativeAddress,
+    ConstantAddress,
+    GlobalAddress,
+    NativeCall,
+    Closure,
+}
+
+@pub
+make type Plan {
+    @pub make kind: Kind = Kind.Unsupported
+    @pub make symbol: str = ""
+    @pub make target: str = ""
+    @pub make constant: ptr<any>
+    @pub make index: uint = 0
+    @pub make storage_size: uint = 0
+    @pub make environment: uint = 0
+}
+
+make type Builder {
+    make context: ptr<any>
+    make module: ptr<any>
+    make handle: ptr<any>
+    make conversion: native::Conversion
+    make unnamed: str = ""
+
+    @this @unsafe
+    make named (name: str) -> ptr<any> {
+        return api::LLVMGetNamedFunction(this.module, name.data)
+    }
+
+    @this @unsafe
+    make call (callee: ptr<any>, signature: ptr<any>, args: ptr<any>[]) -> ptr<any> {
+        @unsafe make first: ptr<ptr<any>> = 0
+        if args.len() > 0 {
+            @unsafe make address: ptr<ptr<any>> = args[0].pin
+            first = address
+        }
+        @unsafe make count: u32 = args.len()
+        return api::LLVMBuildCall2(this.handle, signature, callee, first, count, this.unnamed.data)
+    }
+
+    @this @unsafe
+    make export_body (wrapper: ptr<any>, plan: ref<Plan>, f: ref<mir::MirFunc>) {
+        make args: ptr<any>[] = []
+        make i: uint = 0
+        while i < f.*.body.param_count {
+            @unsafe make index: u32 = i
+            make param = api::LLVMGetParam(wrapper, index)
+            make signed = native::signed_narrow(f.*.body.locals[i + 1].ty.copy())
+            args.push(this.conversion.widen(param, api::LLVMTypeOf(param), signed))
+            i++
+        }
+
+        make target = this.named(plan.*.target.copy())
+        make result = this.call(target, api::LLVMGlobalGetValueType(target), args)
+        make result_type = api::LLVMGetReturnType(api::LLVMGlobalGetValueType(wrapper))
+        if api::LLVMGetTypeKind(result_type) == 0 { api::LLVMBuildRetVoid(this.handle) }
+        else { api::LLVMBuildRet(this.handle, this.conversion.narrow(result, result_type)) }
+    }
+
+    @this @unsafe
+    make forward_body (wrapper: ptr<any>, callee: ptr<any>, skip: uint) {
+        make signature = api::LLVMGlobalGetValueType(wrapper)
+        make result_type = api::LLVMGetReturnType(signature)
+        make count = api::LLVMCountParamTypes(signature)
+        make types: ptr<any>[] = []
+        make args: ptr<any>[] = []
+        make i: u32 = 0
+
+        while i < count {
+            if i != skip {
+                make argument = api::LLVMGetParam(wrapper, i)
+                types.push(api::LLVMTypeOf(argument))
+                args.push(argument)
+            }
+            i++
+        }
+
+        @unsafe make first: ptr<ptr<any>> = 0
+        if types.len() > 0 {
+            @unsafe make address: ptr<ptr<any>> = types[0].pin
+            first = address
+        }
+
+        make target_signature = api::LLVMFunctionType(result_type, first, count - 1, 0)
+        make result = this.call(callee, target_signature, args)
+        if api::LLVMGetTypeKind(result_type) == 0 { api::LLVMBuildRetVoid(this.handle) }
+        else { api::LLVMBuildRet(this.handle, result) }
+    }
+
+    @this @unsafe
+    make global_storage (plan: ref<Plan>) -> ptr<any> {
+        make ty = api::LLVMArrayType2(api::LLVMInt8TypeInContext(this.context), plan.*.storage_size)
+        make name = plan.*.symbol.copy() + ".storage"
+        make storage = api::LLVMAddGlobal(this.module, ty, name.data)
+        api::LLVMSetInitializer(storage, api::LLVMConstNull(ty))
+        api::LLVMSetLinkage(storage, 9)
+        api::LLVMSetAlignment(storage, 16)
+        return storage
+    }
+
+    @this @unsafe
+    make build_one (plan: ref<Plan>, m: ref<mir::MirModule>) -> bool {
+        if plan.*.kind == Kind.Unsupported || (plan.*.kind == Kind.NativeCall && m.*.funcs[plan.*.index].body.param_count == 0) {
+            std::progress::clear()
+            std::io::println("unsupported native adapter " + plan.*.symbol.copy())
+            return false
+        }
+
+        make wrapper = this.named(plan.*.symbol.copy())
+        make entry: str = "entry"
+        make block = api::LLVMAppendBasicBlockInContext(this.context, wrapper, entry.data)
+        api::LLVMPositionBuilderAtEnd(this.handle, block)
+
+        match plan.*.kind {
+            Kind.Export { this.export_body(wrapper, plan, m.*.funcs[plan.*.index].pin) }
+            Kind.NativeCall { this.forward_body(wrapper, api::LLVMGetParam(wrapper, 0), 0) }
+            Kind.Closure {
+                api::LLVMSetLinkage(wrapper, 9)
+                this.forward_body(wrapper, this.named(plan.*.target.copy()), plan.*.environment)
+            }
+            Kind.NativeAddress { api::LLVMBuildRet(this.handle, this.named(plan.*.target.copy())) }
+            Kind.ConstantAddress { api::LLVMBuildRet(this.handle, plan.*.constant) }
+            Kind.GlobalAddress { api::LLVMBuildRet(this.handle, this.global_storage(plan)) }
+            _ { return false }
+        }
+
+        return true
+    }
+}
+
+/// Fills native exports and intrinsic bodies reserved during module lowering.
+@pub @unsafe
+make build (context: ptr<any>, module: ptr<any>, plans: ref<Plan[]>, m: ref<mir::MirModule>) -> bool {
+    if plans.*.len() == 0 { return true }
+    make handle = api::LLVMCreateBuilderInContext(context)
+    make builder = Builder {
+        context = context, module = module, handle = handle, conversion = native::Conversion.create(context, handle),
+    }
+    make success = true
+    for plan : plans.* {
+        if !builder.build_one(plan.pin, m) {
+            success = false
+            break
+        }
+    }
+    api::LLVMDisposeBuilder(handle)
+    return success
+}

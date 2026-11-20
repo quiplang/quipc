@@ -1,0 +1,92 @@
+@pub
+make enum Kind {
+    None,
+    String,
+    Descriptor,
+}
+
+/// The cleanup associated with a local, including captured storage.
+@pub
+make type Local {
+    @pub make kind: Kind = Kind.None
+    @pub make in_environment: bool = false
+}
+
+@pure @const {
+    make mir = @import "../mir/mir.quip"
+    make flow = @import "../mir/flow.quip"
+}
+
+@pub
+make type Plan {
+    @pub make words: uint = 0
+    @pub make inputs: uint[] = []
+}
+
+/// A may-initialized analysis: omit a drop only when every incoming path has
+/// no value. Address-exposed storage is conservatively considered initialized.
+@pub
+make plan (body: ref<mir::MirBody>) -> Plan {
+    make graph = flow::graph(body)
+    make result = Plan { words = graph.words }
+    make outputs: uint[] = []
+    make seed: uint[] = []
+    make state: uint[] = []
+    while seed.len() < graph.words {
+        seed.push(0)
+        state.push(0)
+    }
+    make local: uint = 1
+    while local <= body.*.param_count {
+        flow::insert(seed.pin, 0, local)
+        local++
+    }
+    for capture : body.*.capture_locals { flow::insert(seed.pin, 0, capture) }
+    for statement : body.*.stmts {
+        if statement.kind == mir::MirStmtKind.Assign && statement.rvalue.kind == mir::MirRvalueKind.Pin { flow::insert(seed.pin, 0, statement.rvalue.place.local) }
+    }
+    while result.inputs.len() < graph.words * body.*.terms.len() {
+        result.inputs.push(0)
+        outputs.push(0)
+    }
+    make changed = true
+    while changed {
+        changed = false
+        make block: uint = 0
+        while block < body.*.terms.len() {
+            make word: uint = 0
+            while word < graph.words {
+                make bits: uint = 0
+                if block == 0 { bits = seed[word] }
+                for predecessor : graph.predecessors[block].values { bits |= outputs[predecessor * graph.words + word] }
+                result.inputs[block * graph.words + word] = bits
+                state[word] = bits
+                word++
+            }
+            for index : graph.statements[block].values {
+                make statement = body.*.stmts[index].pin
+                if statement.*.kind == mir::MirStmtKind.Assign {
+                    flow::insert(state.pin, 0, statement.*.place.local)
+                    make value = statement.*.rvalue.pin
+                    if value.*.kind == mir::MirRvalueKind.Use && value.*.a.kind == mir::MirOperandKind.Move && value.*.a.place.projs.len() == 0 {
+                        make source = value.*.a.place.local
+                        if body.*.locals[source].is_temp && (body.*.locals[source].ty == "str" || body.*.locals[source].ty == "String")
+                            && (body.*.locals[statement.*.place.local].ty == "str" || body.*.locals[statement.*.place.local].ty == "String")
+                            && source != statement.*.place.local { flow::remove(state.pin, 0, source) }
+                    }
+                } elif statement.*.kind == mir::MirStmtKind.StorageDead { flow::remove(state.pin, 0, statement.*.local) }
+            }
+            if body.*.terms[block].kind == mir::MirTermKind.Call { flow::insert(state.pin, 0, body.*.terms[block].dest.local) }
+            word = 0
+            while word < graph.words {
+                if outputs[block * graph.words + word] != state[word] {
+                    changed = true
+                    outputs[block * graph.words + word] = state[word]
+                }
+                word++
+            }
+            block++
+        }
+    }
+    return result
+}

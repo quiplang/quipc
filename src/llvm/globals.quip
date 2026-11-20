@@ -1,0 +1,208 @@
+@pure @const {
+    make api = @import "bindings.quip"
+}
+
+@const {
+    make LinkOnceODRLinkage: i32 = 3
+    make AppendingLinkage: i32 = 7
+    make InternalLinkage: i32 = 8
+    make PrivateLinkage: i32 = 9
+    make IntNotEqual: i32 = 33
+}
+
+/// Layout and link symbols for one global allocator and its constructor.
+@pub
+make type Plan {
+    @pub make getter: str = ""
+    @pub make initializer: str = ""
+    @pub make allocate: str = ""
+    @pub make deallocate: str = ""
+    @pub make storage_size: uint = 0
+    @pub make priority: uint = 1002
+}
+
+make type Builder {
+    make context: ptr<any>
+    make module: ptr<any>
+    make handle: ptr<any>
+    make byte: ptr<any>
+    make bit: ptr<any>
+    make word: ptr<any>
+    make pointer: ptr<any>
+    make void_type: ptr<any>
+    make unnamed: str = ""
+
+    @this @unsafe
+    make function (name: str, result: ptr<any>, params: ptr<any>[]) -> ptr<any> {
+        @unsafe make first: ptr<ptr<any>> = 0
+        if params.len() > 0 {
+            @unsafe make address: ptr<ptr<any>> = params[0].pin
+            first = address
+        }
+
+        @unsafe make count: u32 = params.len()
+        make signature = api::LLVMFunctionType(result, first, count, 0)
+        make function = api::LLVMAddFunction(this.module, name.data, signature)
+        api::LLVMSetLinkage(function, PrivateLinkage)
+        return function
+    }
+
+    @this @unsafe
+    make block (function: ptr<any>, name: str) -> ptr<any> {
+        return api::LLVMAppendBasicBlockInContext(this.context, function, name.data)
+    }
+
+    @this @unsafe
+    make named (name: str) -> ptr<any> {
+        return api::LLVMGetNamedFunction(this.module, name.data)
+    }
+
+    @this @unsafe
+    make call (function: ptr<any>, args: ptr<any>[]) -> ptr<any> {
+        @unsafe make first: ptr<ptr<any>> = 0
+        if args.len() > 0 {
+            @unsafe make address: ptr<ptr<any>> = args[0].pin
+            first = address
+        }
+        @unsafe make count: u32 = args.len()
+        return api::LLVMBuildCall2(this.handle, api::LLVMGlobalGetValueType(function), function, first, count, this.unnamed.data)
+    }
+
+    @this @unsafe
+    make load_word (address: ptr<any>) -> ptr<any> {
+        make value = api::LLVMBuildLoad2(this.handle, this.word, address, this.unnamed.data)
+        api::LLVMSetAlignment(value, 8)
+        return value
+    }
+
+    @this @unsafe
+    make allocate_wrapper (plan: ref<Plan>) -> ptr<any> {
+        make function = this.function(plan.*.getter.copy() + ".allocate", this.pointer, [this.pointer, this.word])
+        api::LLVMPositionBuilderAtEnd(this.handle, this.block(function, "entry"))
+        make owner = api::LLVMBuildPtrToInt(this.handle, api::LLVMGetParam(function, 0), this.word, this.unnamed.data)
+        make size = api::LLVMGetParam(function, 1)
+        make result = api::LLVMBuildAlloca(this.handle, api::LLVMArrayType2(this.byte, 16), this.unnamed.data)
+        api::LLVMSetAlignment(result, 8)
+        this.call(this.named(plan.*.allocate.copy()), [result, owner, size])
+        make code = this.load_word(result)
+        make zero = api::LLVMConstInt(this.word, 0, 0)
+        make failed = api::LLVMBuildICmp(this.handle, IntNotEqual, code, zero, this.unnamed.data)
+        make failure = this.block(function, "failure")
+        make success = this.block(function, "success")
+        api::LLVMBuildCondBr(this.handle, failed, failure, success)
+
+        api::LLVMPositionBuilderAtEnd(this.handle, failure)
+        api::LLVMBuildRet(this.handle, api::LLVMConstNull(this.pointer))
+        api::LLVMPositionBuilderAtEnd(this.handle, success)
+        make offset = api::LLVMConstInt(this.word, 8, 0)
+        @unsafe make index: ptr<ptr<any>> = offset.pin
+        make payload = api::LLVMBuildGEP2(this.handle, this.byte, result, index, 1, this.unnamed.data)
+        make value = api::LLVMBuildIntToPtr(this.handle, this.load_word(payload), this.pointer, this.unnamed.data)
+        api::LLVMBuildRet(this.handle, value)
+        return function
+    }
+
+    @this @unsafe
+    make deallocate_wrapper (plan: ref<Plan>) -> ptr<any> {
+        make function = this.function(plan.*.getter.copy() + ".deallocate", this.void_type, [this.pointer, this.pointer])
+        api::LLVMPositionBuilderAtEnd(this.handle, this.block(function, "entry"))
+        make owner = api::LLVMBuildPtrToInt(this.handle, api::LLVMGetParam(function, 0), this.word, this.unnamed.data)
+        make value = api::LLVMBuildPtrToInt(this.handle, api::LLVMGetParam(function, 1), this.word, this.unnamed.data)
+        this.call(this.named(plan.*.deallocate.copy()), [owner, value])
+        api::LLVMBuildRetVoid(this.handle)
+        return function
+    }
+
+    @this @unsafe
+    make internal_zero (name: str, ty: ptr<any>) -> ptr<any> {
+        make global = api::LLVMAddGlobal(this.module, ty, name.data)
+        api::LLVMSetInitializer(global, api::LLVMConstNull(ty))
+        api::LLVMSetLinkage(global, InternalLinkage)
+        return global
+    }
+
+    @this @unsafe
+    make define_getter (getter: ptr<any>, plan: ref<Plan>) {
+        make allocate = this.allocate_wrapper(plan)
+        make deallocate = this.deallocate_wrapper(plan)
+        make storage = this.internal_zero(plan.*.getter.copy() + ".storage", api::LLVMArrayType2(this.byte, plan.*.storage_size))
+        api::LLVMSetAlignment(storage, 8)
+        make ready = this.internal_zero(plan.*.getter.copy() + ".ready", this.bit)
+
+        make entry = this.block(getter, "entry")
+        make initialize = this.block(getter, "init")
+        make done = this.block(getter, "done")
+        api::LLVMPositionBuilderAtEnd(this.handle, entry)
+        make initialized = api::LLVMBuildLoad2(this.handle, this.bit, ready, this.unnamed.data)
+        api::LLVMSetAlignment(initialized, 1)
+        api::LLVMBuildCondBr(this.handle, initialized, done, initialize)
+
+        api::LLVMPositionBuilderAtEnd(this.handle, initialize)
+        this.call(this.named(plan.*.initializer.copy()), [storage])
+        this.call(this.named("__quip_set_global_allocator"), [storage, allocate, deallocate])
+        make store = api::LLVMBuildStore(this.handle, api::LLVMConstInt(this.bit, 1, 0), ready)
+        api::LLVMSetAlignment(store, 1)
+        api::LLVMBuildBr(this.handle, done)
+
+        api::LLVMPositionBuilderAtEnd(this.handle, done)
+        api::LLVMBuildRet(this.handle, storage)
+    }
+
+    @this @unsafe
+    make constructor (plan: ref<Plan>) -> ptr<any> {
+        make getter = this.named(plan.*.getter.copy())
+        if plan.*.initializer.len() > 0 { this.define_getter(getter, plan) }
+
+        make constructor = this.function(plan.*.getter.copy() + ".register", this.void_type, [])
+        api::LLVMPositionBuilderAtEnd(this.handle, this.block(constructor, "entry"))
+        this.call(getter, [])
+        api::LLVMBuildRetVoid(this.handle)
+        return constructor
+    }
+}
+
+/// Defines link-coalesced identities so the same error compares equal across units.
+@pub @unsafe
+make error_identity (context: ptr<any>, module: ptr<any>, name: str) -> ptr<any> {
+    make global = api::LLVMGetNamedGlobal(module, name.data)
+    @unsafe make null: ptr<any> = 0
+    if global != null { return global }
+
+    make byte = api::LLVMInt8TypeInContext(context)
+    global = api::LLVMAddGlobal(module, byte, name.data)
+    api::LLVMSetInitializer(global, api::LLVMConstInt(byte, 0, 0))
+    api::LLVMSetLinkage(global, LinkOnceODRLinkage)
+    api::LLVMSetAlignment(global, 1)
+    return global
+}
+
+@pub @unsafe
+make build (context: ptr<any>, module: ptr<any>, plans: ref<Plan[]>) {
+    if plans.*.len() == 0 { return }
+
+    make handle = api::LLVMCreateBuilderInContext(context)
+    make pointer = api::LLVMPointerTypeInContext(context, 0)
+    make builder = Builder {
+        context = context, module = module, handle = handle, pointer = pointer,
+        byte = api::LLVMInt8TypeInContext(context), bit = api::LLVMInt1TypeInContext(context),
+        word = api::LLVMInt64TypeInContext(context), void_type = api::LLVMVoidTypeInContext(context),
+    }
+
+    make i32_type = api::LLVMInt32TypeInContext(context)
+    make constructors: ptr<any>[] = []
+    for plan : plans.* {
+        make priority = api::LLVMConstInt(i32_type, plan.priority, 0)
+        make constructor = builder.constructor(plan.pin)
+        make fields: ptr<any>[3] = [priority, constructor, api::LLVMConstNull(pointer)]
+        @unsafe make first: ptr<ptr<any>> = fields[0].pin
+        constructors.push(api::LLVMConstStructInContext(context, first, 3, 0))
+    }
+
+    @unsafe make first: ptr<ptr<any>> = constructors[0].pin
+    make table = api::LLVMConstArray2(api::LLVMTypeOf(constructors[0]), first, constructors.len())
+    make name: str = "llvm.global_ctors"
+    make global = api::LLVMAddGlobal(module, api::LLVMTypeOf(table), name.data)
+    api::LLVMSetInitializer(global, table)
+    api::LLVMSetLinkage(global, AppendingLinkage)
+    api::LLVMDisposeBuilder(handle)
+}

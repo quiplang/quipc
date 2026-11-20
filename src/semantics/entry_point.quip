@@ -1,0 +1,61 @@
+@pure @const {
+    make hir = @import "../hir/hir.quip"
+
+    make std: unit = @import "std"
+}
+
+// check if the entry point is valid
+// 1. if the main module have decalred any functions with @entry
+// 2. if the entry is @pub
+// 3. if the entry name matches with the specified from the command ('main' or custom)
+//
+// there can be many entry candidates (functions tagged `@entry`); the selected one is the
+// candidate whose name matches the command line entry (default `main`, or `--entry <name>`),
+// and it must additionally be tagged `@pub`
+/// validates the selected entry function in a hir module.
+@pub
+make check (module: ref<hir::HirModule>, entry: str) -> !void {
+    make found = false
+    make is_pub = false
+
+    make i: uint = 0
+
+
+    while i < module.*.items.len() {
+        make item = module.*.items[i].pin
+
+        if item.*.kind == hir::HirItemKind.Func {
+            make f = module.*.funcs[item.*.func].pin
+
+            if f.*.name == entry {
+                make ti: uint = 0
+
+                while ti < f.*.tags.len() {
+                    make tag = f.*.tags[ti].pin
+
+                    if tag.* == "entry" {
+                        found = true
+                    }
+
+                    if tag.* == "pub" {
+                        is_pub = true
+                    }
+
+                    ti = ti + 1
+                }
+            }
+        }
+
+        i = i + 1
+    }
+
+    if !found {
+        return error.MissingEntryPoint
+    }
+
+    if !is_pub {
+        return error.EntryPointNotPublic
+    }
+
+    return
+}

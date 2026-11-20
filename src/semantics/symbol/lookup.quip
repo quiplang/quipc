@@ -1,0 +1,383 @@
+@pure @const {
+    make mangle = @import "mangle.quip"
+    make hir = @import "../../hir/hir.quip"
+}
+
+@pub
+make type NamespaceValue {
+    @pub make found: bool = false
+    @pub make namespace: uint = 0
+    @pub make export: uint = 0
+    @pub make kind: uint = 0 // variant, function, global, literal
+    @pub make variant: uint = 0
+    @pub make signature: uint = 0
+}
+
+// Name lookup owns declaration selection, namespace paths and ambiguity rules.
+// Type construction and inference consume these indices without reimplementing lookup.
+@pub
+make type Resolver {
+    @pub make module: ref<hir::HirModule>
+    @pub make namespaces: ref<hir::HirNamespace[]>
+    @pub make sigs: ref<hir::HirAttachedSig[]>
+    @pub make structs: ref<hir::HirStructSig[]>
+    @pub make funcs: ref<hir::HirFuncSig[]>
+
+    @pub @this
+    make path_starts_with (path: str, prefix: str) -> bool {
+        if prefix.len() + 2 > path.len() { return false }
+
+        make i: uint = 0
+
+        while i < prefix.len() {
+            if path[i] != prefix[i] { return false }
+
+            i = i + 1
+        }
+
+        return path[i] == ':' && path[i + 1] == ':'
+    }
+
+    @pub @this
+    make slice_from (s: str, start: uint) -> str {
+        make out: str = ""
+        make i = start
+
+        while i < s.len() {
+            out = out + s[i]
+            i = i + 1
+        }
+
+        return out
+    }
+
+    @pub @this
+    make access_path (body: ref<hir::HirBody>, e: uint) -> str {
+        make ex = body.*.exprs[e].pin
+
+        match ex.*.kind {
+            hir::HirExprKind.Path {
+                return ex.*.name !
+            }
+
+            hir::HirExprKind.Field {
+                make base = this.access_path(body, ex.*.lhs)
+
+                if base.len() == 0 {
+                    make empty: str = ""
+
+                    return empty
+                }
+
+                return base + "::" + (ex.*.name !)
+            }
+
+            _ {}
+        }
+
+        make empty: str = ""
+
+        return empty
+    }
+
+    @pub @this
+    make find_namespace (path: str) -> uint {
+        make i: uint = 0
+
+        while i < this.namespaces.*.len() {
+            if this.namespaces.*[i].path == path {
+                return i
+            }
+
+            i = i + 1
+        }
+
+        return i
+    }
+
+    @pub @this
+    make namespace_has_type (nsi: uint, name: str) -> bool {
+        make ns = this.namespaces.*[nsi].pin
+        make i: uint = 0
+
+        while i < ns.*.exports.len() {
+            if ns.*.exports[i].name == name && ns.*.exports[i].is_type {
+                return true
+            }
+
+            i = i + 1
+        }
+
+        return false
+    }
+
+    @pub @this
+    make find_struct_sig (name: str) -> uint {
+        make i: uint = 0
+
+        while i < this.structs.*.len() {
+            make s = this.structs.*[i].pin
+
+            if s.*.name == name {
+                return i
+            }
+
+            i = i + 1
+        }
+
+        return this.structs.*.len()
+    }
+
+    @pub @this
+    make find_func_sig (module: str, name: str) -> uint {
+        make i: uint = 0
+
+        while i < this.funcs.*.len() {
+            make f = this.funcs.*[i].pin
+
+            if f.*.module == module && f.*.name == name {
+                return i
+            }
+
+            i = i + 1
+        }
+
+        return this.funcs.*.len()
+    }
+
+    @pub @this
+    make find_attached_sig (type_name: str, name: str) -> uint {
+        make i: uint = 0
+
+        while i < this.sigs.*.len() {
+            make s = this.sigs.*[i].pin
+
+            if s.*.type_name == type_name && s.*.name == name {
+                return i
+            }
+
+            i = i + 1
+        }
+
+        return this.sigs.*.len()
+    }
+
+    @pub @this
+    make find_unique_sig (name: str) -> uint {
+        make found = this.sigs.*.len()
+        make count: uint = 0
+        make i: uint = 0
+
+        while i < this.sigs.*.len() {
+            make s = this.sigs.*[i].pin
+
+            if s.*.name == name {
+                found = i
+                count = count + 1
+            }
+
+            i = i + 1
+        }
+
+        if count == 1 {
+            return found
+        }
+
+        return this.sigs.*.len()
+    }
+
+    @pub @this
+    make find_attached_func (type_name: str, name: str) -> uint {
+        make i: uint = 0
+
+        while i < this.module.*.attached_funcs.len() {
+            make m = this.module.*.attached_funcs[i].pin
+
+            if m.*.type_name == type_name && m.*.name == name {
+                return i
+            }
+
+            i = i + 1
+        }
+
+        return this.module.*.attached_funcs.len()
+    }
+
+    @pub @this
+    make find_struct (name: str) -> uint {
+        make i: uint = 0
+
+        while i < this.module.*.structs.len() {
+            make s = this.module.*.structs[i].pin
+
+            if s.*.name.len() == name.len() {
+                if s.*.name == name {
+                    return i
+                }
+            }
+
+            i = i + 1
+        }
+
+        return this.module.*.structs.len()
+    }
+
+    @pub @this
+    make find_unique_attached_func (name: str) -> uint {
+        make found = this.module.*.attached_funcs.len()
+        make count: uint = 0
+
+        make i: uint = 0
+
+        while i < this.module.*.attached_funcs.len() {
+            make m = this.module.*.attached_funcs[i].pin
+
+            if m.*.name == name {
+                found = i
+                count = count + 1
+            }
+
+            i = i + 1
+        }
+
+        if count == 1 {
+            return found
+        }
+
+        return this.module.*.attached_funcs.len()
+    }
+
+    @pub @this
+    make find_func (name: str) -> uint {
+        make i: uint = 0
+
+        while i < this.module.*.funcs.len() {
+            make f = this.module.*.funcs[i].pin
+
+            if f.*.name == name {
+                return i
+            }
+
+            i = i + 1
+        }
+
+        return this.module.*.funcs.len()
+    }
+
+    @pub @this
+    make item_exists (name: str) -> bool {
+        make i: uint = 0
+
+        while i < this.module.*.items.len() {
+            make item = this.module.*.items[i].pin
+
+            if item.*.name.len() == name.len() {
+                if item.*.name == name {
+                    return true
+                }
+            }
+
+            i = i + 1
+        }
+
+        return false
+    }
+
+    @pub @this
+    make find_type_item (name: str) -> uint {
+        make i: uint = 0
+        while i < this.module.*.items.len() {
+            make item = this.module.*.items[i].pin
+
+            if item.*.name.len() == name.len() && item.*.name == name {
+                if item.*.kind == hir::HirItemKind.Type || item.*.kind == hir::HirItemKind.Enum || item.*.kind == hir::HirItemKind.Alias { return i }
+            }
+
+            i = i + 1
+        }
+
+        return i
+    }
+
+    @pub @this
+    make find_export (namespace: uint, name: str) -> uint {
+        make exports = this.namespaces.*[namespace].exports.pin
+        make i: uint = 0
+        while i < exports.*.len() {
+            if exports.*[i].name == name { return i }
+
+            i = i + 1
+        }
+
+        return i
+    }
+
+    @pub @this
+    make namespace_value (path: str, member: str) -> NamespaceValue {
+        make ni: uint = 0
+        while ni < this.namespaces.*.len() {
+            make ns = this.namespaces.*[ni].pin
+
+            if this.path_starts_with(path.copy(), ns.*.path.copy()) {
+                make ename = this.slice_from(path.copy(), ns.*.path.len() + 2)
+                make ei: uint = 0
+                while ei < ns.*.exports.len() {
+                    if ns.*.exports[ei].is_enum && ns.*.exports[ei].name == ename {
+                        make vi: uint = 0
+                        while vi < ns.*.exports[ei].variants.len() {
+                            if ns.*.exports[ei].variants[vi] == member {
+                                return NamespaceValue { found = true, namespace = ni, export = ei, variant = vi }
+                            }
+
+                            vi = vi + 1
+                        }
+                    }
+
+                    ei = ei + 1
+                }
+            }
+
+            if path == ns.*.path {
+                make signature = this.find_func_sig(ns.*.module_name.copy(), member.copy())
+
+                if signature < this.funcs.*.len() {
+                    make fi: uint = 0
+                    while fi < ns.*.exports.len() {
+                        if ns.*.exports[fi].name == member && !ns.*.exports[fi].is_type && !ns.*.exports[fi].is_unit {
+                            return NamespaceValue { found = true, namespace = ni, export = fi, kind = 1, signature = signature }
+                        }
+
+                        fi = fi + 1
+                    }
+                }
+
+                make ci: uint = 0
+                while ci < ns.*.exports.len() {
+                    if ns.*.exports[ci].name == member {
+                        if ns.*.exports[ci].global_type.len() > 0 { return NamespaceValue { found = true, namespace = ni, export = ci, kind = 2 } }
+
+                        if ns.*.exports[ci].has_lit { return NamespaceValue { found = true, namespace = ni, export = ci, kind = 3 } }
+                    }
+
+                    ci = ci + 1
+                }
+            }
+
+            ni = ni + 1
+        }
+
+        return NamespaceValue {}
+    }
+
+    @pub @this
+    make function_symbol (namespace: uint, name: str, external: bool) -> str {
+        if external { return name }
+
+        return mangle::free_symbol(this.namespaces.*[namespace].module_name.copy(), name)
+    }
+
+    @pub @this
+    make global_symbol (namespace: uint, name: str) -> str {
+        return mangle::variable_symbol(this.namespaces.*[namespace].module_name.copy(), "__quip_global_" + name)
+    }
+}

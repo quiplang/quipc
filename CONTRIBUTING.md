@@ -11,7 +11,7 @@ Because the vision and internal structure of the compiler change frequently duri
 ### How You Can Still Help Right Now
 
 While code contributions are currently paused, you are more than welcome to:
-* **Test Nightly Releases**: Try out pre-built `quipc` binaries.
+* **Test Alpha Releases**: Try out pre-built `quipc` binaries.
 * **Report Bugs**: Open an issue on GitHub if you encounter compiler crashes (`segfaults` inside `quipc`), incorrect type analysis, or misleading contextual error messages.
 
 ## Licensing of Future Contributions

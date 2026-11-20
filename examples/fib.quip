@@ -1,9 +1,15 @@
-@pure @const make std = @import "stdlib.quip"
-// remember to check the stdlib path
+@pure @const make std = @import "../library/std/pkg.quip"
 
 @pub @entry
 make main () -> int {
-    std::io::println(fib(10).to_str())
+
+    make i = 0
+    while i < 10000 {
+        fib(20)
+        i = i + 1
+    }
+
+    fib(20)
     return 0
 }
 
@@ -11,5 +17,6 @@ make fib (n: int) -> int {
     if n < 2 {
         return n
     }
+
     return fib(n - 1) + fib(n - 2)
 }

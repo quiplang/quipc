@@ -1,18 +1,190 @@
+/// identifies compiler error categories.
 @pub
 make enum Err {
     None,
 
+    Internal,
+
+    // parser
     UnexpectedToken,
     UnexpectedEndOfFile,
     InvalidSyntax,
+    UnexpectedNode,
+    InvalidState,
 
-
-
+    // semantic
+    MissingEntryPoint,
+    EntryPointNotPublic,
     BadNodeKind,
+    TypeMismatch,
+    UnexpectedAutoType,
+    MissingTypeDeclaration,
+    TypeAliasNotPure,
+    DuplicateSymbol,
+    UnknownField,
+    MissingFieldInitializer,
+    UnknownAttachedFunc,
+    UnknownNamespace,
+    UnsafeRequired,
+    PrivateField,
+    UnknownSymbol,
+    ConstMutation,
+    PureRequired,
 
+    // memory
+    RefOutlivesSource,
+    ReturnStackRef,
+    FreeWhileReferenced,
+    UseAfterMove,
+    UseOfUninitialized,
+    MoveWhilePinned,
+    AlreadyPinned,
+    AssignWhilePinned,
+    UseAfterScope,
 }
 
+/// identifies compiler warning categories.
 @pub
 make enum Warn {
     None,
+    UnusedBinding,
+    UnusedAssignment,
+    Unreachable,
+    IgnoredFallible,
+    UnusedImport,
+    IgnoredResult,
+    PossibleMemoryLeak,
+}
+
+/// returns the external code for an error category.
+@pub
+make err_code (code: Err) -> str {
+    match code {
+        Err.Internal { return "E0000" }
+        // parser 0000+
+        Err.UnexpectedToken { return "E0001" }
+
+        Err.UnexpectedEndOfFile { return "E0002" }
+
+        Err.InvalidSyntax { return "E0003" }
+
+        Err.UnexpectedNode { return "E0004" }
+
+        Err.InvalidState { return "E0005" }
+
+        // semantic 1000+
+        Err.MissingEntryPoint { return "E1000" }
+
+        Err.EntryPointNotPublic { return "E1001" }
+
+        Err.BadNodeKind { return "E1002" }
+
+        Err.TypeMismatch { return "E1003" }
+
+        Err.UnexpectedAutoType { return "E1004" }
+
+        Err.MissingTypeDeclaration { return "E1005" }
+
+        Err.TypeAliasNotPure { return "E1006" }
+
+        Err.DuplicateSymbol { return "E1007" }
+
+        Err.UnknownField { return "E1008" }
+
+        Err.MissingFieldInitializer { return "E1014" }
+
+        Err.UnknownAttachedFunc { return "E1009" }
+
+        Err.UnknownNamespace { return "E1011" }
+
+        Err.UnsafeRequired { return "E1010" }
+
+        Err.PrivateField { return "E1012" }
+
+        Err.UnknownSymbol { return "E1013" }
+
+        Err.ConstMutation { return "E1015" }
+
+        Err.PureRequired { return "E1016" }
+
+        // memory 2000+
+        Err.RefOutlivesSource { return "E2000" }
+
+        Err.ReturnStackRef { return "E2001" }
+
+        Err.FreeWhileReferenced { return "E2002" }
+
+        Err.UseAfterMove { return "E2003" }
+
+        Err.UseOfUninitialized { return "E2004" }
+
+        Err.MoveWhilePinned { return "E2005" }
+
+        Err.AlreadyPinned { return "E2006" }
+
+        Err.AssignWhilePinned { return "E2007" }
+
+        Err.UseAfterScope { return "E2008" }
+        _ { return "" }
+    }
+
+    return ""
+}
+
+/// returns the external code for a warning category.
+@pub
+make warn_code (code: Warn) -> str {
+    match code {
+        Warn.UnusedBinding { return "W0001" }
+        Warn.UnusedAssignment { return "W0002" }
+        Warn.Unreachable { return "W0003" }
+        Warn.IgnoredFallible { return "W0004" }
+        Warn.UnusedImport { return "W0005" }
+        Warn.IgnoredResult { return "W0007" }
+        Warn.PossibleMemoryLeak { return "W0008" }
+        _ { return "" }
+    }
+
+    return ""
+}
+
+/// Default repair guidance, overridden by diagnostics with more specific context.
+@pub
+make err_help (code: Err) -> str {
+    match code {
+        Err.None { return "correct the highlighted source using the diagnostic’s labels" }
+        Err.Internal { return "check the input file and compiler configuration, then report this compiler failure with a reproducer" }
+        Err.UnexpectedToken { return "replace the highlighted token with the token required by this declaration or expression" }
+        Err.UnexpectedEndOfFile { return "complete the expression or declaration and close its enclosing delimiters" }
+        Err.InvalidSyntax { return "correct the highlighted construct using the declaration or expression syntax" }
+        Err.UnexpectedNode { return "rewrite the highlighted construct using supported syntax" }
+        Err.InvalidState { return "check the surrounding declaration and report this failure if valid source triggers it" }
+        Err.MissingEntryPoint { return "add a public function tagged `@entry`, or select an existing entry function with `--entry`" }
+        Err.EntryPointNotPublic { return "add `@pub` to the entry function" }
+        Err.BadNodeKind { return "replace this construct with a supported expression or declaration" }
+        Err.TypeMismatch { return "change this expression to match the expected type, or update its declaration" }
+        Err.UnexpectedAutoType { return "add an explicit type annotation to this declaration" }
+        Err.MissingTypeDeclaration { return "declare the referenced type or import its module and qualify the type name" }
+        Err.TypeAliasNotPure { return "add `@pure` before this type alias declaration" }
+        Err.DuplicateSymbol { return "rename one of these declarations or assign to the existing binding" }
+        Err.UnknownField { return "correct the field name or declare the field on the receiver type" }
+        Err.MissingFieldInitializer { return "add an initializer for the named field or provide a default in its declaration" }
+        Err.UnknownAttachedFunc { return "correct the method name or import the module that defines its attached implementation" }
+        Err.UnknownNamespace { return "bind the module import to a name and use that name as the namespace" }
+        Err.UnsafeRequired { return "establish the operation’s safety preconditions and use an explicit `@unsafe` context" }
+        Err.PrivateField { return "use a public accessor or add `@pub` to the field declaration if external access is intended" }
+        Err.UnknownSymbol { return "declare the referenced symbol, correct its spelling, or qualify it through a named import" }
+        Err.ConstMutation { return "remove the mutation or change the binding declaration to allow mutation" }
+        Err.PureRequired { return "add `@pure` to the receiving binding or enclosing function" }
+        Err.RefOutlivesSource { return "extend the source lifetime or shorten the reference lifetime" }
+        Err.ReturnStackRef { return "return an owned value or a reference whose source outlives this call" }
+        Err.FreeWhileReferenced { return "finish using all references before freeing their source" }
+        Err.UseAfterMove { return "assign a fresh value before this use or explicitly copy the value before moving it" }
+        Err.UseOfUninitialized { return "initialize this binding on every path that reaches this use" }
+        Err.MoveWhilePinned { return "finish using the active reference before moving its source" }
+        Err.AlreadyPinned { return "finish using the existing reference or derive the new reference from it" }
+        Err.AssignWhilePinned { return "finish using the active reference before assigning to its source" }
+        Err.UseAfterScope { return "move the source declaration into an enclosing scope or shorten the reference lifetime" }
+    }
+    return "correct the highlighted source"
 }

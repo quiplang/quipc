@@ -1,0 +1,31 @@
+@pure @const {
+    make std = @import "std"
+}
+
+
+// issues are knwon compiler errors, instead of using Dagnostic system, use Issues
+// These issues exit the program immediately.
+@pub
+make type Issue {
+
+    @pub @this
+    make report (fmt: str, name: str) -> void {
+
+        make code: u8 = 27
+        @unsafe make ESC: char = code
+        make RED    = ESC.to_str() + "[31m"
+        make YELLOW = ESC.to_str() + "[33m"
+        make RESET  = ESC.to_str() + "[0m"
+
+
+        std::io::print(RED) // red color
+        std::io::println("issue reported [" + name + "]:")
+        std::io::print(RESET.copy()) // reset color
+
+        std::io::print("    " + YELLOW)
+        std::io::println(fmt)
+        std::io::print(RESET.copy()) // reset color
+
+        std::process::abort()
+    }
+}

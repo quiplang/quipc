@@ -19,6 +19,9 @@
     @pub @external make LLVMAddFunction (module: ptr<any>, name: ptr<char>, signature: ptr<any>) -> ptr<any>
     @pub @external make LLVMAppendBasicBlockInContext (context: ptr<any>, function: ptr<any>, name: ptr<char>) -> ptr<any>
     @pub @external make LLVMCreateBuilderInContext (context: ptr<any>) -> ptr<any>
+    @pub @external make LLVMGetFirstBasicBlock (function: ptr<any>) -> ptr<any>
+    @pub @external make LLVMGetFirstInstruction (block: ptr<any>) -> ptr<any>
+    @pub @external make LLVMPositionBuilderBefore (builder: ptr<any>, instruction: ptr<any>) -> void
     @pub @external make LLVMPositionBuilderAtEnd (builder: ptr<any>, block: ptr<any>) -> void
     @pub @external make LLVMBuildCall2 (builder: ptr<any>, signature: ptr<any>, callee: ptr<any>, args: ptr<ptr<any>>, count: u32, name: ptr<char>) -> ptr<any>
     @pub @external make LLVMBuildTrunc (builder: ptr<any>, value: ptr<any>, ty: ptr<any>, name: ptr<char>) -> ptr<any>
@@ -36,6 +39,14 @@
     @pub @external make LLVMBuildBinOp (builder: ptr<any>, opcode: i32, left: ptr<any>, right: ptr<any>, name: ptr<char>) -> ptr<any>
     @pub @external make LLVMBuildICmp (builder: ptr<any>, predicate: i32, left: ptr<any>, right: ptr<any>, name: ptr<char>) -> ptr<any>
     @pub @external make LLVMBuildZExt (builder: ptr<any>, value: ptr<any>, ty: ptr<any>, name: ptr<char>) -> ptr<any>
+    @pub @external make LLVMGetUndef (ty: ptr<any>) -> ptr<any>
+    @pub @external make LLVMBuildPhi (builder: ptr<any>, ty: ptr<any>, name: ptr<char>) -> ptr<any>
+    @pub @external make LLVMAddIncoming (phi: ptr<any>, values: ptr<ptr<any>>, blocks: ptr<ptr<any>>, count: u32) -> void
+    @pub @external make LLVMCountIncoming (phi: ptr<any>) -> u32
+    @pub @external make LLVMGetIncomingValue (phi: ptr<any>, index: u32) -> ptr<any>
+    @pub @external make LLVMReplaceAllUsesWith (value: ptr<any>, replacement: ptr<any>) -> void
+    @pub @external make LLVMInstructionEraseFromParent (value: ptr<any>) -> void
+    @pub @external make LLVMGetInsertBlock (builder: ptr<any>) -> ptr<any>
     @pub @external make LLVMBuildSelect (builder: ptr<any>, condition: ptr<any>, yes: ptr<any>, no: ptr<any>, name: ptr<char>) -> ptr<any>
     @pub @external make LLVMBuildBr (builder: ptr<any>, target: ptr<any>) -> ptr<any>
     @pub @external make LLVMBuildCondBr (builder: ptr<any>, cond: ptr<any>, yes: ptr<any>, no: ptr<any>) -> ptr<any>
@@ -52,6 +63,7 @@
     @pub @external make LLVMInt1TypeInContext (context: ptr<any>) -> ptr<any>
     @pub @external make LLVMInt16TypeInContext (context: ptr<any>) -> ptr<any>
     @pub @external make LLVMGetTypeKind (ty: ptr<any>) -> i32
+    @pub @external make LLVMGetIntTypeWidth (ty: ptr<any>) -> u32
     @pub @external make LLVMGetReturnType (signature: ptr<any>) -> ptr<any>
     @pub @external make LLVMCountParamTypes (signature: ptr<any>) -> u32
     @pub @external make LLVMBuildIntToPtr (builder: ptr<any>, value: ptr<any>, ty: ptr<any>, name: ptr<char>) -> ptr<any>

@@ -4,6 +4,9 @@
     make native = @import "native.quip"
     make floating = @import "floating.quip"
     make slots = @import "slots.quip"
+    make ssa = @import "ssa.quip"
+    make registers = @import "registers.quip"
+    make flow = @import "../mir/flow.quip"
     make structs = @import "structs.quip"
     make lexer = @import "../core/token.quip"
     make mir = @import "../mir/mir.quip"
@@ -40,6 +43,7 @@ make unsigned (ty: str) -> bool {
     return ty == "uint" || ty == "u8" || ty == "u16" || ty == "u32" || ty == "u64"
 }
 
+@pub
 make scalar_type (ty: str) -> bool {
     return native::raw_pointer(ty.copy()) || native::reference(ty.copy()) || ty == "char" || floating::is_float(ty.copy()) || ty == "bool" || ty == "int" || ty == "i8" || ty == "i16" || ty == "i32" || ty == "i64" || unsigned(ty)
 }
@@ -54,7 +58,10 @@ make add_payload_layout (layouts: ref<structs::Layout[]>, ty: str) {
     if ty.len() > 2 && ty[ty.len() - 2] == '[' && ty[ty.len() - 1] == ']' {
         make element: str = ""
         make i: uint = 0
-        while i + 2 < ty.len() { element.push(ty[i]) i++ }
+        while i + 2 < ty.len() {
+            element.push(ty[i])
+            i++
+        }
         if scalar_type(element.copy()) {
             layouts.*.push(structs::Layout { name = ty, size = 24, array_element = element })
         }
@@ -127,7 +134,10 @@ make layouts (m: ref<mir::MirModule>) -> structs::Layout[] {
             if structs::size(result.pin, ty.copy()) > 0 { continue }
             make payload: str = ""
             make i: uint = 1
-            while i < ty.len() { payload.push(ty[i]) i++ }
+            while i < ty.len() {
+                payload.push(ty[i])
+                i++
+            }
             if closure_type(payload.copy()) { continue }
             add_payload_layout(result.pin, payload.copy())
             make size = structs::size(result.pin, payload.copy())
@@ -257,11 +267,12 @@ make supports_operand (op: ref<mir::MirOperand>, body: ref<mir::MirBody>, layout
 /// The direct Quip ABI for functions whose parameters and result are words.
 @pub
 make supports_signature (f: ref<mir::MirFunc>, layouts: ref<structs::Layout[]>) -> bool {
-    if f.*.intrinsic_name.len() > 0 || f.*.is_external || f.*.is_variadic || (f.*.ret_ty == "char" || !value_type(layouts, f.*.ret_ty.copy())) { return false }
+    if f.*.intrinsic_name.len() > 0 || f.*.is_external || f.*.is_variadic || f.*.ret_ty == "char" { return false }
+    if f.*.ret_ty != "" && f.*.ret_ty != "void" && !value_type(layouts, f.*.ret_ty.copy()) { return false }
     if f.*.body.locals.len() <= f.*.body.param_count { return false }
     if closure_type(f.*.ret_ty.copy()) || f.*.ret_ty == "str" || f.*.ret_ty == "String" { return false }
     make result = f.*.body.locals[0].ty.copy()
-    if result != f.*.ret_ty && (structs::size(layouts, result) > 0 || structs::size(layouts, f.*.ret_ty.copy()) > 0) {
+    if result != f.*.ret_ty && result != "void" && f.*.ret_ty != "void" && (structs::size(layouts, result) > 0 || structs::size(layouts, f.*.ret_ty.copy()) > 0) {
         return false
     }
 
@@ -326,6 +337,22 @@ make supports_call (term: ref<mir::MirTerm>, caller: ref<mir::MirBody>, callee: 
         if structs::size(layouts, parameter.copy()) > 0 {
             if actual != parameter { return false }
         } elif structs::size(layouts, actual) > 0 { return false }
+        i++
+    }
+    return true
+}
+
+/// Imported Quip calls carry their ABI in the MIR terminator. Keep unknown
+/// layouts and ownership-bearing arguments on the general emitter.
+@pub
+make supports_imported_call (term: ref<mir::MirTerm>, body: ref<mir::MirBody>, layouts: ref<structs::Layout[]>) -> bool {
+    if term.*.ret_agg || term.*.has_receiver || term.*.variadic_fixed >= 0 { return false }
+    if term.*.ret_ty != "" && term.*.ret_ty != "void" && !scalar_type(term.*.ret_ty.copy()) { return false }
+    if term.*.args.len() != term.*.arg_tys.len() || term.*.args.len() != term.*.arg_aggs.len() { return false }
+    make i: uint = 0
+    while i < term.*.args.len() {
+        if term.*.arg_aggs[i] || !scalar_type(term.*.arg_tys[i].copy())
+            || !scalar_type(operand_type(term.*.args[i].pin, body, layouts)) { return false }
         i++
     }
     return true
@@ -473,6 +500,7 @@ make type Builder {
     make handle: ptr<any>
     make word: ptr<any>
     make zero: ptr<any>
+    make boolean: ptr<any>
     make byte: ptr<any>
     make context: ptr<any>
     make layouts: ref<structs::Layout[]>
@@ -486,30 +514,65 @@ make type Builder {
     make pointer: ptr<any>
     make float_ops: floating::Lowering
     make slots: ptr<any>[] = []
+    // Cache SSA values between memory writes within one basic block.
+    make dereference_values: ptr<any>[] = []
+    make dereference_pointers: ptr<any>[] = []
+    make dereference_epochs: uint[] = []
+    make values: ptr<any>[] = []
+    make value_epochs: uint[] = []
+    make pure_ssa: bool[] = []
+    make registers: registers::State = .{}
+    make continuations: bool[] = []
+    make current_block: uint = 0
+    make epoch: uint = 1
     make blocks: ptr<any>[] = []
+    make resolved_targets: uint[] = []
     make unnamed: str = ""
 
     @this @unsafe
     make load (local: uint) -> ptr<any> {
+        if this.pure_ssa[local] || this.value_epochs[local] == this.epoch {
+            make value = this.values[local]
+            if this.pure_ssa[local] { value = this.registers.values[local] }
+            if api::LLVMTypeOf(value) == this.boolean { return api::LLVMBuildZExt(this.handle, value, this.word, this.unnamed.data) }
+            return value
+        }
         make value = api::LLVMBuildLoad2(this.handle, this.word, this.slots[local], this.unnamed.data)
         api::LLVMSetAlignment(value, 8)
+        this.values[local] = value
+        this.value_epochs[local] = this.epoch
         return value
     }
 
     @this @unsafe
     make store (local: uint, value: ptr<any>) {
+        if this.pure_ssa[local] {
+            this.registers.write(local, value)
+            return
+        }
+        this.values[local] = value
+        this.value_epochs[local] = this.epoch
+        if api::LLVMTypeOf(value) == this.boolean { value = api::LLVMBuildZExt(this.handle, value, this.word, this.unnamed.data) }
+        // Slots may be recycled between locals. Invalidate aliases on every write.
+        this.epoch++
         make inst = api::LLVMBuildStore(this.handle, value, this.slots[local])
         api::LLVMSetAlignment(inst, 8)
     }
 
     @this @unsafe
     make address (place: ref<mir::MirPlace>, body: ref<mir::MirBody>) -> ptr<any> {
+        // Forming an address does not modify memory; stores and calls advance
+        // the epoch when that address is actually used to mutate storage.
         make address = this.slots[place.*.local]
         if place.*.projs.len() == 0 { return address }
 
         make ty = body.*.locals[place.*.local].ty.copy()
+        make projection_index: uint = 0
         for projection : place.*.projs {
-            if projection.kind != mir::MirProjKind.Field || native::raw_pointer(ty.copy()) || native::reference(ty.copy()) {
+            if projection_index == 0 && this.pure_ssa[place.*.local] && (native::raw_pointer(ty.copy()) || native::reference(ty.copy())) {
+                address = api::LLVMBuildIntToPtr(this.handle, this.load(place.*.local), this.pointer, this.unnamed.data)
+                ty = native::pointee(ty)
+            } elif projection.kind != mir::MirProjKind.Field || native::raw_pointer(ty.copy()) || native::reference(ty.copy()) {
                 make bits = api::LLVMBuildLoad2(this.handle, this.word, address, this.unnamed.data)
                 api::LLVMSetAlignment(bits, 8)
                 address = api::LLVMBuildIntToPtr(this.handle, bits, this.pointer, this.unnamed.data)
@@ -527,6 +590,7 @@ make type Builder {
                 @unsafe make indices: ptr<ptr<any>> = index.pin
                 address = api::LLVMBuildGEP2(this.handle, element, address, indices, 1, this.unnamed.data)
             }
+            projection_index++
         }
 
         return address
@@ -547,12 +611,25 @@ make type Builder {
     make operand (op: ref<mir::MirOperand>, body: ref<mir::MirBody>, ty: str) -> ptr<any> {
         if op.*.kind != mir::MirOperandKind.Const {
             make place = op.*.place.pin
+            if place.*.projs.len() == 0 && ty != "char" { return this.load(place.*.local) }
+            make cached = place.*.projs.len() == 1 && place.*.projs[0].kind == mir::MirProjKind.Deref && this.pure_ssa[place.*.local]
+            make pointer = this.zero
+            if cached {
+                pointer = this.load(place.*.local)
+                if this.dereference_epochs[place.*.local] == this.epoch && this.dereference_pointers[place.*.local] == pointer { return this.dereference_values[place.*.local] }
+            }
             make address = this.address(place, body)
             make stored = this.stored_type(place, body, ty.copy())
             make value = api::LLVMBuildLoad2(this.handle, stored, address, this.unnamed.data)
             if stored == this.word { api::LLVMSetAlignment(value, 8) }
             else { api::LLVMSetAlignment(value, 1) }
-            return this.native_ops.widen(value, stored, native::signed_narrow(ty))
+            make result = this.native_ops.widen(value, stored, native::signed_narrow(ty))
+            if cached {
+                this.dereference_values[place.*.local] = result
+                this.dereference_pointers[place.*.local] = pointer
+                this.dereference_epochs[place.*.local] = this.epoch
+            }
+            return result
         }
         if op.*.is_sizeof {
             make size = structs::size(this.layouts, op.*.name.copy())
@@ -580,6 +657,7 @@ make type Builder {
 
     @this @unsafe
     make copy_bytes (dest: ptr<any>, source: ptr<any>, size: uint) {
+        this.epoch++
         api::LLVMBuildMemMove(this.handle, dest, 1, source, 1, api::LLVMConstInt(this.word, size, 0))
     }
 
@@ -591,6 +669,7 @@ make type Builder {
         make count: u32 = 2
         if copying { args[1] = source count = 3 }
         @unsafe make first: ptr<ptr<any>> = args[0].pin
+        this.epoch++
         api::LLVMBuildCall2(this.handle, api::LLVMGlobalGetValueType(function), function, first, count, this.unnamed.data)
     }
 
@@ -645,6 +724,7 @@ make type Builder {
     @this @unsafe
     make construct_array (dest: ptr<any>, rv: ref<mir::MirRvalue>, body: ref<mir::MirBody>, element: str) {
         make zero = api::LLVMConstInt(this.byte, 0, 0)
+        this.epoch++
         api::LLVMBuildMemSet(this.handle, dest, zero, api::LLVMConstInt(this.word, 24, 0), 8)
         if rv.*.ops.len() == 0 { return }
 
@@ -655,7 +735,9 @@ make type Builder {
         @unsafe make first: ptr<ptr<any>> = args[0].pin
         for argument : rv.*.ops {
             make value = this.operand(argument.pin, body, element.copy())
+            this.epoch++
             api::LLVMSetAlignment(api::LLVMBuildStore(this.handle, value, this.scratch), 8)
+            this.epoch++
             api::LLVMBuildCall2(this.handle, signature, push, first, 3, this.unnamed.data)
         }
     }
@@ -670,8 +752,11 @@ make type Builder {
             if tag < result.*.variant_members.len() {
                 make value = this.operand(operand, body, actual)
                 make address = this.byte_offset(dest, 8)
+                this.epoch++
                 api::LLVMSetAlignment(api::LLVMBuildStore(this.handle, this.zero, dest), 8)
+                this.epoch++
                 api::LLVMSetAlignment(api::LLVMBuildStore(this.handle, api::LLVMConstInt(this.word, tag, 0), address), 8)
+                this.epoch++
                 api::LLVMSetAlignment(api::LLVMBuildStore(this.handle, value, this.byte_offset(address, 8)), 8)
                 return
             }
@@ -701,14 +786,17 @@ make type Builder {
         }
 
         this.drop(dest, layout.*.name.copy())
+        this.epoch++
         api::LLVMSetAlignment(api::LLVMBuildStore(this.handle, tag, dest), 8)
         make address = this.byte_offset(dest, 8)
         make size = layout.*.size - 8
         if aggregate {
             this.copy_bytes(address, this.scratch, size)
         } elif size > 8 {
+            this.epoch++
             api::LLVMBuildMemSet(this.handle, address, api::LLVMConstInt(this.byte, 0, 0), api::LLVMConstInt(this.word, size, 0), 8)
         } else {
+            this.epoch++
             api::LLVMSetAlignment(api::LLVMBuildStore(this.handle, payload, address), 8)
         }
     }
@@ -734,6 +822,7 @@ make type Builder {
     @this @unsafe
     make assign_string_result (dest: ptr<any>, rv: ref<mir::MirRvalue>, ty: str) {
         this.drop(dest, ty)
+        this.epoch++
         api::LLVMSetAlignment(api::LLVMBuildStore(this.handle, this.zero, dest), 8)
         make payload = this.byte_offset(dest, 8)
         make left = this.literal_header(rv.*.a.lit.lexeme.copy())
@@ -744,12 +833,15 @@ make type Builder {
 
         make right = this.literal_header(rv.*.b.lit.lexeme.copy())
         make tag = api::LLVMConstInt(api::LLVMInt32TypeInContext(this.context), 0, 0)
+        this.epoch++
         api::LLVMSetAlignment(api::LLVMBuildStore(this.handle, tag, this.string_variant), 4)
+        this.epoch++
         api::LLVMSetAlignment(api::LLVMBuildStore(this.handle, right, this.byte_offset(this.string_variant, 8)), 8)
         make name: str = "__quip_str_concat"
         make function = api::LLVMGetNamedFunction(this.module, name.data)
         make args: ptr<any>[3] = [payload, left, this.string_variant]
         @unsafe make first: ptr<ptr<any>> = args[0].pin
+        this.epoch++
         api::LLVMBuildCall2(this.handle, api::LLVMGlobalGetValueType(function), function, first, 3, this.unnamed.data)
     }
 
@@ -776,6 +868,7 @@ make type Builder {
             }
             if layout.*.fallible_payload.len() > 0 {
                 make payload_layout = structs::find(this.layouts, layout.*.fallible_payload.copy())
+                this.epoch++
                 api::LLVMSetAlignment(api::LLVMBuildStore(this.handle, this.zero, dest), 8)
                 this.construct_array(this.byte_offset(dest, 8), rv, body, this.layouts.*[payload_layout].array_element.copy())
                 return
@@ -785,7 +878,12 @@ make type Builder {
         if rv.*.kind == mir::MirRvalueKind.Aggregate && layout.*.fields.len() == 0 { return }
         this.drop(dest, layout.*.name.copy())
         make byte = api::LLVMConstInt(this.byte, 0, 0)
-        api::LLVMBuildMemSet(this.handle, dest, byte, api::LLVMConstInt(this.word, layout.*.size, 0), 1)
+        make complete = rv.*.ops.len() == layout.*.fields.len()
+        for field : layout.*.fields { if !scalar_type(field.ty.copy()) { complete = false } }
+        if !complete {
+            this.epoch++
+            api::LLVMBuildMemSet(this.handle, dest, byte, api::LLVMConstInt(this.word, layout.*.size, 0), 1)
+        }
         make i: uint = 0
         while i < rv.*.ops.len() {
             make field = aggregate_field(rv, layout, i)
@@ -797,6 +895,7 @@ make type Builder {
                 this.transfer(target, operand, body, this.layouts.*[field_layout].pin)
             } else {
                 make value = this.operand(operand, body, operand_type(operand, body, this.layouts))
+                this.epoch++
                 api::LLVMSetAlignment(api::LLVMBuildStore(this.handle, value, target), 8)
             }
             i++
@@ -805,8 +904,18 @@ make type Builder {
 
     @this @unsafe
     make compare (pred: i32, left: ptr<any>, right: ptr<any>) -> ptr<any> {
-        make result = api::LLVMBuildICmp(this.handle, pred, left, right, this.unnamed.data)
-        return api::LLVMBuildZExt(this.handle, result, this.word, this.unnamed.data)
+        return api::LLVMBuildICmp(this.handle, pred, left, right, this.unnamed.data)
+    }
+
+    @this @unsafe
+    make condition (operand: ref<mir::MirOperand>, body: ref<mir::MirBody>) -> ptr<any> {
+        if (operand.*.kind == mir::MirOperandKind.Copy || operand.*.kind == mir::MirOperandKind.Move)
+            && operand.*.place.projs.len() == 0 && this.pure_ssa[operand.*.place.local]
+            && api::LLVMTypeOf(this.registers.values[operand.*.place.local]) == this.boolean {
+            return this.registers.values[operand.*.place.local]
+        }
+        make value = this.operand(operand, body, operand_type(operand, body, this.layouts))
+        return api::LLVMBuildICmp(this.handle, NE, value, this.zero, this.unnamed.data)
     }
 
     @this @unsafe
@@ -817,6 +926,16 @@ make type Builder {
             return api::LLVMBuildPtrToInt(this.handle, this.address(rv.*.place.pin, body), this.word, this.unnamed.data)
         }
 
+        if destination == "bool" {
+            if rv.*.kind == mir::MirRvalueKind.Use { return this.condition(rv.*.a.pin, body) }
+            if rv.*.kind == mir::MirRvalueKind.Unary && rv.*.op == "!" {
+                return api::LLVMBuildBinOp(this.handle, Xor, this.condition(rv.*.a.pin, body), api::LLVMConstInt(this.boolean, 1, 0), this.unnamed.data)
+            }
+            if rv.*.kind == mir::MirRvalueKind.Binary && opcode(rv.*.op.copy(), false) != 0
+                && operand_type(rv.*.a.pin, body, this.layouts) == "bool" && operand_type(rv.*.b.pin, body, this.layouts) == "bool" {
+                return api::LLVMBuildBinOp(this.handle, opcode(rv.*.op.copy(), false), this.condition(rv.*.a.pin, body), this.condition(rv.*.b.pin, body), this.unnamed.data)
+            }
+        }
         make ty = operand_type(rv.*.a.pin, body, this.layouts)
         if rv.*.kind == mir::MirRvalueKind.Use && rv.*.a.kind == mir::MirOperandKind.Const
             && rv.*.a.lit.kind == lexer::TokenKind.LiteralNum && floating::is_float(destination.copy()) {
@@ -844,6 +963,7 @@ make type Builder {
             }
         }
         if floating::is_float(ty.copy()) || floating::is_float(right_type) {
+            if predicate(rv.*.op.copy(), false) != 0 { return this.float_ops.compare(rv.*.op.copy(), left, right, ty == "f32") }
             return this.float_ops.binary(rv.*.op.copy(), left, right, ty == "f32")
         }
         make use_unsigned = unsigned(ty)
@@ -862,17 +982,17 @@ make type Builder {
                     local++
                 }
                 if this.result_size > 0 {
-                    this.copy_bytes(this.result_address, this.slots[0], this.result_size)
+                    if this.result_address != this.slots[0] { this.copy_bytes(this.result_address, this.slots[0], this.result_size) }
                     api::LLVMBuildRetVoid(this.handle)
                 } else {
-                    api::LLVMBuildRet(this.handle, this.load(0))
+                    if body.*.locals[0].ty == "void" || body.*.locals[0].ty == "" { api::LLVMBuildRet(this.handle, this.zero) }
+                    else { api::LLVMBuildRet(this.handle, this.load(0)) }
                 }
             }
             mir::MirTermKind.Goto { api::LLVMBuildBr(this.handle, this.blocks[term.*.target]) }
             mir::MirTermKind.Branch {
                 make operand = term.*.cond.pin
-                make value = this.operand(operand, body, operand_type(operand, body, this.layouts))
-                make cond = api::LLVMBuildICmp(this.handle, NE, value, this.zero, this.unnamed.data)
+                make cond = this.condition(operand, body)
                 api::LLVMBuildCondBr(this.handle, cond, this.blocks[term.*.target], this.blocks[term.*.other])
             }
             mir::MirTermKind.Call {
@@ -901,8 +1021,9 @@ make type Builder {
                     this.drop(this.slots[term.*.dest.local], body.*.locals[term.*.dest.local].ty.copy())
                 }
                 if term.*.c_abi {
+                    this.epoch++
                     this.native_ops.call(callee, term, args.pin, this.slots[term.*.dest.local])
-                    api::LLVMBuildBr(this.handle, this.blocks[term.*.target])
+                    if !this.continuations[term.*.target] { api::LLVMBuildBr(this.handle, this.blocks[term.*.target]) }
                     return
                 }
 
@@ -912,14 +1033,16 @@ make type Builder {
                     arg_ptr = address
                 }
                 @unsafe make count: u32 = args.len()
+                this.epoch++
                 make result = api::LLVMBuildCall2(this.handle, api::LLVMGlobalGetValueType(callee), callee, arg_ptr, count, this.unnamed.data)
                 if !term.*.ret_agg { this.store(term.*.dest.local, result) }
-                api::LLVMBuildBr(this.handle, this.blocks[term.*.target])
+                if !this.continuations[term.*.target] { api::LLVMBuildBr(this.handle, this.blocks[term.*.target]) }
             }
             _ { api::LLVMBuildUnreachable(this.handle) }
         }
     }
 }
+
 
 /// Builds a function using the scalar lowering and its slot plan.
 @pub @unsafe
@@ -936,8 +1059,20 @@ make build (context: ptr<any>, module: ptr<any>, symbol: str, body: ref<mir::Mir
     }
     make builder = Builder {
         handle = handle, context = context, module = module, layouts = layouts, result_size = result_size, result_address = result_address, scratch = result_address, word = word, zero = api::LLVMConstInt(word, 0, 0),
-        byte = api::LLVMInt8TypeInContext(context), pointer = api::LLVMPointerTypeInContext(context, 0),
+        boolean = api::LLVMInt1TypeInContext(context), byte = api::LLVMInt8TypeInContext(context), pointer = api::LLVMPointerTypeInContext(context, 0),
         float_ops = floating::Lowering.create(context, handle), native_ops = native::Conversion.create(context, handle),
+    }
+    builder.pure_ssa = registers::plan(body)
+    make local_index: uint = 0
+    for local : body.*.locals {
+        if (local.ty != "void" && !scalar_type(local.ty.copy())) || local.ty == "char" { builder.pure_ssa[local_index] = false }
+
+        local_index++
+        builder.dereference_values.push(result_address)
+        builder.dereference_pointers.push(result_address)
+        builder.dereference_epochs.push(0)
+        builder.values.push(result_address)
+        builder.value_epochs.push(0)
     }
     make entry_name: str = "entry"
     make entry = api::LLVMAppendBasicBlockInContext(context, function, entry_name.data)
@@ -951,19 +1086,43 @@ make build (context: ptr<any>, module: ptr<any>, symbol: str, body: ref<mir::Mir
         argument_start++
     }
 
+    make direct_result = result_size > 0
+    make result_layout_index = structs::find(layouts, body.*.locals[0].ty.copy())
+    if result_layout_index >= layouts.*.len() { direct_result = false }
+    elif layouts.*[result_layout_index].managed || layouts.*[result_layout_index].fields.len() == 0 { direct_result = false }
+    make parameter: uint = 1
+    while parameter <= body.*.param_count {
+        make ty = body.*.locals[parameter].ty.copy()
+        if !scalar_type(ty.copy()) || native::raw_pointer(ty.copy()) || native::reference(ty) { direct_result = false }
+        parameter++
+    }
+    make mentioned = flow::mentioned(body)
     make physical: ptr<any>[] = []
     make sizes: uint[] = []
-    while sizes.len() < plan.*.next_slot { sizes.push(8) }
+    while sizes.len() < plan.*.next_slot { sizes.push(0) }
+    make captured: bool[] = []
+    while captured.len() < body.*.locals.len() { captured.push(false) }
+    for local : body.*.capture_locals { captured[local] = true }
     make i: uint = 0
     while i < body.*.locals.len() {
-        make size = structs::size(layouts, body.*.locals[i].ty.copy())
-        make slot = plan.*.locals[i]
-        if size > sizes[slot] { sizes[slot] = size }
+        // Managed values get cleanup-aware storage below, and captures live in
+        // the environment. Neither needs an additional physical stack slot.
+        if mentioned[i] && !(i == 0 && direct_result) && !builder.pure_ssa[i] && !captured[i] && !managed(layouts, body.*.locals[i].ty.copy()) {
+            make size = structs::size(layouts, body.*.locals[i].ty.copy())
+            if size < 8 { size = 8 }
+            make slot = plan.*.locals[i]
+            if size > sizes[slot] { sizes[slot] = size }
+        }
         i++
     }
 
     i = 0
     while i < plan.*.next_slot {
+        if sizes[i] == 0 {
+            physical.push(result_address)
+            i++
+            continue
+        }
         make name = "slot" + i.to_str()
         make ty = word
         if sizes[i] > 8 { ty = api::LLVMArrayType2(builder.byte, sizes[i]) }
@@ -985,7 +1144,8 @@ make build (context: ptr<any>, module: ptr<any>, symbol: str, body: ref<mir::Mir
         if layout < layouts.*.len() && layouts.*[layout].array_element.len() > 0 && scratch_size < 8 {
             scratch_size = 8
         }
-        if managed(layouts, ty.copy()) {
+        if i == 0 && direct_result { builder.slots.push(result_address) }
+        elif managed(layouts, ty.copy()) {
             make size = structs::size(layouts, ty)
             if size > scratch_size { scratch_size = size }
             make slot = api::LLVMBuildAlloca(handle, api::LLVMArrayType2(builder.byte, size), builder.unnamed.data)
@@ -1046,6 +1206,28 @@ make build (context: ptr<any>, module: ptr<any>, symbol: str, body: ref<mir::Mir
         } else { builder.argument_slots.push(result_address) }
     }
 
+    make groups = registers::groups(body)
+    for root : groups.iter() {
+        builder.resolved_targets.push(builder.resolved_targets.len())
+        builder.continuations.push(root != builder.continuations.len())
+    }
+    make merged_entry = ssa::entry_is_first(body)
+    i = 0
+    while i < body.*.terms.len() {
+        if i == 0 && merged_entry { builder.blocks.push(entry) }
+        elif builder.continuations[i] { builder.blocks.push(builder.blocks[groups[i]]) }
+        elif builder.resolved_targets[i] == i {
+            make name = "bb" + i.to_str()
+            builder.blocks.push(api::LLVMAppendBasicBlockInContext(context, function, name.data))
+        } else { builder.blocks.push(entry) }
+        i++
+    }
+    i = 0
+    while i < builder.blocks.len() {
+        builder.blocks[i] = builder.blocks[builder.resolved_targets[i]]
+        i++
+    }
+    builder.registers = registers::create(body, context, handle, builder.pure_ssa.pin, builder.blocks.pin, builder.continuations.pin)
     i = 0
     while i < body.*.param_count {
         @unsafe make index: u32 = i + argument_start
@@ -1056,51 +1238,74 @@ make build (context: ptr<any>, module: ptr<any>, symbol: str, body: ref<mir::Mir
         i++
     }
 
+    if !merged_entry { api::LLVMBuildBr(handle, builder.blocks[0]) }
+
+    // Keep statements and terminators together so cached values never cross blocks.
+    make heads: uint[] = []
+    make next: uint[] = []
+    make end = body.*.stmts.len()
+    while heads.len() < body.*.terms.len() { heads.push(end) }
+    while next.len() < end { next.push(end) }
+    i = end
+    while i > 0 {
+        i--
+        make block = body.*.stmts[i].block
+        next[i] = heads[block]
+        heads[block] = i
+    }
     i = 0
     while i < body.*.terms.len() {
-        make name = "bb" + i.to_str()
-        builder.blocks.push(api::LLVMAppendBasicBlockInContext(context, function, name.data))
-        i++
-    }
-    api::LLVMBuildBr(handle, builder.blocks[0])
-
-    // Statements are already in MIR order within each block. LLVM tracks
-    // insertion position separately from the order in which blocks were created.
-    for stmt : body.*.stmts {
-        if stmt.kind == mir::MirStmtKind.StorageDead && stmt.local < body.*.locals.len() {
-            api::LLVMPositionBuilderAtEnd(handle, builder.blocks[stmt.block])
-            builder.drop(builder.slots[stmt.local], body.*.locals[stmt.local].ty.copy())
+        if builder.resolved_targets[i] != i {
+            i++
+            continue
         }
-
-        if stmt.kind == mir::MirStmtKind.Assign {
-            api::LLVMPositionBuilderAtEnd(handle, builder.blocks[stmt.block])
-            make place = stmt.place.pin
-            make ty = place_type(place, body, layouts)
-            make address = builder.address(place, body)
-            make aggregate = structs::find(layouts, ty.copy())
-
-            if aggregate < layouts.*.len() {
-                builder.assign_aggregate(address, stmt.rvalue.pin, body, aggregate)
-                continue
-            }
-
-            make value = builder.rvalue(stmt.rvalue.pin, body, ty.copy())
-            make stored = builder.stored_type(place, body, ty)
-
-            if stored == word || (place.*.projs.len() == 0 && stmt.rvalue.op == "__zero") {
-                api::LLVMSetAlignment(api::LLVMBuildStore(handle, value, address), 8)
-            } else {
-                make narrowed = builder.native_ops.narrow(value, stored)
-                api::LLVMSetAlignment(api::LLVMBuildStore(handle, narrowed, address), 1)
-            }
-        }
-    }
-
-    i = 0
-    while i < body.*.terms.len() {
+        builder.epoch++
+        builder.current_block = i
+        builder.registers.begin(i, builder.continuations[i])
         api::LLVMPositionBuilderAtEnd(handle, builder.blocks[i])
+        make statement = heads[i]
+        while statement < body.*.stmts.len() {
+            make stmt = body.*.stmts[statement].pin
+            statement = next[statement]
+            if stmt.*.kind == mir::MirStmtKind.StorageDead && stmt.*.local < body.*.locals.len() {
+                api::LLVMPositionBuilderAtEnd(handle, builder.blocks[stmt.*.block])
+                builder.drop(builder.slots[stmt.*.local], body.*.locals[stmt.*.local].ty.copy())
+            }
+
+            if stmt.*.kind == mir::MirStmtKind.Assign {
+                api::LLVMPositionBuilderAtEnd(handle, builder.blocks[stmt.*.block])
+                make place = stmt.*.place.pin
+                make ty = place_type(place, body, layouts)
+                make aggregate = structs::find(layouts, ty.copy())
+
+                if aggregate < layouts.*.len() {
+                    make address = builder.address(place, body)
+                    builder.assign_aggregate(address, stmt.*.rvalue.pin, body, aggregate)
+                    continue
+                }
+
+                make value = builder.rvalue(stmt.*.rvalue.pin, body, ty.copy())
+                make stored = builder.stored_type(place, body, ty)
+                if place.*.projs.len() == 0 && stored == word {
+                    builder.store(place.*.local, value)
+                    continue
+                }
+                if api::LLVMTypeOf(value) == builder.boolean { value = api::LLVMBuildZExt(handle, value, word, builder.unnamed.data) }
+                make address = builder.address(place, body)
+                builder.epoch++
+
+                if stored == word || (place.*.projs.len() == 0 && stmt.*.rvalue.op == "__zero") {
+                    api::LLVMSetAlignment(api::LLVMBuildStore(handle, value, address), 8)
+                } else {
+                    make narrowed = builder.native_ops.narrow(value, stored)
+                    api::LLVMSetAlignment(api::LLVMBuildStore(handle, narrowed, address), 1)
+                }
+            }
+        }
         builder.terminator(body.*.terms[i].pin, body, module, calls.*[i].pin)
+        builder.registers.end(i)
         i++
     }
+    builder.registers.finish()
     api::LLVMDisposeBuilder(handle)
 }

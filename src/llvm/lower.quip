@@ -14,6 +14,9 @@
     make adapters = @import "adapters.quip"
     make scalar = @import "scalar.quip"
     make slots = @import "slots.quip"
+    make ssa = @import "ssa.quip"
+    make registers = @import "registers.quip"
+    make flow = @import "../mir/flow.quip"
     make layouts = @import "structs.quip"
     make lexer = @import "../core/token.quip"
     make mangle = @import "../semantics/symbol/mangle.quip"
@@ -50,7 +53,7 @@ make build (context: ptr<any>, module: ptr<any>, m: ref<mir::MirModule>, module_
             m.*.funcs[function.index].is_lambda, function.slots.pin, function.calls.pin, e.builder_layouts.pin)
     }
     descriptors::build(context, module, e.descriptors.pin)
-    strings::build(context, module)
+    if e.needs_string_equal { strings::build(context, module) }
     globals::build(context, module, e.global_plans.pin)
     if !adapters::build(context, module, e.adapters.pin, m) { return false }
     return entry::build(context, module, e.entry_plan.pin)
@@ -81,6 +84,9 @@ make type Emitter {
     // definition-name -> emitted-symbol maps for the functions defined in this module
     make local_src: str[] = []
     make local_sym: str[] = []
+    // Open-addressed table of source-name indices (one based) and maximum return sizes.
+    make return_names: uint[] = []
+    make return_sizes: uint[] = []
 
     // struct layouts carried through by the MIR builder, and the functions in this module (used to
     // resolve call signatures for aggregate argument/return conventions)
@@ -92,6 +98,14 @@ make type Emitter {
     make builder_layouts: layouts::Layout[] = []
     make managed_names: str[] = []
     make managed_flags: bool[] = []
+    make size_names: str[] = []
+    make size_values: uint[] = []
+    make agg_names: str[] = []
+    make agg_values: bool[] = []
+    make lookup_names: str[] = []
+    make lookup_indices: uint[] = []
+    make struct_names: str[] = []
+    make struct_indices: uint[] = []
     make environment_names: str[] = []
     make capture_indices: uint[] = []
 
@@ -102,14 +116,27 @@ make type Emitter {
     make captures: ptr<any>[] = []
     make owners: ptr<any>[] = []
     make blocks: ptr<any>[] = []
+    make needs_string_equal: bool = false
+    make resolved_targets: uint[] = []
+    make ssa_locals: bool[] = []
+    make registers: registers::State = .{}
+    make continuations: bool[] = []
+    make emitting_block: uint = 0
+    make memory_epoch: uint = 1
+    make read_values: ptr<any>[] = []
+    make read_pointers: ptr<any>[] = []
+    make read_epochs: uint[] = []
     make string_result: ptr<any>
     make raw_store: ptr<any>
     make return_buffer: ptr<any>
     make function: ptr<any>
     make local_cleanup: drops::Local[] = []
+    make cleanup_plan: drops::Plan = .{}
+    make cleanup_active: bool[] = []
     make move_temps: bool[] = []
     make cur_ret_ty: str = ""
     make cur_sret: bool = false
+    make direct_result: bool = false
     make platform: str = "macos"
     make mem_report: ref<memr::MemReport>
 
@@ -149,6 +176,7 @@ make type Emitter {
         @unsafe make first: ptr<ptr<any>> = 0
         if arguments.len() > 0 { @unsafe first = arguments[0].pin }
         @unsafe make count: u32 = arguments.len()
+        this.memory_epoch++
         return api::LLVMBuildCall2(this.builder, signature, callee, first, count, this.unnamed.data)
     }
 
@@ -165,9 +193,36 @@ make type Emitter {
 
     @this @unsafe
     make allocate (size: uint) -> ptr<any> {
-        make address = api::LLVMBuildArrayAlloca(this.builder, this.byte, this.word_value(size), this.unnamed.data)
-        api::LLVMSetAlignment(address, 8)
-        return address
+        return this.entry_scratch(size)
+    }
+
+    // Scratch storage is requested lazily but always inserted in entry, so
+    // repeated string assignments and raw stores in loops cannot grow the stack.
+    @this @unsafe
+    make entry_scratch (size: uint) -> ptr<any> {
+        make builder = api::LLVMCreateBuilderInContext(this.context)
+        make entry = api::LLVMGetFirstBasicBlock(this.function)
+        make first = api::LLVMGetFirstInstruction(entry)
+        if first == this.null { api::LLVMPositionBuilderAtEnd(builder, entry) }
+        else { api::LLVMPositionBuilderBefore(builder, first) }
+        make ty = this.word
+        if size > 8 { ty = api::LLVMArrayType2(this.byte, size) }
+        make slot = api::LLVMBuildAlloca(builder, ty, this.unnamed.data)
+        api::LLVMSetAlignment(slot, 8)
+        api::LLVMDisposeBuilder(builder)
+        return slot
+    }
+
+    @this @unsafe
+    make string_scratch () -> ptr<any> {
+        if this.string_result == this.null { this.string_result = this.entry_scratch(24) }
+        return this.string_result
+    }
+
+    @this @unsafe
+    make raw_scratch () -> ptr<any> {
+        if this.raw_store == this.null { this.raw_store = this.entry_scratch(8) }
+        return this.raw_store
     }
 
     @this @unsafe
@@ -179,11 +234,13 @@ make type Emitter {
 
     @this @unsafe
     make store (value: ptr<any>, address: ptr<any>, alignment: u32) {
+        this.memory_epoch++
         api::LLVMSetAlignment(api::LLVMBuildStore(this.builder, value, address), alignment)
     }
 
     @this @unsafe
     make go_to (target: uint) {
+        if this.emitting_block < this.continuations.len() && this.continuations[target] { return }
         api::LLVMBuildBr(this.builder, this.blocks[target])
     }
 
@@ -299,6 +356,7 @@ make type Emitter {
     @this @unsafe
     make zero_value (addr: ptr<any>, ty: str) {
         if this.is_agg(ty.copy()) {
+            this.memory_epoch++
             api::LLVMBuildMemSet(this.builder, addr, api::LLVMConstInt(this.byte, 0, 0),
                 this.word_value(this.size_of(ty)), 1)
         } else {
@@ -518,14 +576,23 @@ make type Emitter {
     /// finds a structure by name, returning the structure count when absent.
     @this
     make struct_index (name: str) -> uint {
+        make ci: uint = 0
+        while ci < this.struct_names.len() {
+            if this.struct_names[ci] == name { return this.struct_indices[ci] }
+            ci++
+        }
         make i = 0
-
         while i < this.structs.len() {
-            if this.structs[i].*.name == name { return i }
+            if this.structs[i].*.name == name {
+                this.struct_names.push(name.copy())
+                this.struct_indices.push(i)
+                return i
+            }
 
             i = i + 1
         }
-
+        this.struct_names.push(name.copy())
+        this.struct_indices.push(i)
         return i
     }
 
@@ -903,7 +970,10 @@ make type Emitter {
     make closure_value (rv: ref<mir::MirRvalue>) -> ptr<any> {
         make index = this.lookup_func(this.symbol_of(rv.*.name.copy()))
 
-        if index >= this.fns.len() { this.trap() return this.word_value(0) }
+        if index >= this.fns.len() {
+            this.trap()
+            return this.word_value(0)
+        }
 
         make f = this.fns[index]
         make layout = this.capture_layout(f)
@@ -982,6 +1052,20 @@ make type Emitter {
 
     @this
     make is_agg (ty: str) -> bool {
+        make ci = 0
+        while ci < this.agg_names.len() {
+            if this.agg_names[ci] == ty { return this.agg_values[ci] }
+            ci++
+        }
+
+        make result = this.is_agg_impl(ty.copy())
+        this.agg_names.push(ty)
+        this.agg_values.push(result)
+        return result
+    }
+
+    @this
+    make is_agg_impl (ty: str) -> bool {
         if this.is_fallible(ty.copy()) { return true }
 
         make t = this.strip_bang(ty)
@@ -1004,6 +1088,20 @@ make type Emitter {
     /// returns the backend storage size for a rendered type.
     @this
     make size_of (ty: str) -> uint {
+        make ci = 0
+        while ci < this.size_names.len() {
+            if this.size_names[ci] == ty { return this.size_values[ci] }
+            ci++
+        }
+
+        make result = this.size_of_impl(ty.copy())
+        this.size_names.push(ty)
+        this.size_values.push(result)
+        return result
+    }
+
+    @this
+    make size_of_impl (ty: str) -> uint {
         if this.is_fallible(ty.copy()) { return 8 + this.size_of(this.strip_bang(ty)) }
 
         make t = this.strip_bang(ty)
@@ -1226,11 +1324,17 @@ make type Emitter {
     @this @unsafe
     make place_addr (p: ref<mir::MirPlace>) -> ptr<any> {
         make cur = this.local_slot(p.*.local)
-
-        if cur == this.null { return this.null }
-
         make ty = this.local_ty(p.*.local)
-        make i = 0
+        make i: uint = 0
+        if this.ssa_locals[p.*.local] && p.*.projs.len() > 0 && this.is_indirect(ty.copy()) {
+            cur = this.inttoptr(this.read_local_word(p.*.local))
+            if p.*.projs[0].kind == mir::MirProjKind.Deref {
+                ty = this.pointee(ty)
+                i = 1
+            }
+            elif p.*.projs[0].kind == mir::MirProjKind.Field || !native::raw_pointer(ty.copy()) { ty = this.pointee(ty) }
+        }
+        if cur == this.null { return this.null }
 
         while i < p.*.projs.len() {
             make pr = p.*.projs[i].pin
@@ -1277,7 +1381,12 @@ make type Emitter {
                     make esz: uint = 1
                     make raw_ptr = false
 
-                    while this.is_indirect(ty !) {
+                    if i == 0 && this.ssa_locals[p.*.local] && native::raw_pointer(ty.copy()) {
+                        base = cur
+                        esz = this.c_element_size(this.pointee(ty.copy()))
+                        raw_ptr = true
+                    }
+                    while !raw_ptr && this.is_indirect(ty !) {
                         make lt = this.first_at(ty !, '<')
                         make prefix = this.slice(ty !, 0, lt)
                         make v = this.load_i64(cur)
@@ -1306,7 +1415,7 @@ make type Emitter {
                         }
                     }
 
-                    make idx = this.load_i64(this.local_slot(pr.*.index))
+                    make idx = this.read_local_word(pr.*.index)
                     make scaled = this.gen_binop("*", idx, this.word_value(esz), false)
                     cur = this.gep_dyn(base, scaled)
                     ty = this.pointee(ty)
@@ -1379,21 +1488,48 @@ make type Emitter {
     /// emits an llvm memmove for the supplied addresses and byte count.
     @this @unsafe
     make memcpy (dst: ptr<any>, src: ptr<any>, n: uint) {
+        this.memory_epoch++
         api::LLVMBuildMemMove(this.builder, dst, 1, src, 1, this.word_value(n))
     }
 
     // index of the function whose emitted symbol is `sym`, or `this.fns.len()` when not found
     @this
     make lookup_func (sym: str) -> uint {
+        make ci = 0
+        while ci < this.lookup_names.len() {
+            if this.lookup_names[ci] == sym { return this.lookup_indices[ci] }
+            ci++
+        }
         make i = 0
-
         while i < this.fns.len() {
-            if this.emit_symbol(this.fns[i]) == sym { return i }
+            if this.local_sym[i] == sym {
+                this.lookup_names.push(sym.copy())
+                this.lookup_indices.push(i)
+                return i
+            }
 
             i = i + 1
         }
+        this.lookup_names.push(sym.copy())
+        this.lookup_indices.push(i)
 
         return i
+    }
+
+    @this
+    make return_bucket (name: str) -> uint {
+        make hash: uint = 0
+        for c : name.iter() {
+            @unsafe make byte: uint = c
+            hash = hash * 31 + byte
+        }
+        make mask = this.return_names.len() - 1
+        make bucket = hash & mask
+        while this.return_names[bucket] != 0 {
+            if this.local_src[this.return_names[bucket] - 1] == name { break }
+            bucket = (bucket + 1) & mask
+        }
+        return bucket
     }
 
     // module
@@ -1419,7 +1555,6 @@ make type Emitter {
         this.declare_native("__quip_str_add_char", this.void_type, [this.pointer, this.pointer, this.byte])
         this.declare("memcmp", this.c_int, [this.pointer, this.pointer, this.word], false)
         this.declared.push("memcmp")
-        this.declare("__quip_string_equal", this.word, [this.pointer, this.pointer], false)
 
         make i: uint = 0
 
@@ -1444,6 +1579,22 @@ make type Emitter {
         while i < m.*.structs.len() {
             this.structs.push(m.*.structs[i].pin)
             i = i + 1
+        }
+
+        // Build after registering all structs so aggregate sizes are available.
+        make capacity: uint = 1
+        while capacity < this.fns.len() * 2 { capacity = capacity * 2 }
+        while this.return_names.len() < capacity {
+            this.return_names.push(0)
+            this.return_sizes.push(0)
+        }
+        i = 0
+        while i < this.fns.len() {
+            make bucket = this.return_bucket(this.local_src[i] !)
+            make required = this.size_of(this.fns[i].*.ret_ty.copy())
+            this.return_names[bucket] = i + 1
+            if required > this.return_sizes[bucket] { this.return_sizes[bucket] = required }
+            i++
         }
 
         this.builder_layouts = scalar::layouts(m)
@@ -1593,7 +1744,11 @@ make type Emitter {
             }
             make symbol = this.symbol_of(term.func.name.copy())
             make callee = this.lookup_func(symbol.copy())
-            if callee >= this.fns.len() { return false }
+            if callee >= this.fns.len() {
+                if !scalar::supports_imported_call(term.pin, f.*.body.pin, this.builder_layouts.pin) { return false }
+                calls.push(symbol)
+                continue
+            }
             if !scalar::supports_call(term.pin, f.*.body.pin, this.fns[callee], this.builder_layouts.pin) { return false }
             make target = this.fns[callee]
             make result_type = target.*.ret_ty.copy()
@@ -1790,17 +1945,44 @@ make type Emitter {
         this.cur_ret_ty = (f.*.ret_ty !).copy()
         this.cur_sret = sret
 
+        this.direct_result = sret
+        make result_layout = layouts::find(this.builder_layouts.pin, this.cur_ret_ty.copy())
+        if result_layout >= this.builder_layouts.len() { this.direct_result = false }
+        elif this.builder_layouts[result_layout].managed || this.builder_layouts[result_layout].fields.len() == 0 { this.direct_result = false }
+        make parameter_local: uint = 1
+        while parameter_local <= f.*.body.param_count {
+            make ty = this.local_ty(parameter_local)
+            if !scalar::scalar_type(ty.copy()) || this.is_indirect(ty) { this.direct_result = false }
+            parameter_local++
+        }
         make function = this.named(name)
         this.function = function
-        api::LLVMPositionBuilderAtEnd(this.builder, this.block(function, "entry"))
+        make entry = this.block(function, "entry")
+        api::LLVMPositionBuilderAtEnd(this.builder, entry)
+        make merged_entry = ssa::entry_is_first(f.*.body.pin)
+        this.resolved_targets = []
+        this.continuations = []
+        make groups = registers::groups(f.*.body.pin)
+        for root : groups.iter() {
+            this.resolved_targets.push(this.resolved_targets.len())
+            this.continuations.push(root != this.continuations.len())
+        }
 
         this.blocks = []
         make block_index: uint = 0
         while block_index < f.*.body.terms.len() {
-            this.blocks.push(this.block(function, "bb" + block_index.to_str()))
+            if block_index == 0 && merged_entry { this.blocks.push(entry) }
+            elif this.continuations[block_index] { this.blocks.push(this.blocks[groups[block_index]]) }
+            elif this.resolved_targets[block_index] == block_index { this.blocks.push(this.block(function, "bb" + block_index.to_str())) }
+            else { this.blocks.push(entry) }
             block_index++
         }
 
+        block_index = 0
+        while block_index < this.blocks.len() {
+            this.blocks[block_index] = this.blocks[this.resolved_targets[block_index]]
+            block_index++
+        }
         this.owners = []
         this.captures = []
         make li: uint = 0
@@ -1825,6 +2007,46 @@ make type Emitter {
             }
         }
 
+        this.memory_epoch = 1
+        this.read_values = []
+        this.read_pointers = []
+        this.read_epochs = []
+        for local : f.*.body.locals {
+            _ = local
+            this.read_values.push(this.null)
+            this.read_pointers.push(this.null)
+            this.read_epochs.push(0)
+        }
+        this.ssa_locals = registers::plan(f.*.body.pin)
+        make scalar_index: uint = 0
+        for ty : this.local_tys {
+            if !scalar::scalar_type(ty.copy()) || ty == "char" { this.ssa_locals[scalar_index] = false }
+            scalar_index++
+        }
+        for statement : f.*.body.stmts {
+            if statement.kind == mir::MirStmtKind.Assign && statement.rvalue.kind == mir::MirRvalueKind.OptionalPayload {
+                this.ssa_locals[statement.place.local] = false
+            }
+        }
+        // General call emission handles ABI conversion and writes to addresses.
+        for term : f.*.body.terms {
+            if term.kind == mir::MirTermKind.Call {
+                this.ssa_locals[term.dest.local] = false
+                // Attached receivers can be implicitly borrowed by address.
+                if term.has_receiver && term.args.len() > 0
+                    && (term.args[0].kind == mir::MirOperandKind.Copy || term.args[0].kind == mir::MirOperandKind.Move) {
+                    this.ssa_locals[term.args[0].place.local] = false
+                }
+            }
+        }
+
+        this.cleanup_plan = drops::plan(f.*.body.pin)
+        this.cleanup_active = []
+        for local : f.*.body.locals {
+            _ = local
+            this.cleanup_active.push(false)
+        }
+        this.registers = registers::create(f.*.body.pin, this.context, this.builder, this.ssa_locals.pin, this.blocks.pin, this.continuations.pin)
         make plan = slots::plan(f.*.body.locals.len(), this.mem_report, report_index)
         make next_unplanned_slot = plan.next_slot
         this.local_slots = plan.locals
@@ -1841,7 +2063,9 @@ make type Emitter {
             if ty == "str" || ty == "String" { cleanup.kind = drops::Kind.String }
             elif this.has_closure(ty.copy()) { cleanup.kind = drops::Kind.Descriptor }
 
-            if cleanup.kind != drops::Kind.None {
+            if cleanup.in_environment {
+                this.local_slots[li] = 0
+            } elif cleanup.kind != drops::Kind.None {
                 this.local_slots[li] = next_unplanned_slot
                 next_unplanned_slot++
             }
@@ -1863,17 +2087,20 @@ make type Emitter {
         li = 0
 
         while li <= max_slot {
-            slot_sizes.push(8)
+            slot_sizes.push(0)
             li = li + 1
         }
 
+        make mentioned = flow::mentioned(f.*.body.pin)
         li = 0
 
         while li < f.*.body.locals.len() {
-            make sid = this.local_slots[li]
-            make sz = this.size_of(this.local_ty(li))
+            if (mentioned[li] || this.local_cleanup[li].kind != drops::Kind.None) && !(li == 0 && this.direct_result) && !this.is_capture(li) && !this.ssa_locals[li] {
+                make sid = this.local_slots[li]
+                make sz = this.size_of(this.local_ty(li))
 
-            if sz > slot_sizes[sid] { slot_sizes[sid] = sz }
+                if sz > slot_sizes[sid] { slot_sizes[sid] = sz }
+            }
 
             li = li + 1
         }
@@ -1886,30 +2113,24 @@ make type Emitter {
         while call_idx < f.*.body.terms.len() {
             make call = f.*.body.terms[call_idx].pin
 
-            if call.*.kind == mir::MirTermKind.Call && call.*.dest.projs.len() == 0 {
-                make callee_idx: uint = 0
-
-                while callee_idx < this.fns.len() {
-                    if this.fns[callee_idx].*.name == call.*.name {
-                        make sid = this.local_slots[call.*.dest.local]
-                        make required = this.size_of(this.fns[callee_idx].*.ret_ty.copy())
-
-                        if required > slot_sizes[sid] { slot_sizes[sid] = required }
-                    }
-
-                    callee_idx = callee_idx + 1
-                }
+            if call.*.kind == mir::MirTermKind.Call && call.*.dest.projs.len() == 0
+                && !this.is_capture(call.*.dest.local) {
+                make required = this.return_sizes[this.return_bucket(call.*.name !)]
+                make sid = this.local_slots[call.*.dest.local]
+                if required > slot_sizes[sid] { slot_sizes[sid] = required }
             }
 
             call_idx = call_idx + 1
         }
 
         this.storage = []
-        for size : slot_sizes { this.storage.push(this.allocate(size)) }
+        for size : slot_sizes {
+            if size > 0 { this.storage.push(this.allocate(size)) }
+            else { this.storage.push(this.null) }
+        }
 
-        this.string_result = this.allocate(24)
-        // Reuse conversion storage in raw byte-copy loops.
-        this.raw_store = this.allocate(8)
+        this.string_result = this.null
+        this.raw_store = this.null
         li = 0
 
         while li < this.local_cleanup.len() {
@@ -1933,7 +2154,8 @@ make type Emitter {
                 make slot = this.local_slot(pi)
                 make argument = api::LLVMGetParam(function, parameter)
 
-                if this.is_agg(this.local_ty(pi)) {
+                if this.ssa_locals[pi] { this.registers.write(pi, argument) }
+                elif this.is_agg(this.local_ty(pi)) {
                     this.memcpy(slot, argument, this.size_of(this.local_ty(pi)))
                 } else {
                     this.store_i64(argument, slot)
@@ -1948,28 +2170,52 @@ make type Emitter {
             this.zero_value(this.local_slot(0), this.cur_ret_ty.copy())
         }
 
-        this.go_to(0)
+        if !merged_entry { api::LLVMBuildBr(this.builder, this.blocks[0]) }
+
+        // Link statements backwards so each block retains its original MIR order.
+        make end = f.*.body.stmts.len()
+        make first_stmt: uint[] = []
+        make next_stmt: uint[] = []
+        while first_stmt.len() < f.*.body.terms.len() { first_stmt.push(end) }
+        while next_stmt.len() < end { next_stmt.push(end) }
+        make index = end
+        while index > 0 {
+            index--
+            make block = f.*.body.stmts[index].block
+            if block < first_stmt.len() {
+                next_stmt[index] = first_stmt[block]
+                first_stmt[block] = index
+            }
+        }
 
         make b: uint = 0
-
         while b < f.*.body.terms.len() {
+            if this.resolved_targets[b] != b {
+                b++
+                continue
+            }
+            this.emitting_block = b
+            this.memory_epoch++
+            this.registers.begin(b, this.continuations[b])
+            make cleanup_index: uint = 0
+            while cleanup_index < this.cleanup_active.len() {
+                this.cleanup_active[cleanup_index] = flow::bit(this.cleanup_plan.inputs.pin, b * this.cleanup_plan.words, cleanup_index)
+                cleanup_index++
+            }
             api::LLVMPositionBuilderAtEnd(this.builder, this.blocks[b])
-
-            make si: uint = 0
-
-            while si < f.*.body.stmts.len() {
-                make stmt = f.*.body.stmts[si].pin
-
-                if stmt.*.block == b {
-                    this.gen_stmt(stmt)
-                }
-
-                si = si + 1
+            make si = first_stmt[b]
+            while si < end {
+                this.gen_stmt(f.*.body.stmts[si].pin)
+                if f.*.body.stmts[si].kind == mir::MirStmtKind.Assign { this.cleanup_active[f.*.body.stmts[si].place.local] = true }
+                si = next_stmt[si]
             }
 
             this.gen_term(f.*.body.terms[b].pin)
+            if f.*.body.terms[b].kind == mir::MirTermKind.Call { this.cleanup_active[f.*.body.terms[b].dest.local] = true }
+            this.registers.end(b)
             b = b + 1
         }
+        this.registers.finish()
     }
 
     @this
@@ -2033,6 +2279,38 @@ make type Emitter {
         }
 
         if stmt.*.kind == mir::MirStmtKind.Assign {
+            if stmt.*.place.projs.len() == 0 && this.ssa_locals[stmt.*.place.local] {
+                make rv = stmt.*.rvalue.pin
+                make value: ptr<any> = this.null
+                make dest_ty = this.local_ty(stmt.*.place.local)
+                if rv.*.kind == mir::MirRvalueKind.Use && rv.*.a.kind == mir::MirOperandKind.Const
+                    && rv.*.a.lit.kind == lexer::TokenKind.LiteralNum && this.is_float_ty(dest_ty.copy()) {
+                    rv.*.a.ty = dest_ty.copy()
+                }
+                // Preserve comparison bits until an ABI or arithmetic use needs a word.
+                if rv.*.kind == mir::MirRvalueKind.Binary && rv.*.op == "__zero" { value = this.word_value(0) }
+                elif rv.*.kind == mir::MirRvalueKind.Binary && scalar::predicate(rv.*.op.copy(), false) != 0
+                    && scalar::scalar_type(this.operand_type(rv.*.a.pin)) && scalar::scalar_type(this.operand_type(rv.*.b.pin)) {
+                    make left = this.gen_operand(rv.*.a.pin)
+                    make right = this.gen_operand(rv.*.b.pin)
+                    make ty = this.operand_type(rv.*.a.pin)
+                    if this.is_float_ty(ty.copy()) { value = this.floats.compare(rv.*.op.copy(), left, right, ty == "f32") }
+                    else {
+                        make unsigned = ty == "uint" || ty == "u8" || ty == "u16" || ty == "u32" || ty == "u64"
+                        value = this.compare(rv.*.op.copy(), left, right, unsigned)
+                    }
+                } elif dest_ty == "bool" && rv.*.kind == mir::MirRvalueKind.Use {
+                    value = this.gen_condition(rv.*.a.pin)
+                } elif rv.*.kind == mir::MirRvalueKind.Unary && rv.*.op == "!" {
+                    make truth = api::LLVMConstInt(api::LLVMInt1TypeInContext(this.context), 1, 0)
+                    value = api::LLVMBuildBinOp(this.builder, scalar::opcode("^", false), this.gen_condition(rv.*.a.pin), truth, this.unnamed.data)
+                } elif dest_ty == "bool" && rv.*.kind == mir::MirRvalueKind.Binary && scalar::opcode(rv.*.op.copy(), false) != 0
+                    && this.operand_type(rv.*.a.pin) == "bool" && this.operand_type(rv.*.b.pin) == "bool" {
+                    value = api::LLVMBuildBinOp(this.builder, scalar::opcode(rv.*.op.copy(), false), this.gen_condition(rv.*.a.pin), this.gen_condition(rv.*.b.pin), this.unnamed.data)
+                } else { value = this.gen_rvalue(rv) }
+                this.registers.write(stmt.*.place.local, value)
+                return
+            }
             make dest_ty = this.type_of_place(stmt.*.place.pin)
             make dest = this.place_addr(stmt.*.place.pin)
 
@@ -2042,7 +2320,7 @@ make type Emitter {
             }
 
             if this.raw_scalar_place(stmt.*.place.pin) && this.c_element_size(dest_ty.copy()) < 8 {
-                make slot = this.raw_store
+                make slot = this.raw_scratch()
                 this.gen_assignment(stmt.*.rvalue.pin, slot, dest_ty.copy())
                 make kind = this.c_scalar_type(dest_ty.copy())
                 this.store(this.conversion.narrow(this.load_i64(slot), kind), dest, 1)
@@ -2071,12 +2349,30 @@ make type Emitter {
         make owner = this.string_owner(addr)
 
         if owner != this.null {
+            make local: uint = 0
+            while local < this.local_tys.len() {
+                if this.owners[local] == owner {
+                    if !this.cleanup_active[local] { return }
+                    this.cleanup_active[local] = false
+                    break
+                }
+                local++
+            }
             this.call_named("__quip_str_drop", [addr, owner])
         }
     }
 
     @this @unsafe
     make drop_managed (addr: ptr<any>, descriptor: ptr<any>) {
+        make local: uint = 0
+        while local < this.local_tys.len() {
+            if this.has_closure(this.local_ty(local)) && this.local_slot(local) == addr {
+                if !this.cleanup_active[local] { return }
+                this.cleanup_active[local] = false
+                break
+            }
+            local++
+        }
         this.call_named("__quip_value_drop", [addr, descriptor])
     }
 
@@ -2108,6 +2404,7 @@ make type Emitter {
         }
 
         this.call_named("__quip_str_assign", [dest, src, owner])
+        if owner != this.null { this.cleanup_active[op.*.place.local] = false }
     }
 
     @this @unsafe
@@ -2154,14 +2451,15 @@ make type Emitter {
 
             // Evaluate before releasing the destination: `s = s + suffix` and
             // self-assignment may read the old buffer. The scratch lives in entry.
+            make scratch = this.string_scratch()
             if source.*.kind == mir::MirRvalueKind.Use {
-                this.assign_string_operand(this.string_result, source.*.a.pin)
+                this.assign_string_operand(scratch, source.*.a.pin)
             } else {
-                this.gen_assignment_value(source, this.string_result, dest_ty.copy())
+                this.gen_assignment_value(source, scratch, dest_ty.copy())
             }
 
             this.drop_string(dest)
-            this.memcpy(dest, this.string_result, 24)
+            this.memcpy(dest, scratch, 24)
             make owner = this.string_owner(dest)
 
             if owner != this.null { this.store_i64(this.word_value(1), owner) }
@@ -2324,7 +2622,6 @@ make type Emitter {
         while zi < this.structs[sid].*.fields.len() {
             make zfty = (this.structs[sid].*.fields[zi].ty !).copy()
             make field_addr = this.gep(dest, this.field_off_at(sid, zi))
-            this.zero_value(field_addr, zfty.copy())
             make field = this.structs[sid].*.fields[zi].pin
             make supplied = false
             make oi = 0
@@ -2339,6 +2636,7 @@ make type Emitter {
                 oi = oi + 1
             }
 
+            if !supplied || !flow::scalar(zfty.copy()) { this.zero_value(field_addr, zfty.copy()) }
             if !supplied && field.*.default_init.len() > 0 {
                 make sym = this.sanitize(field.*.default_init.copy())
                 make agg = this.is_agg(zfty.copy())
@@ -2460,7 +2758,7 @@ make type Emitter {
             } elif this.is_optional(elem_ty.copy()) {
                 item = this.optional_arg_addr(rv.*.ops[i].pin, elem_ty.copy())
             } elif elem_ty == "str" || elem_ty == "String" {
-                item = this.string_result
+                item = this.string_scratch()
                 this.assign_string_operand(item, rv.*.ops[i].pin)
             } elif this.is_agg(elem_ty.copy()) {
                 item = this.operand_addr(rv.*.ops[i].pin)
@@ -2654,9 +2952,30 @@ make type Emitter {
 
     @this @unsafe
     make local_slot (local: uint) -> ptr<any> {
+        if local == 0 && this.direct_result { return this.return_buffer }
         if this.is_capture(local) { return this.captures[local] }
         if local < this.local_slots.len() { return this.storage[this.local_slots[local]] }
         return this.null
+    }
+
+    @this @unsafe
+    make read_local_word (local: uint) -> ptr<any> {
+        if !this.ssa_locals[local] { return this.load_i64(this.local_slot(local)) }
+        make value = this.registers.values[local]
+        if api::LLVMTypeOf(value) == api::LLVMInt1TypeInContext(this.context) {
+            return api::LLVMBuildZExt(this.builder, value, this.word, this.unnamed.data)
+        }
+        return value
+    }
+
+    @this @unsafe
+    make gen_condition (operand: ref<mir::MirOperand>) -> ptr<any> {
+        if (operand.*.kind == mir::MirOperandKind.Copy || operand.*.kind == mir::MirOperandKind.Move)
+            && operand.*.place.projs.len() == 0 && this.ssa_locals[operand.*.place.local]
+            && api::LLVMTypeOf(this.registers.values[operand.*.place.local]) == api::LLVMInt1TypeInContext(this.context) {
+            return this.registers.values[operand.*.place.local]
+        }
+        return this.compare("!=", this.gen_operand(operand), this.word_value(0), false)
     }
 
     // rvalues / operands
@@ -2712,6 +3031,10 @@ make type Emitter {
                 && (right_ty == "str" || right_ty == "String") {
                 make left = this.operand_addr(rv.*.a.pin)
                 make right = this.operand_addr(rv.*.b.pin)
+                if !this.needs_string_equal {
+                    this.declare("__quip_string_equal", this.word, [this.pointer, this.pointer], false)
+                    this.needs_string_equal = true
+                }
                 make result = this.call_named("__quip_string_equal", [left, right])
 
                 if rv.*.op == "!=" { return this.gen_binop("==", result, this.word_value(0), false) }
@@ -2819,6 +3142,15 @@ make type Emitter {
         }
 
         if op.*.kind == mir::MirOperandKind.Copy || op.*.kind == mir::MirOperandKind.Move {
+            if op.*.place.projs.len() == 0 && this.ssa_locals[op.*.place.local] {
+                return this.read_local_word(op.*.place.local)
+            }
+            make cached = op.*.place.projs.len() == 1 && op.*.place.projs[0].kind == mir::MirProjKind.Deref && this.ssa_locals[op.*.place.local]
+            make pointer = this.null
+            if cached {
+                pointer = this.read_local_word(op.*.place.local)
+                if this.read_epochs[op.*.place.local] == this.memory_epoch && this.read_pointers[op.*.place.local] == pointer { return this.read_values[op.*.place.local] }
+            }
             make ty = this.type_of_place(op.*.place.pin)
             make addr = this.place_addr(op.*.place.pin)
 
@@ -2834,16 +3166,18 @@ make type Emitter {
                 return this.ptrtoint(addr)
             }
 
+            make result = this.null
             if this.raw_scalar_place(op.*.place.pin) && this.c_element_size(ty.copy()) < 8 {
                 make kind = this.c_scalar_type(ty.copy())
-                return this.conversion.widen(this.load(addr, kind, 1), kind, native::signed_narrow(ty))
+                result = this.conversion.widen(this.load(addr, kind, 1), kind, native::signed_narrow(ty))
+            } elif ty == "char" { result = this.load_char(addr) }
+            else { result = this.load_i64(addr) }
+            if cached {
+                this.read_values[op.*.place.local] = result
+                this.read_pointers[op.*.place.local] = pointer
+                this.read_epochs[op.*.place.local] = this.memory_epoch
             }
-
-            if ty == "char" {
-                return this.load_char(addr)
-            }
-
-            return this.load_i64(addr)
+            return result
         }
 
         if op.*.kind == mir::MirOperandKind.Path {
@@ -2897,7 +3231,7 @@ make type Emitter {
 
             if this.cur_sret {
                 // copy the return place into the caller-provided sret storage
-                if this.local_tys.len() > 0 {
+                if !this.direct_result && this.local_tys.len() > 0 {
                     this.memcpy(this.return_buffer, this.local_slot(0), this.size_of((this.cur_ret_ty !).copy()))
                 }
 
@@ -2916,8 +3250,7 @@ make type Emitter {
         }
 
         if term.*.kind == mir::MirTermKind.Branch {
-            make c = this.gen_operand(term.*.cond.pin)
-            make bit = this.compare("!=", c, this.word_value(0), false)
+            make bit = this.gen_condition(term.*.cond.pin)
             api::LLVMBuildCondBr(this.builder, bit, this.blocks[term.*.target], this.blocks[term.*.other])
             return
         }
@@ -2933,6 +3266,8 @@ make type Emitter {
     @this @unsafe
     make load_ret () -> ptr<any> {
         if this.local_tys.len() == 0 { return this.word_value(0) }
+        if this.cur_ret_ty == "void" || this.cur_ret_ty == "" { return this.word_value(0) }
+        if this.ssa_locals[0] { return this.read_local_word(0) }
         return this.load_i64(this.local_slot(0))
     }
 
@@ -3209,7 +3544,7 @@ make type Emitter {
             } elif this.is_optional(elem_ty.copy()) {
                 item = this.optional_arg_addr(term.*.args[1].pin, elem_ty.copy())
             } elif elem_ty == "str" || elem_ty == "String" {
-                item = this.string_result
+                item = this.string_scratch()
                 this.assign_string_operand(item, term.*.args[1].pin)
             } elif this.is_agg(elem_ty.copy()) {
                 item = this.operand_addr(term.*.args[1].pin)

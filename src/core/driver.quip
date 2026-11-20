@@ -245,7 +245,7 @@ make type Driver {
                 make ir_dir = build_dir.add(".llvm")
                 make object_dir = build_dir.add("objects")
 
-                if !this.config.emit_llvm && !this.config.emit_mem && !this.config.emit_mir {
+                if this.config.emit_llvm_optimized || (!this.config.emit_llvm && !this.config.emit_mem && !this.config.emit_mir) {
                     llvm::object::initialize()
                 }
 
@@ -265,6 +265,7 @@ make type Driver {
 
 
                     mgr.*.units[id].print_llvm = this.config.emit_llvm
+                    mgr.*.units[id].print_llvm_optimized = this.config.emit_llvm_optimized
                     mgr.*.units[id].entry_name = this.config.entry !
 
 

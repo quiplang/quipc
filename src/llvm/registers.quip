@@ -1,0 +1,222 @@
+// Pruned SSA construction shared by both emitters. Phi operands are connected
+// after every MIR block has been emitted, so block numbering is immaterial.
+@pure @const {
+    make api = @import "bindings.quip"
+    make mir = @import "../mir/mir.quip"
+    make flow = @import "../mir/flow.quip"
+    make native = @import "native.quip"
+    make arrays = @import "../../library/runtime/array.quip"
+}
+
+@pub
+make plan (body: ref<mir::MirBody>) -> bool[] {
+    make result: bool[] = []
+    for local : body.*.locals {
+        make ty = local.ty.copy()
+        result.push(ty == "void" || ty == "bool" || ty == "int" || ty == "uint" || ty == "i8" || ty == "i16" || ty == "i32" || ty == "i64"
+            || ty == "u8" || ty == "u16" || ty == "u32" || ty == "u64" || ty == "float" || ty == "f32" || ty == "f64"
+            || native::raw_pointer(ty.copy()) || native::reference(ty))
+    }
+    for capture : body.*.capture_locals { result[capture] = false }
+    for statement : body.*.stmts {
+        if statement.kind != mir::MirStmtKind.Assign { continue }
+        if statement.rvalue.kind == mir::MirRvalueKind.Pin && statement.rvalue.place.projs.len() == 0 { result[statement.rvalue.place.local] = false }
+        // Aggregate fields still need storage; pointer dereferences do not
+        // expose the pointer local's own address.
+        if statement.place.projs.len() > 0 && !native::raw_pointer(body.*.locals[statement.place.local].ty.copy()) && !native::reference(body.*.locals[statement.place.local].ty.copy()) { result[statement.place.local] = false }
+    }
+    for term : body.*.terms {
+        if term.kind == mir::MirTermKind.Call && (term.c_abi || term.ret_agg) { result[term.dest.local] = false }
+        if term.kind == mir::MirTermKind.Call && term.has_receiver && term.args.len() > 0
+            && (term.args[0].kind == mir::MirOperandKind.Copy || term.args[0].kind == mir::MirOperandKind.Move) {
+            result[term.args[0].place.local] = false
+        }
+    }
+    return result
+}
+
+@pub
+make type Phi {
+    make block: uint = 0
+    make local: uint = 0
+    make value: ptr<any>
+}
+@pub
+make type State {
+    @pub make enabled: bool[] = []
+    @pub make values: ptr<any>[] = []
+    make boolean: bool[] = []
+    make zeroes: ptr<any>[] = []
+    make entries: ptr<any>[] = []
+    make ends: ptr<any>[] = []
+    make exits: ptr<any>[] = []
+    make phis: Phi[] = []
+    make facts: flow::Graph = .{}
+    make count: uint = 0
+    @unsafe make word: ptr<any> = 0
+    @unsafe make bit: ptr<any> = 0
+    @unsafe make builder: ptr<any> = 0
+    make unnamed: str = ""
+
+    @pub @this @unsafe
+    make write (local: uint, value: ptr<any>) {
+        if this.boolean[local] && api::LLVMTypeOf(value) != this.bit {
+            value = api::LLVMBuildICmp(this.builder, 33, value, api::LLVMConstInt(this.word, 0, 0), this.unnamed.data)
+        } elif !this.boolean[local] && api::LLVMTypeOf(value) == this.bit {
+            value = api::LLVMBuildZExt(this.builder, value, this.word, this.unnamed.data)
+        }
+        this.values[local] = value
+    }
+    @pub @this
+    make begin (block: uint, continuation: bool) {
+        if block == 0 { return }
+        if continuation {
+            make predecessor = this.facts.predecessors[block].values[0]
+            make local: uint = 0
+            while local < this.count {
+                if this.enabled[local] { this.values[local] = this.ends[predecessor * this.count + local] }
+                local++
+            }
+            return
+        }
+        make local: uint = 0
+        while local < this.count {
+            if this.enabled[local] {
+                @unsafe make null: ptr<any> = 0
+                make value = this.entries[block * this.count + local]
+                if value == null { value = this.zeroes[local] }
+                this.values[local] = value
+            }
+            local++
+        }
+    }
+    @pub @this @unsafe
+    make end (block: uint) {
+        this.exits[block] = api::LLVMGetInsertBlock(this.builder)
+        make local: uint = 0
+        while local < this.count {
+            if this.enabled[local] { this.ends[block * this.count + local] = this.values[local] }
+            local++
+        }
+    }
+    @pub @this @unsafe
+    make finish () {
+        for phi : this.phis {
+            for predecessor : this.facts.predecessors[phi.block].values {
+                make value = this.ends[predecessor * this.count + phi.local]
+                make block = this.exits[predecessor]
+                @unsafe make values: ptr<ptr<any>> = value.pin
+                @unsafe make blocks: ptr<ptr<any>> = block.pin
+                api::LLVMAddIncoming(phi.value, values, blocks, 1)
+            }
+        }
+        make alive: bool[] = []
+        for phi : this.phis {
+            _ = phi
+            alive.push(true)
+        }
+        make changed = true
+        @unsafe make null: ptr<any> = 0
+        while changed {
+            changed = false
+            make index: uint = 0
+            for phi : this.phis {
+                if alive[index] {
+                    make same: ptr<any> = null
+                    make distinct = false
+                    make incoming: u32 = 0
+                    while incoming < api::LLVMCountIncoming(phi.value) {
+                        make value = api::LLVMGetIncomingValue(phi.value, incoming)
+                        if value != phi.value {
+                            if same == null { same = value }
+                            elif same != value { distinct = true }
+                        }
+                        incoming++
+                    }
+                    if !distinct {
+                        if same == null { same = api::LLVMGetUndef(api::LLVMTypeOf(phi.value)) }
+                        api::LLVMReplaceAllUsesWith(phi.value, same)
+                        api::LLVMInstructionEraseFromParent(phi.value)
+                        alive[index] = false
+                        changed = true
+                    }
+                }
+                index++
+            }
+        }
+    }
+}
+
+@pub @unsafe
+make create (body: ref<mir::MirBody>, context: ptr<any>, builder: ptr<any>, enabled: ref<bool[]>, blocks: ref<ptr<any>[]>, continuations: ref<bool[]>) -> State {
+    make result = State { count = body.*.locals.len(), word = api::LLVMInt64TypeInContext(context), bit = api::LLVMInt1TypeInContext(context), builder = builder, facts = flow::liveness(body) }
+    make word_zero = api::LLVMConstInt(result.word, 0, 0)
+    make bit_zero = api::LLVMConstInt(result.bit, 0, 0)
+    for local : body.*.locals {
+        result.boolean.push(local.ty == "bool")
+        make zero = word_zero
+        if local.ty == "bool" { zero = bit_zero }
+        result.zeroes.push(zero)
+        result.values.push(zero)
+    }
+    for flag : enabled.* { result.enabled.push(flag) }
+    for block : blocks.* { result.exits.push(block) }
+    make size = result.count * body.*.terms.len()
+    result.entries = arrays::zero_pointers(size)
+    result.ends = arrays::zero_pointers(size)
+    make handle = api::LLVMCreateBuilderInContext(context)
+    make block: uint = 1
+    while block < body.*.terms.len() {
+        if !continuations.*[block] {
+            api::LLVMPositionBuilderAtEnd(handle, blocks.*[block])
+            make local: uint = 0
+            while local < result.count {
+                if result.enabled[local] && flow::bit(result.facts.live_in.pin, block * result.facts.words, local) {
+                    make ty = result.word
+                    if result.boolean[local] { ty = result.bit }
+                    make value = api::LLVMBuildPhi(handle, ty, result.unnamed.data)
+                    result.entries[block * result.count + local] = value
+                    result.phis.push(Phi { block = block, local = local, value = value })
+                }
+                local++
+            }
+        }
+        block++
+    }
+    api::LLVMDisposeBuilder(handle)
+    return result
+}
+
+/// Ordinary call continuations with one predecessor can share an LLVM block.
+@pub
+make groups (body: ref<mir::MirBody>) -> uint[] {
+    make facts = flow::graph(body)
+    make result: uint[] = []
+    make block: uint = 0
+    while block < body.*.terms.len() {
+        make root = block
+        if block > 0 && facts.predecessors[block].values.len() == 1 {
+            make predecessor = facts.predecessors[block].values[0]
+            if predecessor < block && body.*.terms[predecessor].kind == mir::MirTermKind.Call {
+                make name = body.*.terms[predecessor].func.name.copy()
+                make ordinary = body.*.terms[predecessor].func.kind == mir::MirOperandKind.Path && !body.*.terms[predecessor].has_receiver
+                make prefix: str = "__quip_builtin."
+                if name.len() >= prefix.len() {
+                    make same = true
+                    make index: uint = 0
+                    while index < prefix.len() {
+                        if name[index] != prefix[index] {
+                            same = false
+                        }
+                        index++
+                    }
+                    if same { ordinary = false }
+                }
+                if ordinary { root = result[predecessor] }
+            }
+        }
+        result.push(root)
+        block++
+    }
+    return result
+}

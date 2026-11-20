@@ -48,6 +48,7 @@ make type Config {
     @pub make emit_mir: bool = false
     @pub make emit_mem: bool = false
 
+    @pub make emit_llvm_optimized: bool = false
     @pub make emit_llvm: bool = false        // print textual LLVM IR and stop (debug)
     @pub make entry: str = "main"            // entry point function name
     @pub make output_set: bool = false       // true if `-o` was given
@@ -257,12 +258,18 @@ make type Config {
                 }
             } elif t == "--" && this.command == CommandKind.Build {
                 i++
-                while i < argv.len() { this.build_args.push(c::to_str(argv[i])) i++ }
+                while i < argv.len() {
+                    this.build_args.push(c::to_str(argv[i]))
+                    i++
+                }
                 break
             } elif t == "--" && this.command == CommandKind.Run {
                 i = i + 1
 
-                while i < argv.len() { this.run_args.push(c::to_str(argv[i])) i = i + 1 }
+                while i < argv.len() {
+                    this.run_args.push(c::to_str(argv[i]))
+                    i = i + 1
+                }
 
                 break
 
@@ -294,8 +301,12 @@ make type Config {
                 this.native_libraries.push(c::to_str(argv[i]))
             } elif t == "--keep-llvm" {
                 this.options.keep_llvm = true
-            } elif t == "--emit-llvm" {
+            } elif t == "--emit-llvm-optimized" {
                 this.emit_llvm = true
+                this.emit_llvm_optimized = true
+            } elif t == "--emit-llvm" || t == "--emit-llvm-raw" {
+                this.emit_llvm = true
+                this.emit_llvm_optimized = false
             } elif t == "--entry" {
                 if i + 1 < argv.len() {
                     make f = argv[i + 1]
@@ -364,7 +375,10 @@ make type Config {
                 make tuple: str = ""
                 make ti: uint = 8
 
-                while ti < t.len() { tuple.push(t[ti]) ti = ti + 1 }
+                while ti < t.len() {
+                    tuple.push(t[ti])
+                    ti = ti + 1
+                }
 
                 this.parse_package(tuple) catch {
                     std::io::println("expected --alias=(\"name\", \"path\") (quote the tuple in your shell)")

@@ -87,6 +87,7 @@ make type Unit {
         make mem_ctx: memr::MemContext = .{}
         make mem_report: memr::MemReport = .{}
         make emit_llvm: bool = true    // enable LLVM codegen + object emission
+        make print_llvm_optimized: bool = false
         make print_llvm: bool = false  // dump the textual IR to stdout (--emit-llvm)
         make llvm_ll: str = ""         // path for the .ll output; set by the Driver
         make keep_llvm: bool = false
@@ -413,7 +414,7 @@ make type Unit {
         memr::collect(this.hir_module.pin, this.mem_ctx.pin)
         make previous = memr::MemReport {}
         make reuse: bool[] = []
-        this.mem_report = mem::check_cached(this.mir_module.pin, this.diag.pin, this.mem_ctx.pin, this.path_rel.get(), previous.pin, reuse.pin, timings, true)
+        this.mem_report = mem::check_cached(this.mir_module.pin, this.diag.pin, this.mem_ctx.pin, this.path_rel.get(), previous.pin, reuse.pin, timings, this.emit_mem)
 
         if timings.*.enabled { timings.*.record(started, "memory", this.path_rel.get()) }
 
@@ -451,7 +452,7 @@ make type Unit {
 
             if !llvm::object::compile(this.mir_module.pin, this.mem_report.pin, this.path_rel.get(),
                 this.entry_name !, this.content !, this.platform_name !, this.llvm_out !,
-                this.llvm_optimization !, this.print_llvm, dump_path, timings) {
+                this.llvm_optimization !, this.print_llvm, dump_path, timings, true, this.print_llvm_optimized) {
                 std::progress::clear()
                 std::io::println("LLVM generation failed for " + this.path_rel.get())
                 return error.CompilationAborted

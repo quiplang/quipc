@@ -104,6 +104,13 @@ make type Lowering {
     }
 
     @pub @this @unsafe
+    make compare (op: str, left: ptr<any>, right: ptr<any>, single: bool) -> ptr<any> {
+        make a = this.from_word(left, single)
+        make b = this.from_word(right, single)
+        return api::LLVMBuildFCmp(this.builder, predicate(op), a, b, this.unnamed.data)
+    }
+
+    @pub @this @unsafe
     make binary (op: str, left: ptr<any>, right: ptr<any>, single: bool) -> ptr<any> {
         make a = this.from_word(left, single)
         make b = this.from_word(right, single)

@@ -53,14 +53,14 @@ make verify (module: ptr<any>) -> bool {
 }
 
 @unsafe
-make generate (module: ptr<any>, machine: ptr<any>, path: str, optimization: str, filename: str, timings: ref<profile::Profile>) -> bool {
+make generate (module: ptr<any>, machine: ptr<any>, path: str, optimization: str, filename: str, timings: ref<profile::Profile>, print_optimized: bool = false) -> bool {
     make started: uint = 0
     if timings.*.enabled { started = profile::now() }
     make layout = api::LLVMCreateTargetDataLayout(machine)
     api::LLVMSetModuleDataLayout(module, layout)
     api::LLVMDisposeTargetData(layout)
 
-    make passes: str = ""
+    make passes: str = "function(sroa,mem2reg,simplifycfg)"
     if optimization == "-O2" { passes = "default<O2>" }
     elif optimization == "-O3" { passes = "default<O3>" }
     elif optimization == "-Os" { passes = "default<Os>" }
@@ -80,6 +80,13 @@ make generate (module: ptr<any>, machine: ptr<any>, path: str, optimization: str
             api::LLVMDisposeErrorMessage(message)
             return false
         }
+    }
+
+    if print_optimized {
+        make message = api::LLVMPrintModuleToString(module)
+        std::io::println(c::to_str(message))
+        api::LLVMDisposeMessage(message)
+        return true
     }
 
     if timings.*.enabled { started = profile::now() }
@@ -121,7 +128,7 @@ make target_triple () -> str {
 }
 
 @unsafe
-make compile_module (module: ptr<any>, path: str, optimization: str, filename: str, timings: ref<profile::Profile>) -> bool {
+make compile_module (module: ptr<any>, path: str, optimization: str, filename: str, timings: ref<profile::Profile>, print_optimized: bool = false) -> bool {
     make started: uint = 0
     if timings.*.enabled { started = profile::now() }
     make triple = target_triple()
@@ -144,7 +151,7 @@ make compile_module (module: ptr<any>, path: str, optimization: str, filename: s
     if machine == null { return false }
 
     if timings.*.enabled { timings.*.record(started, "llvm_target", filename.copy()) }
-    make success = generate(module, machine, path, optimization, filename.copy(), timings)
+    make success = generate(module, machine, path, optimization, filename.copy(), timings, print_optimized)
     if timings.*.enabled { started = profile::now() }
     api::LLVMDisposeTargetMachine(machine)
     if timings.*.enabled { timings.*.record(started, "llvm_cleanup", filename) }
@@ -152,14 +159,14 @@ make compile_module (module: ptr<any>, path: str, optimization: str, filename: s
 }
 
 @unsafe
-make output_module (module: ptr<any>, path: str, optimization: str, print_ir: bool, dump_path: str, filename: str, timings: ref<profile::Profile>) -> bool {
+make output_module (module: ptr<any>, path: str, optimization: str, print_ir: bool, dump_path: str, filename: str, timings: ref<profile::Profile>, print_optimized: bool = false) -> bool {
     make started: uint = 0
     if timings.*.enabled { started = profile::now() }
     make valid = verify(module)
     if timings.*.enabled { timings.*.record(started, "llvm_verify", filename.copy()) }
     if !valid { return false }
 
-    if print_ir || dump_path.len() > 0 {
+    if (print_ir && !print_optimized) || dump_path.len() > 0 {
         if timings.*.enabled { started = profile::now() }
         make message = api::LLVMPrintModuleToString(module)
         make ir = c::to_str(message)
@@ -178,14 +185,14 @@ make output_module (module: ptr<any>, path: str, optimization: str, print_ir: bo
     }
 
     if (print_ir || dump_path.len() > 0) && timings.*.enabled { timings.*.record(started, "llvm_dump", filename.copy()) }
-    return compile_module(module, path, optimization, filename, timings)
+    return compile_module(module, path, optimization, filename, timings, print_optimized)
 }
 
 /// Builds and emits an LLVM module for one source unit.
 @pub
 make compile (mir_module: ref<mir::MirModule>, report: ref<memory::MemReport>, filename: str,
     selected_entry: str, source: str, platform: str, path: str, optimization: str,
-    print_ir: bool, dump_path: str, timings: ref<profile::Profile>) -> bool {
+    print_ir: bool, dump_path: str, timings: ref<profile::Profile>, show_progress: bool = true, print_optimized: bool = false) -> bool {
     @unsafe {
         make started: uint = 0
         if timings.*.enabled { started = profile::now() }
@@ -210,8 +217,8 @@ make compile (mir_module: ref<mir::MirModule>, report: ref<memory::MemReport>, f
         make success = lower::build(context, module, mir_module, filename.copy(), selected_entry, source, platform, report)
         if timings.*.enabled { timings.*.record(started, "llvm_ir", filename.copy()) }
         if success {
-            if !print_ir { std::progress::phase("Generate object", 0, 0, filename.copy()) }
-            success = output_module(module, path, optimization, print_ir, dump_path, filename.copy(), timings)
+            if show_progress && !print_ir { std::progress::phase("Generate object", 0, 0, filename.copy()) }
+            success = output_module(module, path, optimization, print_ir, dump_path, filename.copy(), timings, print_optimized)
         }
 
         if timings.*.enabled { started = profile::now() }

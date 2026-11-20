@@ -1507,7 +1507,17 @@ make portable_type_name (sig: ref<hir::HirTypeSig>) -> str {
 
     if sig.*.prim == ty::TY_CHAR { name = "char" }
 
-    if sig.*.args.len() > 0 {
+    if sig.*.name == "tuple" {
+        name = "("
+        make i: uint = 0
+        while i < sig.*.args.len() {
+            if i > 0 { name = name + ", " }
+            name = name + portable_type_name(sig.*.args[i].pin)
+            i++
+        }
+        if sig.*.args.len() == 1 { name = name + "," }
+        name = name + ")"
+    } elif sig.*.args.len() > 0 {
         name = name + "<"
         make i = 0
 
@@ -1612,7 +1622,7 @@ make collect_sigs_into (out: ref<hir::HirAttachedSig[]>, module: ref<hir::HirMod
 make portable_type_is_aggregate (sig: ref<hir::HirTypeSig>, struct_names: ref<str[]>) -> bool {
     if sig.*.is_fallible { return true }
 
-    if sig.*.name == "variant" && !sig.*.is_ref && !sig.*.is_ptr { return true }
+    if (sig.*.name == "variant" || sig.*.name == "tuple") && !sig.*.is_ref && !sig.*.is_ptr { return true }
 
     if sig.*.is_array || sig.*.is_optional {
         return true

@@ -180,6 +180,22 @@ make build_cached (module: ref<hir::HirModule>, checked: ref<typeck::ModuleTypec
         si = si + 1
     }
 
+    make ti: uint = 0
+    while ti < tys.*.tys.len() {
+        if tys.*.kind_of(ti) == ty::TyKind.Tuple {
+            make tuple = mir::MirStruct { name = ty_name(module, tys, ti) }
+            make fields = tys.*.args_of(ti)
+            make fi: uint = 0
+            while fi < fields.len() {
+                tuple.fields.push(mir::MirField { name = fi.to_str(), ty = ty_name(module, tys, fields[fi]) })
+                fi++
+            }
+            make duplicate = false
+            for definition : out.structs { if definition.name == tuple.name { duplicate = true } }
+            if !duplicate { out.structs.push(tuple) }
+        }
+        ti++
+    }
     return out
 }
 
@@ -236,6 +252,18 @@ make ty_name (module: ref<hir::HirModule>, tys: ref<ty::TyInterner>, id: uint) -
 
 /// renders the base name of an interned type for mir.
 make ty_base_name (module: ref<hir::HirModule>, tys: ref<ty::TyInterner>, kind: ty::TyKind, id: uint) -> str {
+    if kind == ty::TyKind.Tuple {
+        make result: str = "("
+        make args = tys.*.args_of(id)
+        make i: uint = 0
+        while i < args.len() {
+            if i > 0 { result = result + ", " }
+            result = result + ty_name(module, tys, args[i])
+            i++
+        }
+        if args.len() == 1 { result = result + "," }
+        return result + ")"
+    }
     if kind == ty::TyKind.Variant {
         make members = tys.*.args_of(id)
         make result: str = "variant<"
@@ -283,7 +311,7 @@ make ty_base_name (module: ref<hir::HirModule>, tys: ref<ty::TyInterner>, kind: 
 
     if kind == ty::TyKind.Float { return "float" }
 
-    if kind == ty::TyKind.Str { return "str" }
+    if kind == ty::TyKind.Text || kind == ty::TyKind.Str { return "str" }
 
     if kind == ty::TyKind.StrBuf { return "String" }
 
@@ -324,6 +352,21 @@ make type_name (body: ref<hir::HirBody>, id: uint) -> str {
         return name
     }
 
+    if t.*.name == "tuple" {
+        make result: str = "("
+        make i: uint = 0
+        while i < t.*.args.len() {
+            if i > 0 { result = result + ", " }
+            result = result + type_name(body, t.*.args[i])
+            i++
+        }
+        if t.*.args.len() == 1 { result = result + "," }
+        result = result + ")"
+        if t.*.is_array { result = result + "[]" }
+        if t.*.is_optional { result = result + "?" }
+        if t.*.is_fallible { result = "!" + result }
+        return result
+    }
     make s: str = ""
 
     if t.*.is_fallible { s = "!" }
@@ -479,7 +522,7 @@ make type Builder {
 
         if kind == ty::TyKind.Fallible { return true }
 
-        if kind == ty::TyKind.Array || kind == ty::TyKind.Optional || kind == ty::TyKind.Variant {
+        if kind == ty::TyKind.Tuple || kind == ty::TyKind.Array || kind == ty::TyKind.Optional || kind == ty::TyKind.Variant {
             return true
         }
 
@@ -902,6 +945,7 @@ make type Builder {
         make src = this.src
         make s = src.*.stmts[id].pin
         this.cur_range = s.*.range !
+        if s.*.tuple_pattern { return }
 
         match s.*.kind {
             hir::HirStmtKind.Let {
@@ -1473,6 +1517,16 @@ make type Builder {
                 }
             }
 
+            hir::HirExprKind.Tuple {
+                rv.kind = mir::MirRvalueKind.Aggregate
+                // Snapshot each element before evaluating the next one.
+                for element : ex.*.args {
+                    make local = this.materialize(element)
+                    make operand = mir::MirOperand { kind = mir::MirOperandKind.Move, place = local_place(local) }
+                    rv.ops.push(operand)
+                }
+            }
+
             hir::HirExprKind.Array {
                 rv.kind = mir::MirRvalueKind.Aggregate
                 make i = 0
@@ -1747,8 +1801,13 @@ make type Builder {
                 make p = this.place(ex.*.lhs)
                 make proj = mir::MirProj {}
 
-                proj.kind = mir::MirProjKind.Index
-                proj.index = this.operand_local(ex.*.rhs)
+                if ex.*.name.len() > 0 {
+                    proj.kind = mir::MirProjKind.Field
+                    proj.name = ex.*.name.copy()
+                } else {
+                    proj.kind = mir::MirProjKind.Index
+                    proj.index = this.operand_local(ex.*.rhs)
+                }
                 p.projs.push(proj)
                 return p
             }

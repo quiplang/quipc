@@ -19,6 +19,7 @@ make main (argc: int, argv: ptr<char>[]) -> int {
     //b.options.benchmark = true
     // b.options.keep_llvm = true
     b.options.hide_warnings = true
+    b.options.jobs = 8
 
     make exe = std::Executable.default()
     exe.name = "quipc"
@@ -383,7 +384,10 @@ make bump (part: str) -> !str {
     make text = "// Updated by build.quip's bump-major, bump-minor and bump-build options.\n@pub @const\nmake current: str = \"" + next.copy() + "\"\n"
 
     make file = std::io::File.create(std::io::Path.create("src/version.quip.tmp"), 420) catch { return error.WriteVersionFailed }
-    file.write(text) catch { file.close() return error.WriteVersionFailed }
+    file.write(text) catch {
+        file.close()
+        return error.WriteVersionFailed
+    }
     file.close()
 
     make command = std::process::Command.create("mv", ["src/version.quip.tmp", "src/version.quip"])

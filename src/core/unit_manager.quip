@@ -86,6 +86,7 @@ make type Unit {
         make emit_mem: bool = false
         make mem_ctx: memr::MemContext = .{}
         make mem_report: memr::MemReport = .{}
+        make defer_llvm: bool = false
         make emit_llvm: bool = true    // enable LLVM codegen + object emission
         make print_llvm_optimized: bool = false
         make print_llvm: bool = false  // dump the textual IR to stdout (--emit-llvm)
@@ -191,7 +192,10 @@ make type Unit {
                     d.attach(diags::Label.create(util::Range.of(start, start + 1), "identifier starts here"))
                     d.help("shorten this identifier or split a long qualified name into namespaces")
                 }
-                _ { d.label("this character cannot begin a valid token") d.help("remove the character or write a valid identifier, literal, or operator") }
+                _ {
+                    d.label("this character cannot begin a valid token")
+                    d.help("remove the character or write a valid identifier, literal, or operator")
+                }
             }
 
             this.diag.report(d)
@@ -442,23 +446,31 @@ make type Unit {
 
         if this.emit_mem || (this.emit_mir && !this.print_llvm) { return }
 
-        // work with LLVM
+        if this.emit_llvm && !this.defer_llvm {
+            this.generate_llvm(timings, true) catch err { return err }
+        }
+        return
+    }
+
+    /// Generates native output after analysis has completed.
+    @pub @this
+    make generate_llvm (timings: ref<profile::Profile>, show_progress: bool) -> !void {
         if this.emit_llvm {
             this.status = UnitStatus.LLVM
-            std::progress::phase("Generate IR", 0, 0, this.path_rel.get())
+            if show_progress { std::progress::phase("Generate IR", 0, 0, this.path_rel.get()) }
 
             make dump_path: str = ""
             if this.keep_llvm && !this.print_llvm { dump_path = this.llvm_ll.copy() }
 
             if !llvm::object::compile(this.mir_module.pin, this.mem_report.pin, this.path_rel.get(),
                 this.entry_name !, this.content !, this.platform_name !, this.llvm_out !,
-                this.llvm_optimization !, this.print_llvm, dump_path, timings, true, this.print_llvm_optimized) {
+                this.llvm_optimization !, this.print_llvm, dump_path, timings, show_progress, this.print_llvm_optimized) {
                 std::progress::clear()
                 std::io::println("LLVM generation failed for " + this.path_rel.get())
                 return error.CompilationAborted
             }
 
-            if !this.print_llvm { std::progress::unit_done() }
+            if show_progress && !this.print_llvm { std::progress::unit_done() }
         }
 
 
@@ -675,7 +687,10 @@ make collect_imports (program: ref<owned<ast::AST_Head>[]>, os: str) -> ImportIn
     make i: uint = 0
 
     while i < program.*.len() {
-        if !selected[i] { i++ continue }
+        if !selected[i] {
+            i++
+            continue
+        }
         @unsafe make node: ptr<ast::AST_Head> = program.*[i].*.pin
 
         if node.*.var != none {
@@ -822,7 +837,10 @@ make exports_of (program: ref<owned<ast::AST_Head>[]>, os: str) -> hir::HirExpor
     make i: uint = 0
 
     while i < program.*.len() {
-        if !selected[i] { i++ continue }
+        if !selected[i] {
+            i++
+            continue
+        }
         @unsafe make node: ptr<ast::AST_Head> = program.*[i].*.pin
 
         make before = out.len()
@@ -1064,7 +1082,10 @@ make type UnitManager {
         make name: str = ""
         make end: uint = 0
 
-        while end < path.len() && path[end] != '/' { name.push(path[end]) end = end + 1 }
+        while end < path.len() && path[end] != '/' {
+            name.push(path[end])
+            end = end + 1
+        }
 
         make i: uint = 0
 
@@ -1076,7 +1097,10 @@ make type UnitManager {
                 make suffix: str = ""
                 end = end + 1
 
-                while end < path.len() { suffix.push(path[end]) end = end + 1 }
+                while end < path.len() {
+                    suffix.push(path[end])
+                    end = end + 1
+                }
 
                 return resolve_import(root, suffix)
             }

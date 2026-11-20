@@ -156,6 +156,7 @@ make print_help () -> void {
     std::io::println("  -Os                                     Optimize for code size")
     std::io::println("  --emit-llvm, --emit-llvm-raw             Print lowered LLVM IR and stop")
     std::io::println("  --emit-llvm-optimized                   Print LLVM IR after optimization and stop")
+    std::io::println("  --jobs <1–256>                         Set LLVM object generation concurrency")
     std::io::println("  --keep-llvm                             Retain intermediate LLVM IR files")
     std::io::println("")
     std::io::println("Diagnostic options:")

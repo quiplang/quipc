@@ -299,6 +299,13 @@ make type Config {
                 if i + 1 >= argv.len() { return error.InvalidArgument }
                 i = i + 1
                 this.native_libraries.push(c::to_str(argv[i]))
+            } elif t == "--jobs" {
+                if i + 1 >= argv.len() { return error.InvalidArgument }
+                i++
+                this.options.jobs = std::parse_jobs(c::to_str(argv[i])) catch {
+                    std::io::println("--jobs requires a number between 1 and 256")
+                    return error.InvalidArgument
+                }
             } elif t == "--keep-llvm" {
                 this.options.keep_llvm = true
             } elif t == "--emit-llvm-optimized" {

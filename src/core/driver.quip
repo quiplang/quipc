@@ -3,6 +3,7 @@
     make profile = @import "analysis_profile.quip"
 
     make um = @import "unit_manager.quip"
+    make workers = @import "object_workers.quip"
     make configuration = @import "config.quip"
 
     make llvm = @import "../llvm/pkg.quip"
@@ -76,7 +77,10 @@ make type Driver {
                 executable_buffer.data[count] = '\0'
             }
             make i: uint = 0
-            while executable_buffer.data[i] != '\0' { compiler.push(executable_buffer.data[i]) i++ }
+            while executable_buffer.data[i] != '\0' {
+                compiler.push(executable_buffer.data[i])
+                i++
+            }
         }
 
         if compiler.len() == 0 {
@@ -91,6 +95,10 @@ make type Driver {
         runner.config.output = std::io::Path.create(runner_path.copy())
         runner.config.output_set = true
         runner.config.options = this.config.options
+        // A one-shot build runner does not benefit from the target's costly
+        // release optimization. Its requested target profile is passed below.
+        runner.config.options.mode = std::Mode.Debug
+        runner.config.options.optimization = std::Optimization.None
         runner.config.intermediate_directory = this.profile_path() + "/intermediate/build/files"
         runner.config.package_names = this.config.package_names !
 
@@ -116,6 +124,8 @@ make type Driver {
             std::Optimization.Size { args.push("-Os") }
             _ {}
         }
+        args.push("--jobs")
+        args.push(this.config.options.jobs.to_str())
         if this.config.options.benchmark { args.push("--benchmark") }
         if this.config.options.extra_warnings { args.push("--extra-warnings") }
         if this.config.options.hide_warnings { args.push("--hide-warnings") }
@@ -262,6 +272,7 @@ make type Driver {
                     mgr.*.units[id].emit_mem = this.config.emit_mem
 
                     mgr.*.units[id].emit_llvm = true
+                    mgr.*.units[id].defer_llvm = !this.config.emit_llvm && !this.config.emit_mem && !this.config.emit_mir
 
 
                     mgr.*.units[id].print_llvm = this.config.emit_llvm
@@ -366,6 +377,7 @@ make type Driver {
                     mi = mi + 1
                 }
 
+                make pool = workers::Pool { limit = this.config.options.jobs }
                 // typecheck only once every declaration, including `@impl`, is registered
                 si = 0
 
@@ -374,6 +386,7 @@ make type Driver {
                     std::progress::phase("Analyze", si, mgr.*.compilation_stack.len(), mgr.*.units[id].path_rel.get())
                     mgr.*.units[id].mem_ctx = memory_context
                     mgr.*.units[id].analyze(mgr.*.attached_sigs.pin, mgr.*.struct_sigs.pin, mgr.*.free_sigs.pin, timings.pin) catch err {
+                        pool.drain()
                         match err {
                             error.IdentifierTooLong {
                                 std::progress::clear()
@@ -398,12 +411,30 @@ make type Driver {
                     }
 
                     memory_context = mgr.*.units[id].mem_ctx
+                    if mgr.*.units[id].defer_llvm {
+                        if timings.enabled { started = profile::now() }
+                        pool.submit(mgr, timings.pin) catch err {
+                            pool.drain()
+                            return err
+                        }
+                        if timings.enabled && pool.limit > 1 && mgr.*.compilation_stack.len() > 1 {
+                            timings.record(started, "llvm_dispatch", "<build>")
+                        }
+                    }
                     objs.push(mgr.*.units[id].llvm_out !)
                     si = si + 1
                 }
 
                 // assemble + link every unit into one executable (unless only dumping IR or memory report)
                 if !this.config.emit_llvm && !this.config.emit_mem && !this.config.emit_mir {
+                    if timings.enabled { started = profile::now() }
+                    pool.finish(mgr) catch err {
+                        pool.drain()
+                        return err
+                    }
+                    if timings.enabled && pool.limit > 1 && mgr.*.compilation_stack.len() > 1 {
+                        timings.record(started, "llvm_wait", "<build>")
+                    }
                     make exe = this.executable_path()
                     ensure_output_parent(exe.copy())
                     std::progress::phase("Link", 0, 1, exe.copy())

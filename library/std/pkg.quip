@@ -32,11 +32,27 @@ make type Options {
         make extra_warnings: bool = false
         make benchmark: bool = false
         make keep_llvm: bool = false
+        make jobs: uint = 4
         make progress_enabled: bool = true
 
         make build_simplified: bool = false
     }
 
+}
+
+/// Parses the bounded LLVM worker count used by compiler subprocesses.
+@pub
+make parse_jobs (value: str) -> !uint {
+    make count: uint = 0
+    if value.len() == 0 { return error.InvalidArgument }
+    for digit : value.iter() {
+        if digit < '0' || digit > '9' { return error.InvalidArgument }
+        @unsafe make number: uint = digit
+        count = count * 10 + number - 48
+        if count > 256 { return error.InvalidArgument }
+    }
+    if count == 0 { return error.InvalidArgument }
+    return count
 }
 
 @pub
@@ -215,6 +231,8 @@ make type Build {
     @pub {
         make options: Options
         make compiler_path: str = ""
+        // Negotiated by the driver; older bootstrap compilers omit --jobs.
+        make compiler_supports_jobs: bool = false
 
         make script_args: str[] = []
 
@@ -493,6 +511,13 @@ make type Build {
 
         if this.options.show_memory_dump { this.args.push("--emit-mem") }
 
+        if this.compiler_supports_jobs && this.options.jobs != 0 {
+            if this.options.jobs > 256 { panic("--jobs must be between 1 and 256", @file, @line) }
+
+            this.args.push("--jobs")
+            this.args.push(this.options.jobs.to_str())
+        }
+
         if this.options.benchmark { this.args.push("--benchmark") }
         if this.options.keep_llvm { this.args.push("--keep-llvm") }
         if !this.options.progress_enabled { this.args.push("--no-progress") }
@@ -545,6 +570,12 @@ make load_build_args (b: ref<Build>, argv: ptr<char>[]) -> !uint {
             "-Os" { b.*.options.optimization = Optimization.Size }
             "--benchmark" { b.*.options.benchmark = true }
             "--keep-llvm" { b.*.options.keep_llvm = true }
+            "--jobs" {
+                b.*.compiler_supports_jobs = true
+                if i + 1 >= argv.len() { return error.InvalidBuildArguments }
+                i++
+                b.*.options.jobs = parse_jobs(c_ffi::to_str(argv[i])) catch { return error.InvalidBuildArguments }
+            }
             "--no-progress" { b.*.options.progress_enabled = false }
             "--extra-warnings" { b.*.options.extra_warnings = true }
             "--hide-warnings" { b.*.options.hide_warnings = true }

@@ -1,0 +1,103 @@
+// CFG interference for stack-resident locals, including functions with loops.
+@pure @const {
+    make mir = @import "../mir/mir.quip"
+    make flow = @import "../mir/flow.quip"
+    make arrays = @import "../../library/runtime/array.quip"
+}
+
+make connect (edges: ref<uint[]>, live: ref<uint[]>, local: uint, count: uint, words: uint) {
+    // Store directed rows in bulk. Greedy coloring checks both directions;
+    // there is no need to enumerate every live local for every definition.
+    make word: uint = 0
+    while word < words {
+        edges.*[local * words + word] |= live.*[word]
+        word++
+    }
+}
+
+@pub
+make assign (body: ref<mir::MirBody>, pinned: ref<uint[]>) -> uint[] {
+    make facts = flow::liveness(body)
+    make count = body.*.locals.len()
+
+    make edges = arrays::zero_words(count * facts.words)
+
+    make live: uint[] = []
+    while live.len() < facts.words { live.push(0) }
+
+    make block: uint = 0
+    while block < body.*.terms.len() {
+        make word: uint = 0
+        while word < facts.words {
+            live[word] = facts.live_out[block * facts.words + word]
+            word++
+        }
+
+        make term = body.*.terms[block].pin
+        if term.*.kind == mir::MirTermKind.Call && term.*.dest.projs.len() == 0 { connect(edges.pin, live.pin, term.*.dest.local, count, facts.words) }
+        flow::terminator_backwards(live.pin, term)
+
+        make index = facts.statements[block].values.len()
+        while index > 0 {
+            index--
+            make statement = body.*.stmts[facts.statements[block].values[index]].pin
+            if statement.*.kind == mir::MirStmtKind.Assign && statement.*.place.projs.len() == 0 { connect(edges.pin, live.pin, statement.*.place.local, count, facts.words) }
+            flow::statement_backwards(live.pin, statement, body)
+        }
+
+        if block == 0 {
+            make parameter: uint = 1
+            while parameter <= body.*.param_count {
+                connect(edges.pin, live.pin, parameter, count, facts.words)
+                parameter++
+            }
+        }
+
+        block++
+    }
+
+    make slots: uint[] = []
+    make unique: bool[] = []
+    make local: uint = 0
+    while local < count {
+        // Captures, pinned addresses, return places, and managed cleanup must
+        // never alias a recycled scalar slot.
+        unique.push(local == 0 || pinned.*[local] != 0 || !flow::scalar(body.*.locals[local].ty.copy()))
+        slots.push(local)
+        local++
+    }
+
+    for capture : body.*.capture_locals { unique[capture] = true }
+
+    make occupants: flow::Ids[] = []
+    make reusable: uint[] = []
+    local = 0
+    while local < count {
+        make chosen = occupants.len()
+        if !unique[local] {
+            for candidate : reusable.iter() {
+                make allowed = true
+                for other : occupants[candidate].values {
+                    if flow::bit(edges.pin, local * facts.words, other) || flow::bit(edges.pin, other * facts.words, local)
+                        || (local <= body.*.param_count && other <= body.*.param_count) {
+                            allowed = false
+                            break
+                        }
+                }
+                if allowed {
+                    chosen = candidate
+                    break
+                }
+            }
+        }
+        if chosen == occupants.len() {
+            occupants.push(flow::Ids {})
+            if !unique[local] { reusable.push(chosen) }
+        }
+        occupants[chosen].values.push(local)
+        slots[local] = chosen
+        local++
+    }
+
+    return slots
+}

@@ -27,11 +27,11 @@ make check (mir_mod: ref<mir::MirModule>, hir_mod: ref<hir::HirModule>, diag: re
 
 /// checks memory rules while reusing eligible previous function reports.
 @pub
-make check_cached (mir_mod: ref<mir::MirModule>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, module_name: str, previous: ref<report::MemReport>, reuse: ref<bool[]>, timings: ref<profile::Profile>) -> report::MemReport {
+make check_cached (mir_mod: ref<mir::MirModule>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, module_name: str, previous: ref<report::MemReport>, reuse: ref<bool[]>, timings: ref<profile::Profile>, plan_slots: bool = true) -> report::MemReport {
     make out = report::MemReport {}
 
     out.module_name = module_name
-    checker::check_cached(mir_mod, diag, ctx, out.pin, previous, reuse, timings)
+    checker::check_cached(mir_mod, diag, ctx, out.pin, previous, reuse, timings, plan_slots)
     return out
 }
 

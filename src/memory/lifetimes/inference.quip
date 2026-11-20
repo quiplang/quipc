@@ -65,7 +65,10 @@ make reachable (body: ref<mir::MirBody>, start: uint, target: uint) -> bool {
     make seen: uint[] = []
     make queue: uint[] = []
     make i = 0
-    while i < body.*.terms.len() { seen.push(0) i = i + 1 }
+    while i < body.*.terms.len() {
+        seen.push(0)
+        i = i + 1
+    }
 
     seen[start] = 1
     queue.push(start)
@@ -76,7 +79,10 @@ make reachable (body: ref<mir::MirBody>, start: uint, target: uint) -> bool {
         make edges: uint[] = []
 
         if term.*.kind == mir::MirTermKind.Goto || term.*.kind == mir::MirTermKind.Call { edges.push(term.*.target) }
-        elif term.*.kind == mir::MirTermKind.Branch { edges.push(term.*.target) edges.push(term.*.other) }
+        elif term.*.kind == mir::MirTermKind.Branch {
+            edges.push(term.*.target)
+            edges.push(term.*.other)
+        }
 
         make j = 0
         while j < edges.len() {
@@ -146,12 +152,12 @@ make type Infer {
             d.attach(diags::Label.create(this.body.*.locals[local].range.copy(), "`" + errors::local_name(this.body, local) + "` declared here"))
         }
 
-        if local < st.*.moved.len() && d.*.code == "E2003" {
+        if local < st.*.flags.len() && d.*.code == "E2003" {
             d.attach(diags::Label.create(errors::move_event_range(this.body, st.*.move_site[local], local), "ownership was moved here"))
             d.note("passing or assigning an owning value transfers ownership; an explicit copy must be supported by its type")
         }
 
-        if local < st.*.dead.len() && d.*.code == "E2008" {
+        if local < st.*.flags.len() && d.*.code == "E2008" {
             d.attach(diags::Label.create(errors::event_range(this.body, st.*.dead_site[local]), "this storage was left here"))
         }
 
@@ -164,7 +170,7 @@ make type Infer {
                 if pin.*.src == local && pin.*.holder < this.graph.*.nlocals && (pin.*.index + 1) * 2 == st.*.pin_site[local] {
                     make holder = pin.*.holder
 
-                    if st.*.alive[holder] != 0 || st.*.pinned[holder] != 0 {
+                    if (st.*.flags[holder] & state::Alive) != 0 || (st.*.flags[holder] & state::Pinned) != 0 {
                         make name = errors::reference_carrier_name(this.body, this.graph, holder)
 
                         if name.len() > 0 {
@@ -198,7 +204,7 @@ make type Infer {
             return
         }
 
-        if st.*.moved[local] != 0 {
+        if (st.*.flags[local] & state::Moved) != 0 {
             make move_range = errors::move_event_range(this.body, st.*.move_site[local], local)
             make move_block = site_block(this.body, st.*.move_site[local])
             make use_block = site_block(this.body, this.current_site)
@@ -215,14 +221,14 @@ make type Infer {
             return
         }
 
-        if st.*.uninit[local] != 0 {
+        if (st.*.flags[local] & state::Uninit) != 0 {
             this.report_local(errors::uninitialized(this.body, range.copy(), local), local, st)
             return
         }
 
-        if st.*.alive[local] != 0 || st.*.pinned[local] != 0 { return }
+        if (st.*.flags[local] & state::Alive) != 0 || (st.*.flags[local] & state::Pinned) != 0 { return }
 
-        if st.*.dead[local] != 0 {
+        if (st.*.flags[local] & state::Dead) != 0 {
             this.report_local(errors::after_scope(this.body, range.copy(), local), local, st)
             return
         }
@@ -299,8 +305,11 @@ make type Infer {
 
     @this
     make refresh_pin (src: uint, st: ref<state::LocalState>) -> void {
-        if this.pin_holder_live(src, st) { st.*.pinned[src] = 1 }
-        else { st.*.pinned[src] = 0 st.*.pin_site[src] = 0 }
+        if this.pin_holder_live(src, st) { st.*.flags[src] = st.*.flags[src] | state::Pinned }
+        else {
+            st.*.flags[src] = st.*.flags[src] & (uint.max() ^ state::Pinned)
+            st.*.pin_site[src] = 0
+        }
     }
 
     // Two places with a different field in the same struct are disjoint.
@@ -471,7 +480,11 @@ make type Infer {
         make aliases: uint[] = []
         make alias_fields: str[] = []
         make i = 0
-        while i < body.*.locals.len() { aliases.push(0) alias_fields.push("") i = i + 1 }
+        while i < body.*.locals.len() {
+            aliases.push(0)
+            alias_fields.push("")
+            i = i + 1
+        }
 
         aliases[formal] = 1
         make changed = true
@@ -493,7 +506,10 @@ make type Infer {
                         make pj = 0
 
                         while pj < rv.*.place.projs.len() {
-                            if rv.*.place.projs[pj].kind == mir::MirProjKind.Field { first = rv.*.place.projs[pj].name.copy() break }
+                            if rv.*.place.projs[pj].kind == mir::MirProjKind.Field {
+                                first = rv.*.place.projs[pj].name.copy()
+                                break
+                            }
 
                             pj = pj + 1
                         }
@@ -602,31 +618,28 @@ make type Infer {
             return false
         }
 
-        if st.*.moved[local] != 0 && st.*.alive[local] != 0 {
+        if (st.*.flags[local] & state::Moved) != 0 && (st.*.flags[local] & state::Alive) != 0 {
             this.use_local(local, st, range.copy())
         }
 
-        if st.*.pinned[local] != 0 {
+        if (st.*.flags[local] & state::Pinned) != 0 {
             if this.pin_holder_live(local, st) {
                 if this.emit { this.report_local(errors::move_pinned(this.body, range.copy(), local), local, st) }
 
                 return false
             }
 
-            st.*.pinned[local] = 0
+            st.*.flags[local] = st.*.flags[local] & (uint.max() ^ state::Pinned)
         }
 
-        if st.*.alive[local] == 0 {
+        if (st.*.flags[local] & state::Alive) == 0 {
             this.use_local(local, st, range.copy())
             return false
         }
 
-        make had = st.*.owned[local] != 0
-        st.*.moved[local] = 1
+        make had = (st.*.flags[local] & state::Owned) != 0
+        st.*.flags[local] = (st.*.flags[local] & (state::Dead | state::Pinned)) | state::Moved
         st.*.move_site[local] = this.current_site
-        st.*.alive[local] = 0
-        st.*.uninit[local] = 0
-        st.*.owned[local] = 0
         return had
     }
 
@@ -677,22 +690,18 @@ make type Infer {
         if place.*.projs.len() > 0 {
             this.use_local(local, st, range.copy())
 
-            if st.*.pinned[local] != 0 && this.conflicts_with_pin(place, st) {
+            if (st.*.flags[local] & state::Pinned) != 0 && this.conflicts_with_pin(place, st) {
                 if this.emit { this.report_local(errors::assign_pinned(this.body, range.copy(), local), local, st) }
             }
 
             return
         }
 
-        if st.*.pinned[local] != 0 {
+        if (st.*.flags[local] & state::Pinned) != 0 {
             if this.emit { this.report_local(errors::assign_pinned(this.body, range.copy(), local), local, st) }
         }
 
-        st.*.alive[local] = 1
-        st.*.uninit[local] = 0
-        st.*.moved[local] = 0
-        st.*.dead[local] = 0
-        st.*.owned[local] = 0
+        st.*.flags[local] = (st.*.flags[local] & state::Pinned) | state::Alive
         return
     }
 
@@ -703,12 +712,7 @@ make type Infer {
             return
         }
 
-        st.*.uninit[local] = 1
-        st.*.alive[local] = 0
-        st.*.moved[local] = 0
-        st.*.pinned[local] = 0
-        st.*.dead[local] = 0
-        st.*.owned[local] = 0
+        st.*.flags[local] = state::Uninit
         return
     }
 
@@ -719,13 +723,8 @@ make type Infer {
             return
         }
 
-        st.*.uninit[local] = 0
-        st.*.alive[local] = 0
-        st.*.moved[local] = 0
-        st.*.pinned[local] = 0
-        st.*.dead[local] = 1
+        st.*.flags[local] = state::Dead
         st.*.dead_site[local] = this.current_site
-        st.*.owned[local] = 0
 
         make k = 0
 
@@ -765,7 +764,7 @@ make type Infer {
                     this.write_place(s.*.place.pin, st, range.copy())
 
                     if had {
-                        st.*.owned[dest] = 1
+                        st.*.flags[dest] = st.*.flags[dest] | state::Owned
 
                         if this.emit {
                             obls::transfer(this.fr.*.obligations.pin, src, dest, this.graph.*.nstmts)
@@ -803,7 +802,7 @@ make type Infer {
                 this.write_place(s.*.place.pin, st, range.copy())
 
                 if owned {
-                    st.*.owned[dest] = 1
+                    st.*.flags[dest] = st.*.flags[dest] | state::Owned
                 }
             }
 
@@ -840,7 +839,7 @@ make type Infer {
                 this.write_place(s.*.place.pin, st, range.copy())
 
                 if owned {
-                    st.*.owned[dest] = 1
+                    st.*.flags[dest] = st.*.flags[dest] | state::Owned
                 }
             }
 
@@ -848,9 +847,9 @@ make type Infer {
                 make src = rv.*.place.local
                 this.use_local(src, st, range.copy())
 
-                if src < this.graph.*.nlocals && (st.*.alive[src] != 0 || st.*.pinned[src] != 0) {
+                if src < this.graph.*.nlocals && ((st.*.flags[src] & state::Alive) != 0 || (st.*.flags[src] & state::Pinned) != 0) {
                     if dest == 0 {
-                        if !this.body.*.locals[src].is_param && st.*.owned[src] == 0 {
+                        if !this.body.*.locals[src].is_param && (st.*.flags[src] & state::Owned) == 0 {
                             if this.emit { this.report_local(errors::return_stack_ref(this.body, range.copy(), src), src, st) }
                         }
                     } elif src != dest {
@@ -878,13 +877,13 @@ make type Infer {
                         if indexed && !starts_with(this.body.*.locals[src].ty.copy(), "ptr<") { heap_backed = false }
 
                         if !heap_backed {
-                            if st.*.pinned[src] != 0 && rv.*.place.projs.len() == 0 && this.pin_holder_live(src, st) {
+                            if (st.*.flags[src] & state::Pinned) != 0 && rv.*.place.projs.len() == 0 && this.pin_holder_live(src, st) {
                                 if this.emit { this.report_local(errors::already_pinned(this.body, range.copy(), src), src, st) }
                             }
 
-                            if st.*.pinned[src] == 0 || st.*.pin_site[src] == 0 { st.*.pin_site[src] = (index + 1) * 2 }
+                            if (st.*.flags[src] & state::Pinned) == 0 || st.*.pin_site[src] == 0 { st.*.pin_site[src] = (index + 1) * 2 }
 
-                            st.*.pinned[src] = 1
+                            st.*.flags[src] = st.*.flags[src] | state::Pinned
                             make pi = 0
                             while pi < this.graph.*.pins.len() {
                                 if this.graph.*.pins[pi].index == index && this.graph.*.pins[pi].src == src && this.graph.*.pins[pi].holder == dest { st.*.active_pins[pi] = 1 }
@@ -977,7 +976,7 @@ make type Infer {
                     obls::satisfy(this.fr.*.obligations.pin, arg.*.place.local, index, this.graph.*.nstmts, true)
                 }
                 if unwrap && ai == 0 && arg.*.place.local < this.graph.*.nlocals {
-                    unwrap_owned = st.*.owned[arg.*.place.local] != 0
+                    unwrap_owned = (st.*.flags[arg.*.place.local] & state::Owned) != 0
                     if unwrap_owned && this.emit {
                         obls::transfer(this.fr.*.obligations.pin, arg.*.place.local, t.*.dest.local, this.graph.*.nstmts)
                     }
@@ -988,7 +987,7 @@ make type Infer {
                 make local = arg.*.place.local
 
                 if is_free {
-                    if local < this.graph.*.nlocals && st.*.pinned[local] != 0 {
+                    if local < this.graph.*.nlocals && (st.*.flags[local] & state::Pinned) != 0 {
                         if this.emit { this.report_local(errors::free_active(this.body, arg_range.copy(), local), local, st) }
 
                         this.use_local(local, st, arg_range.copy())
@@ -1015,13 +1014,13 @@ make type Infer {
         }
 
         this.write_place(t.*.dest.pin, st, range.copy())
-        if unwrap_owned && t.*.dest.local < this.graph.*.nlocals { st.*.owned[t.*.dest.local] = 1 }
+        if unwrap_owned && t.*.dest.local < this.graph.*.nlocals { st.*.flags[t.*.dest.local] = st.*.flags[t.*.dest.local] | state::Owned }
 
         if is_alloc {
             make dest = t.*.dest.local
 
             if dest < this.graph.*.nlocals {
-                st.*.owned[dest] = 1
+                st.*.flags[dest] = st.*.flags[dest] | state::Owned
             }
 
             if this.emit {

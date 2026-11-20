@@ -26,6 +26,40 @@ make array_allocate (count: uint, size: uint) -> ptr<char> {
     return data
 }
 
+/// Creates runtime-owned word storage of a known length in one allocation.
+@pub
+make zero_words (count: uint) -> uint[] {
+    make result: uint[] = []
+    if count > 0 {
+        @unsafe {
+            make header: ptr<Array> = result.pin
+            make data = array_allocate(count, @sizeof uint)
+            bytes::zero(data, count * (@sizeof uint))
+            header.*.data = data
+            header.*.length = count
+            header.*.capacity = count
+        }
+    }
+    return result
+}
+
+/// Creates pointer storage without per-element temporary stack allocations.
+@pub
+make zero_pointers (count: uint) -> ptr<any>[] {
+    make result: ptr<any>[] = []
+    if count > 0 {
+        @unsafe {
+            make header: ptr<Array> = result.pin
+            make data = array_allocate(count, @sizeof ptr<any>)
+            bytes::zero(data, count * (@sizeof ptr<any>))
+            header.*.data = data
+            header.*.length = count
+            header.*.capacity = count
+        }
+    }
+    return result
+}
+
 @pub @unsafe @export "__quip_array_concat"
 make array_concat (result: ptr<Array>, left: ptr<Array>, right: ptr<Array>, size: uint) -> void {
     make left_length: uint = left.*.length

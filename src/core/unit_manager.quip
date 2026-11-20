@@ -413,7 +413,7 @@ make type Unit {
         memr::collect(this.hir_module.pin, this.mem_ctx.pin)
         make previous = memr::MemReport {}
         make reuse: bool[] = []
-        this.mem_report = mem::check_cached(this.mir_module.pin, this.diag.pin, this.mem_ctx.pin, this.path_rel.get(), previous.pin, reuse.pin, timings)
+        this.mem_report = mem::check_cached(this.mir_module.pin, this.diag.pin, this.mem_ctx.pin, this.path_rel.get(), previous.pin, reuse.pin, timings, true)
 
         if timings.*.enabled { timings.*.record(started, "memory", this.path_rel.get()) }
 

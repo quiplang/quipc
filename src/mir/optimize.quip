@@ -1,0 +1,646 @@
+// Code-generation-only MIR transforms. Run after source memory diagnostics.
+@pure @const {
+    make mir = @import "mir.quip"
+    make flow = @import "flow.quip"
+    make token = @import "../core/token.quip"
+    make integer = @import "../llvm/integer.quip"
+}
+
+@pub
+make word_type (ty: str) -> bool {
+    return ty == "bool" || ty == "int" || ty == "uint" || ty == "i64" || ty == "u64"
+}
+
+make zero (operand: ref<mir::MirOperand>) -> bool {
+    if operand.*.kind != mir::MirOperandKind.Const || operand.*.is_sizeof { return false }
+    return operand.*.lit.lexeme == "0" || operand.*.lit.kind == token::TokenKind.KeyFalse
+}
+
+make one (operand: ref<mir::MirOperand>) -> bool {
+    return operand.*.kind == mir::MirOperandKind.Const && !operand.*.is_sizeof && operand.*.lit.lexeme == "1"
+}
+
+// These values have no address identity and no ownership or trapping effects.
+make removable (statement: ref<mir::MirStmt>, body: ref<mir::MirBody>, pinned: ref<bool[]>) -> bool {
+    if statement.*.kind != mir::MirStmtKind.Assign || statement.*.place.projs.len() > 0 { return false }
+
+    make local = statement.*.place.local
+    if pinned.*[local] || !word_type(body.*.locals[local].ty.copy()) { return false }
+
+    make value = statement.*.rvalue.pin
+    if value.*.kind == mir::MirRvalueKind.Use { return value.*.a.place.projs.len() == 0 }
+    if value.*.kind == mir::MirRvalueKind.Unary { return value.*.a.place.projs.len() == 0 }
+    if value.*.kind != mir::MirRvalueKind.Binary || value.*.a.place.projs.len() > 0 || value.*.b.place.projs.len() > 0 { return false }
+
+    return value.*.op == "+" || value.*.op == "-" || value.*.op == "*" || value.*.op == "&" || value.*.op == "|" || value.*.op == "^"
+        || value.*.op == "==" || value.*.op == "!=" || value.*.op == "<" || value.*.op == "<=" || value.*.op == ">" || value.*.op == ">=" || value.*.op == "__zero"
+}
+
+make constant (operand: ref<mir::MirOperand>, body: ref<mir::MirBody>, known: ref<bool[]>, values: ref<mir::MirOperand[]>) {
+    if (operand.*.kind == mir::MirOperandKind.Copy || operand.*.kind == mir::MirOperandKind.Move)
+        && operand.*.place.projs.len() == 0 && known.*[operand.*.place.local] && word_type(body.*.locals[operand.*.place.local].ty.copy()) {
+        // Explicit field copies keep source ranges for diagnostics/debugging.
+        make source = values.*[operand.*.place.local].pin
+        operand.*.kind = mir::MirOperandKind.Const
+        operand.*.ty = source.*.ty.copy()
+        operand.*.lit.kind = source.*.lit.kind
+        operand.*.lit.lexeme = source.*.lit.lexeme.copy()
+    }
+}
+
+make rename (operand: ref<mir::MirOperand>, aliases: ref<uint[]>) {
+    if operand.*.kind != mir::MirOperandKind.Copy && operand.*.kind != mir::MirOperandKind.Move { return }
+    if operand.*.place.projs.len() == 0 { operand.*.place.local = aliases.*[operand.*.place.local] }
+
+    make index: uint = 0
+    while index < operand.*.place.projs.len() {
+        if operand.*.place.projs[index].kind == mir::MirProjKind.Index { operand.*.place.projs[index].index = aliases.*[operand.*.place.projs[index].index] }
+        index++
+    }
+}
+
+make copies (body: ref<mir::MirBody>, pinned: ref<bool[]>) {
+    make definitions: uint[] = []
+    make aliases: uint[] = []
+
+    for local : body.*.locals {
+        _ = local
+        aliases.push(aliases.len())
+        definitions.push(0)
+    }
+
+    make local: uint = 1
+    while local <= body.*.param_count {
+        definitions[local] = 1
+        local++
+    }
+
+    for statement : body.*.stmts {
+        if statement.kind == mir::MirStmtKind.Assign && statement.place.projs.len() == 0 { definitions[statement.place.local]++ }
+    }
+
+    for term : body.*.terms { if term.kind == mir::MirTermKind.Call && term.dest.projs.len() == 0 { definitions[term.dest.local]++ } }
+
+    for statement : body.*.stmts {
+        make value = statement.rvalue.pin
+        if statement.kind != mir::MirStmtKind.Assign || statement.place.projs.len() > 0 || value.*.kind != mir::MirRvalueKind.Use
+            || (value.*.a.kind != mir::MirOperandKind.Copy && value.*.a.kind != mir::MirOperandKind.Move) || value.*.a.place.projs.len() > 0 { continue }
+
+        make dest = statement.place.local
+        make source = value.*.a.place.local
+        if definitions[dest] == 1 && definitions[source] == 1 && !pinned.*[dest] && !pinned.*[source]
+            && word_type(body.*.locals[dest].ty.copy()) && body.*.locals[dest].ty == body.*.locals[source].ty { aliases[dest] = source }
+    }
+
+    local = 0
+    while local < aliases.len() {
+        make target = aliases[local]
+        make steps: uint = 0
+
+        while aliases[target] != target && steps < aliases.len() {
+            target = aliases[target]
+            steps++
+        }
+
+        if steps < aliases.len() { aliases[local] = target }
+
+        local++
+    }
+
+    make index: uint = 0
+
+    while index < body.*.stmts.len() {
+
+        make statement = body.*.stmts[index].pin
+        if statement.*.kind == mir::MirStmtKind.Assign {
+            make value = statement.*.rvalue.pin
+            rename(value.*.a.pin, aliases.pin)
+            rename(value.*.b.pin, aliases.pin)
+
+            make argument: uint = 0
+            while argument < value.*.ops.len() {
+                rename(value.*.ops[argument].pin, aliases.pin)
+                argument++
+            }
+        }
+
+        index++
+    }
+
+    index = 0
+    while index < body.*.terms.len() {
+        make term = body.*.terms[index].pin
+        rename(term.*.cond.pin, aliases.pin)
+
+        make argument: uint = 0
+        while argument < term.*.args.len() {
+            rename(term.*.args[argument].pin, aliases.pin)
+            argument++
+        }
+
+        index++
+    }
+
+}
+
+make number (operand: ref<mir::MirOperand>) -> !uint {
+    if operand.*.lit.kind == token::TokenKind.KeyTrue { return 1 }
+    if operand.*.lit.kind == token::TokenKind.KeyFalse { return 0 }
+
+    return integer::parse(operand.*.lit.lexeme.copy())
+}
+
+make fold (value: ref<mir::MirRvalue>) {
+    if value.*.kind == mir::MirRvalueKind.Unary && value.*.op == "!" && value.*.a.kind == mir::MirOperandKind.Const && !value.*.a.is_sizeof {
+        make bits = number(value.*.a.pin) catch { return }
+
+        value.*.kind = mir::MirRvalueKind.Use
+        value.*.a.lit.kind = token::TokenKind.KeyFalse
+
+        if bits == 0 { value.*.a.lit.kind = token::TokenKind.KeyTrue }
+
+        value.*.a.lit.lexeme = ""
+
+        return
+    }
+
+    if value.*.kind != mir::MirRvalueKind.Binary || value.*.a.kind != mir::MirOperandKind.Const || value.*.b.kind != mir::MirOperandKind.Const
+        || value.*.a.is_sizeof || value.*.b.is_sizeof { return }
+
+    if !word_type(value.*.a.ty.copy()) && value.*.a.ty != "" { return }
+    if !word_type(value.*.b.ty.copy()) && value.*.b.ty != "" { return }
+
+    make left = number(value.*.a.pin) catch { return }
+    make right = number(value.*.b.pin) catch { return }
+    make result: uint = 0
+    make comparison = true
+    make truth = false
+    @unsafe make signed_left: int = left
+    @unsafe make signed_right: int = right
+    make unsigned = value.*.a.ty == "uint" || value.*.a.ty == "u64"
+
+    if value.*.op == "==" { truth = left == right }
+    elif value.*.op == "!=" { truth = left != right }
+    elif value.*.op == "<" { if unsigned { truth = left < right } else { truth = signed_left < signed_right } }
+    elif value.*.op == "<=" { if unsigned { truth = left <= right } else { truth = signed_left <= signed_right } }
+    elif value.*.op == ">" { if unsigned { truth = left > right } else { truth = signed_left > signed_right } }
+    elif value.*.op == ">=" { if unsigned { truth = left >= right } else { truth = signed_left >= signed_right } }
+    else {
+        comparison = false
+        if value.*.op == "+" { result = left + right }
+        elif value.*.op == "-" { result = left - right }
+        elif value.*.op == "*" { result = left * right }
+        elif value.*.op == "&" { result = left & right }
+        elif value.*.op == "|" { result = left | right }
+        elif value.*.op == "^" { result = left ^ right }
+        else { return }
+    }
+
+    value.*.kind = mir::MirRvalueKind.Use
+    value.*.b = mir::MirOperand {}
+
+    if comparison {
+        value.*.a.lit.kind = token::TokenKind.KeyFalse
+
+        if truth { value.*.a.lit.kind = token::TokenKind.KeyTrue }
+
+        value.*.a.lit.lexeme = ""
+        value.*.a.ty = "bool"
+    } else {
+        value.*.a.lit.kind = token::TokenKind.LiteralNum
+        value.*.a.lit.lexeme = result.to_str()
+    }
+}
+
+make simplify (body: ref<mir::MirBody>, pinned: ref<bool[]>) {
+    make graph = flow::graph(body)
+    make known: bool[] = []
+    make values: mir::MirOperand[] = []
+
+    for local : body.*.locals {
+        _ = local
+        known.push(false)
+        values.push(mir::MirOperand {})
+    }
+
+    make block: uint = 0
+    while block < body.*.terms.len() {
+        make local: uint = 0
+        while local < known.len() {
+            known[local] = false
+            local++
+        }
+
+        for index : graph.statements[block].values {
+            make statement = body.*.stmts[index].pin
+
+            if statement.*.kind != mir::MirStmtKind.Assign { continue }
+
+            make value = statement.*.rvalue.pin
+            constant(value.*.a.pin, body, known.pin, values.pin)
+            constant(value.*.b.pin, body, known.pin, values.pin)
+
+            make argument: uint = 0
+            while argument < value.*.ops.len() {
+                constant(value.*.ops[argument].pin, body, known.pin, values.pin)
+                argument++
+            }
+
+            local = statement.*.place.local
+
+            if statement.*.place.projs.len() > 0 { continue }
+
+            if word_type(body.*.locals[local].ty.copy()) && value.*.kind == mir::MirRvalueKind.Binary {
+                if ((value.*.op == "+" || value.*.op == "-" || value.*.op == "|" || value.*.op == "^") && zero(value.*.b.pin))
+                    || (value.*.op == "*" && one(value.*.b.pin)) {
+                    value.*.kind = mir::MirRvalueKind.Use
+                    value.*.b = mir::MirOperand {}
+                }
+            }
+
+            if word_type(body.*.locals[local].ty.copy()) { fold(value) }
+
+            known[local] = !pinned.*[local] && word_type(body.*.locals[local].ty.copy()) && value.*.kind == mir::MirRvalueKind.Use
+                && value.*.a.kind == mir::MirOperandKind.Const && !value.*.a.is_sizeof
+
+            if known[local] {
+                values[local].ty = body.*.locals[local].ty.copy()
+                values[local].lit.kind = value.*.a.lit.kind
+                values[local].lit.lexeme = value.*.a.lit.lexeme.copy()
+            }
+        }
+
+        make term = body.*.terms[block].pin
+        constant(term.*.cond.pin, body, known.pin, values.pin)
+
+        make argument: uint = 0
+        while argument < term.*.args.len() {
+            constant(term.*.args[argument].pin, body, known.pin, values.pin)
+            argument++
+        }
+
+        if term.*.kind == mir::MirTermKind.Branch {
+            make operand = term.*.cond.pin
+
+            if term.*.target == term.*.other { term.*.kind = mir::MirTermKind.Goto }
+            elif operand.*.kind == mir::MirOperandKind.Const && !operand.*.is_sizeof && (operand.*.lit.kind == token::TokenKind.KeyTrue || operand.*.lit.kind == token::TokenKind.KeyFalse || operand.*.lit.kind == token::TokenKind.LiteralNum) {
+                if zero(operand) { term.*.target = term.*.other }
+                term.*.kind = mir::MirTermKind.Goto
+            }
+        }
+
+        block++
+    }
+}
+
+// Compact unreachable blocks without renumbering locals or dropping cleanup
+// markers in reachable blocks. All successor edges are remapped together.
+make compact (body: ref<mir::MirBody>) {
+    make graph = flow::graph(body)
+    make reached: bool[] = []
+    make remap: uint[] = []
+
+    for term : body.*.terms {
+        _ = term
+        reached.push(false)
+        remap.push(0)
+    }
+
+    make pending: uint[] = [0]
+    reached[0] = true
+    make cursor: uint = 0
+    while cursor < pending.len() {
+        make block = pending[cursor]
+        cursor++
+        for target : graph.successors[block].values {
+            if !reached[target] {
+                reached[target] = true
+                pending.push(target)
+            }
+        }
+    }
+
+    make terms: mir::MirTerm[] = []
+    make block: uint = 0
+    while block < body.*.terms.len() {
+        if reached[block] {
+            remap[block] = terms.len()
+            terms.push(body.*.terms[block])
+        }
+        block++
+    }
+
+    make term_index: uint = 0
+    while term_index < terms.len() {
+        make term = terms[term_index].pin
+        if term.*.kind == mir::MirTermKind.Goto || term.*.kind == mir::MirTermKind.Call || term.*.kind == mir::MirTermKind.Branch { term.*.target = remap[term.*.target] }
+        if term.*.kind == mir::MirTermKind.Branch { term.*.other = remap[term.*.other] }
+        term_index++
+    }
+
+    make statements: mir::MirStmt[] = []
+    // Group statements by block; this also gives later passes linear scans.
+    block = 0
+    while block < body.*.terms.len() {
+        if reached[block] {
+            for index : graph.statements[block].values {
+                make statement = body.*.stmts[index]
+                statement.block = remap[block]
+                statements.push(statement)
+            }
+        }
+        block++
+    }
+
+    body.*.stmts = statements
+    body.*.terms = terms
+}
+
+// Redirect edges through blocks with no runtime effects. Primitive storage
+// markers carry diagnostic lifetimes, but have no cleanup after validation.
+make thread_edges (body: ref<mir::MirBody>) {
+    make empty: bool[] = []
+
+    for term : body.*.terms { empty.push(term.kind == mir::MirTermKind.Goto) }
+
+    for statement : body.*.stmts {
+        if (statement.kind != mir::MirStmtKind.StorageLive && statement.kind != mir::MirStmtKind.StorageDead)
+            || !flow::scalar(body.*.locals[statement.local].ty.copy()) { empty[statement.block] = false }
+    }
+
+    make targets: uint[] = []
+    make block: uint = 0
+    while block < body.*.terms.len() {
+        make target = block
+        make steps: uint = 0
+
+        while target != 0 && empty[target] && steps < body.*.terms.len() {
+            target = body.*.terms[target].target
+            steps++
+        }
+
+        if steps == body.*.terms.len() { target = block }
+
+        targets.push(target)
+        block++
+    }
+
+    block = 0
+    while block < body.*.terms.len() {
+        make term = body.*.terms[block].pin
+        if term.*.kind == mir::MirTermKind.Goto || term.*.kind == mir::MirTermKind.Call || term.*.kind == mir::MirTermKind.Branch { term.*.target = targets[term.*.target] }
+        if term.*.kind == mir::MirTermKind.Branch {
+            term.*.other = targets[term.*.other]
+            if term.*.target == term.*.other { term.*.kind = mir::MirTermKind.Goto }
+        }
+
+        block++
+    }
+}
+
+make append_block (body: ref<mir::MirBody>, block: uint, target: uint) {
+    make statements: mir::MirStmt[] = []
+
+    for statement : body.*.stmts { if statement.block != target { statements.push(statement) } }
+
+    for statement : body.*.stmts {
+        if statement.block == target {
+            statement.block = block
+            statements.push(statement)
+        }
+    }
+
+    body.*.stmts = statements
+}
+
+make merge (body: ref<mir::MirBody>) {
+    make changed = true
+    while changed {
+        changed = false
+        make graph = flow::graph(body)
+
+        make block: uint = 0
+        while block < body.*.terms.len() {
+            make term = body.*.terms[block].pin
+
+            if term.*.kind == mir::MirTermKind.Goto {
+                make target = term.*.target
+                if target != 0 && target != block && graph.predecessors[target].values.len() == 1 {
+                    append_block(body, block, target)
+                    body.*.terms[block] = body.*.terms[target]
+                    body.*.terms[target] = mir::MirTerm { kind = mir::MirTermKind.Unreachable }
+                    changed = true
+                    break
+                }
+            }
+
+            block++
+        }
+    }
+}
+
+make plain (name: str, structs: ref<mir::MirStruct[]>) -> bool {
+    for definition : structs.* {
+        if definition.name == name {
+            for field : definition.fields { if !flow::scalar(field.ty.copy()) { return false } }
+            return true
+        }
+    }
+
+    return false
+}
+
+// A single-use plain call result may be written straight into its destination.
+make forward (body: ref<mir::MirBody>, structs: ref<mir::MirStruct[]>, pinned: ref<bool[]>) -> bool[] {
+    make graph = flow::graph(body)
+    make uses: uint[] = []
+
+    for local : body.*.locals {
+        _ = local
+        uses.push(0)
+    }
+
+    make reads: uint[] = []
+    while reads.len() < graph.words { reads.push(0) }
+    // Counting appearances conservatively through bitsets is sufficient: the
+    // forwarding candidate has one assignment use and no other instruction use.
+    for statement : body.*.stmts {
+        make word: uint = 0
+        while word < reads.len() {
+            reads[word] = 0
+            word++
+        }
+
+        flow::rvalue_reads(reads.pin, statement.rvalue.pin)
+        if statement.place.projs.len() > 0 { flow::place_reads(reads.pin, statement.place.pin) }
+
+        make local: uint = 0
+        while local < uses.len() {
+            if flow::bit(reads.pin, 0, local) {
+                uses[local]++
+            }
+            local++
+        }
+    }
+
+    for term : body.*.terms {
+        make word: uint = 0
+        while word < reads.len() {
+            reads[word] = 0
+            word++
+        }
+
+        flow::terminator_backwards(reads.pin, term.pin)
+
+        make local: uint = 0
+        while local < uses.len() {
+            if flow::bit(reads.pin, 0, local) {
+                uses[local]++
+            }
+            local++
+        }
+    }
+
+    make erased: bool[] = []
+    for statement : body.*.stmts {
+        _ = statement
+        erased.push(false)
+    }
+
+    make term_index: uint = 0
+    while term_index < body.*.terms.len() {
+        make term = body.*.terms[term_index].pin
+        term_index++
+
+        if term.*.kind != mir::MirTermKind.Call || term.*.func.kind != mir::MirOperandKind.Path || !term.*.ret_agg || term.*.dest.projs.len() > 0 { continue }
+
+        make temporary = term.*.dest.local
+
+        if uses[temporary] != 1 || pinned.*[temporary] || !plain(body.*.locals[temporary].ty.copy(), structs) { continue }
+        if graph.predecessors[term.*.target].values.len() != 1 { continue }
+
+        for index : graph.statements[term.*.target].values {
+            make statement = body.*.stmts[index].pin
+            if statement.*.kind != mir::MirStmtKind.Assign { continue }
+
+            make value = statement.*.rvalue.pin
+
+            if statement.*.place.projs.len() == 0 && value.*.kind == mir::MirRvalueKind.Use
+                && (value.*.a.kind == mir::MirOperandKind.Move || value.*.a.kind == mir::MirOperandKind.Copy) && value.*.a.place.projs.len() == 0 && value.*.a.place.local == temporary
+                && statement.*.place.local != temporary && !pinned.*[statement.*.place.local]
+                && body.*.locals[statement.*.place.local].ty == body.*.locals[temporary].ty {
+
+                make aliases = false
+
+                for argument : term.*.args { if argument.kind != mir::MirOperandKind.Const && argument.place.local == statement.*.place.local { aliases = true } }
+
+                if !aliases {
+                    term.*.dest.local = statement.*.place.local
+                    erased[index] = true
+                }
+            }
+
+            break
+        }
+    }
+
+    return erased
+}
+
+@pub
+make run (body: ref<mir::MirBody>, structs: ref<mir::MirStruct[]>) {
+    if body.*.terms.len() == 0 { return }
+    make pinned: bool[] = []
+
+    for local : body.*.locals {
+        _ = local
+        pinned.push(false)
+    }
+
+    for capture : body.*.capture_locals { pinned[capture] = true }
+
+    for statement : body.*.stmts {
+        if statement.kind == mir::MirStmtKind.Assign && statement.rvalue.kind == mir::MirRvalueKind.Pin { pinned[statement.rvalue.place.local] = true }
+    }
+
+    for term : body.*.terms {
+        // Attached receivers may be borrowed implicitly without a MIR Pin.
+        if term.kind == mir::MirTermKind.Call && term.has_receiver && term.args.len() > 0
+            && (term.args[0].kind == mir::MirOperandKind.Copy || term.args[0].kind == mir::MirOperandKind.Move) {
+            pinned[term.args[0].place.local] = true
+        }
+    }
+
+    make erased = forward(body, structs, pinned.pin)
+    make forwarded: mir::MirStmt[] = []
+    make forward_index: uint = 0
+
+    for statement : body.*.stmts {
+        if !erased[forward_index] {
+            forwarded.push(statement)
+        }
+        forward_index++
+    }
+
+    body.*.stmts = forwarded
+
+    // Address-exposed words are never propagated across possible mutations.
+    merge(body)
+    compact(body)
+    simplify(body, pinned.pin)
+    compact(body)
+    merge(body)
+    compact(body)
+    simplify(body, pinned.pin)
+    compact(body)
+    thread_edges(body)
+    compact(body)
+    merge(body)
+    compact(body)
+    copies(body, pinned.pin)
+
+    make facts = flow::liveness(body)
+    make keep: bool[] = []
+
+    for statement : body.*.stmts {
+        _ = statement
+        keep.push(true)
+    }
+
+    make live: uint[] = []
+    while live.len() < facts.words { live.push(0) }
+
+    make block: uint = 0
+    while block < body.*.terms.len() {
+        make word: uint = 0
+        while word < facts.words {
+            live[word] = facts.live_out[block * facts.words + word]
+            word++
+        }
+
+        flow::terminator_backwards(live.pin, body.*.terms[block].pin)
+
+        make index = facts.statements[block].values.len()
+        while index > 0 {
+            index--
+            make id = facts.statements[block].values[index]
+            make statement = body.*.stmts[id].pin
+            if removable(statement, body, pinned.pin) && !flow::bit(live.pin, 0, statement.*.place.local) { keep[id] = false }
+            else { flow::statement_backwards(live.pin, statement, body) }
+        }
+
+        block++
+    }
+
+    make statements: mir::MirStmt[] = []
+    make index: uint = 0
+    for statement : body.*.stmts {
+        if keep[index] {
+            statements.push(statement)
+        }
+        index++
+    }
+    body.*.stmts = statements
+    thread_edges(body)
+    compact(body)
+}

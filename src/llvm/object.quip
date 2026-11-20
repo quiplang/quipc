@@ -6,6 +6,9 @@
     make lower = @import "lower.quip"
     make memory = @import "../memory/report.quip"
     make mir = @import "../mir/mir.quip"
+    make optimize = @import "../mir/optimize.quip"
+    make graph = @import "../memory/lifetimes/graph.quip"
+    make planning = @import "../memory/plan.quip"
     make link = @import "link.quip"
 }
 
@@ -186,6 +189,20 @@ make compile (mir_module: ref<mir::MirModule>, report: ref<memory::MemReport>, f
     @unsafe {
         make started: uint = 0
         if timings.*.enabled { started = profile::now() }
+        make index: uint = 0
+        while index < mir_module.*.funcs.len() {
+            make function = mir_module.*.funcs[index].pin
+            if !function.*.is_external {
+                optimize::run(function.*.body.pin, mir_module.*.structs.pin)
+                make facts = graph::build(function.*.body.pin)
+                if index < report.*.funcs.len() { report.*.funcs[index].slots = planning::build(facts.pin, function.*.body.pin, mir_module.*.structs.pin) }
+            }
+            index++
+        }
+        if timings.*.enabled {
+            timings.*.record(started, "mir_optimize", filename.copy())
+            started = profile::now()
+        }
         make context = api::LLVMContextCreate()
         make module = api::LLVMModuleCreateWithNameInContext(filename.data, context)
         api::LLVMSetSourceFileName(module, filename.data, filename.len())

@@ -378,6 +378,10 @@ make type Parser {
         node.*.status = ast::AST_Status.Error
 
         match this.current().*.kind {
+            lexer::TokenKind.LParen {
+                std::mem::debug.free(node)
+                return this.parse_var(ctx)
+            }
             lexer::TokenKind.Identifier {
 
                 // decide between a function and a variable (or a type alias, which is
@@ -501,14 +505,21 @@ make type Parser {
         make start = this.current().*.span
         make status = ast::AST_Status.Ok
 
-        node.*.name = this.expect(lexer::TokenKind.Identifier) catch { // handle identifier
-            make d = diag::Diag.err(err::Err.UnexpectedToken, this.here(), "unexepcted token")
-            this.report(ctx, d)
+        if this.current().*.kind == lexer::TokenKind.LParen {
+            node.*.pattern = this.parse_primary(ctx)
+            node.*.name.lexeme = "__tuple_pattern"
+            node.*.name.span = start.copy()
+        } else {
+            node.*.name = this.expect(lexer::TokenKind.Identifier) catch { // handle identifier
+                make d = diag::Diag.err(err::Err.UnexpectedToken, this.here(), "unexepcted token")
+                this.report(ctx, d)
 
-            this.recover(ctx)
+                this.recover(ctx)
 
-            @unsafe return this.wrap(ast::new_var(node), start, ast::AST_Status.Error)
-        }.*
+                @unsafe return this.wrap(ast::new_var(node), start, ast::AST_Status.Error)
+            }.*
+
+        }
 
         // an optional generic parameter list, used by compile-time type aliases:
         // `make Alias<T, K>: Type = ...`
@@ -719,7 +730,11 @@ make type Parser {
         make start = this.current().*.span
         make status = ast::AST_Status.Ok
 
-        node.inc = this.expect_identifier(ctx).*
+        if this.current().*.kind == lexer::TokenKind.LParen {
+            node.pattern = this.parse_primary(ctx)
+        } else {
+            node.inc = this.expect_identifier(ctx).*
+        }
 
         this.expect(lexer::TokenKind.Colon) catch {}
 
@@ -872,51 +887,43 @@ make type Parser {
 
         if this.current().*.kind == lexer::TokenKind.LParen {
             sig.*.name.kind = lexer::TokenKind.Identifier
-            sig.*.name.lexeme = "fn"
+            sig.*.name.lexeme = "tuple"
             sig.*.is_generic = true
             this.advance()
             make parameters: owned<ast::AST_TypeSig>[] = []
+            make comma = false
 
             while this.current().*.kind != lexer::TokenKind.RParen && this.current().*.kind != lexer::TokenKind.EOF {
                 make parameter = this.parse_type_signature(ctx)
-
                 if parameter == none { return none }
-
                 parameters.push(parameter.unwrap())
-
                 if this.current().*.kind != lexer::TokenKind.Comma { break }
-
+                comma = true
                 this.advance()
             }
-
             this.expect(lexer::TokenKind.RParen) catch { return none }
-
-            this.expect(lexer::TokenKind.Arrow) catch {
-                make d = diag::Diag.err(err::Err.UnexpectedToken, this.here(), "expected '->' in function type")
-                this.report(ctx, d)
-                return none
+            if this.current().*.kind == lexer::TokenKind.Arrow {
+                this.advance()
+                sig.*.name.lexeme = "fn"
+                make result = this.parse_type_signature(ctx)
+                if result == none { return none }
+                sig.*.inner.push(result.unwrap())
+                for parameter : parameters { sig.*.inner.push(parameter) }
+            } elif parameters.len() == 1 && !comma {
+                make fallible = sig.*.is_fallible
+                sig = parameters[0]
+                if fallible { sig.*.is_fallible = true }
+            } else {
+                for parameter : parameters { sig.*.inner.push(parameter) }
             }
-            make result = this.parse_type_signature(ctx)
-
-            if result == none { return none }
-
-            sig.*.inner.push(result.unwrap())
-
-            for parameter : parameters { sig.*.inner.push(parameter) }
-
-            sig.*.range.end = this.prev().*.span
-            return sig
+        } else {
+            sig.*.name = this.expect(lexer::TokenKind.Identifier) catch {
+                make d = diag::Diag.err(err::Err.UnexpectedToken, this.here(), "expected Type identifier")
+                this.report(ctx, d)
+                this.recover(ctx)
+                return none
+            }.*
         }
-
-        sig.*.name = this.expect(lexer::TokenKind.Identifier) catch {
-            make d = diag::Diag.err(err::Err.UnexpectedToken, this.here(), "unexpected token")
-            d.label("expected Type identifier")
-            this.report(ctx, d)
-
-            this.recover(ctx)
-            return none
-        }.*
-
 
         while true {
 
@@ -2347,20 +2354,37 @@ make type Parser {
             return this.parse_lambda(ctx, false)
         }
 
-        // parenthesized (grouped) expression `( ... )`
+        // A comma distinguishes tuple construction from grouping.
         if this.current().*.kind == lexer::TokenKind.LParen {
-            this.advance() // consume '('
-
-            make inner = this.parse_expr(ctx)
-
+            make start = this.current().*.span
+            this.advance()
+            make ctor = ast::fresh_constructor()
+            if this.current().*.kind != lexer::TokenKind.RParen {
+                make first = this.parse_expr(ctx)
+                if this.current().*.kind != lexer::TokenKind.Comma {
+                    this.expect(lexer::TokenKind.RParen) catch {
+                        make d = diag::Diag.err(err::Err.UnexpectedToken, this.here(), "expected ')' here")
+                        this.report(ctx, d)
+                        this.recover(ctx)
+                    }
+                    @unsafe return first
+                }
+                ctor.*.fields.push(first)
+                while this.current().*.kind == lexer::TokenKind.Comma {
+                    this.advance()
+                    if this.current().*.kind == lexer::TokenKind.RParen { break }
+                    ctor.*.fields.push(this.parse_expr(ctx))
+                }
+            }
             this.expect(lexer::TokenKind.RParen) catch {
-                make d = diag::Diag.err(err::Err.UnexpectedToken, this.here(), "unexpected token")
-                d.label("expected ')' here")
+                make d = diag::Diag.err(err::Err.UnexpectedToken, this.here(), "expected ')' after tuple")
                 this.report(ctx, d)
                 this.recover(ctx)
             }
-
-            @unsafe return inner
+            make e = ast::fresh_expr()
+            e.*.kind = ast::ExprKind.TupleLiteral
+            e.*.constructor = ctor
+            return this.wrap(ast::new_expr(e), start, ast::AST_Status.Ok)
         }
 
         if this.current().*.kind == lexer::TokenKind.Identifier || this.current().*.kind == lexer::TokenKind.KeyError {

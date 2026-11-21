@@ -2,6 +2,7 @@
 // unless the local was ever pinned (its address may still be observed)
 
 @pure @const {
+    make flow = @import "../../repr/mir/flow.quip"
     make mir = @import "../../repr/mir/mir.quip"
     make graph = @import "../../analysis/mir/memory/lifetimes/graph.quip"
     make report = @import "../../analysis/mir/memory/report.quip"
@@ -11,6 +12,13 @@
 /// plans stack slots for mir locals using their liveness information.
 @pub
 make build (g: ref<graph::LivenessGraph>, body: ref<mir::MirBody>, structs: ref<mir::MirStruct[]>) -> report::MemSlot[] {
+    make facts = flow::liveness(body)
+    return build_with_facts(g, body, structs, facts.pin)
+}
+
+/// Plans storage using shared facts from the same, unmodified MIR body.
+@pub
+make build_with_facts (g: ref<graph::LivenessGraph>, body: ref<mir::MirBody>, structs: ref<mir::MirStruct[]>, facts: ref<flow::Graph>) -> report::MemSlot[] {
     make out: report::MemSlot[] = []
 
     make n = g.*.nlocals
@@ -20,7 +28,7 @@ make build (g: ref<graph::LivenessGraph>, body: ref<mir::MirBody>, structs: ref<
         return out
     }
 
-    make slot_of = interference::assign(body, g.*.ever_pinned.pin)
+    make slot_of = interference::assign_with_facts(body, g.*.ever_pinned.pin, facts)
     make i: uint = 0
 
     i = 0

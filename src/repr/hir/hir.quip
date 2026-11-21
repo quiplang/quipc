@@ -31,6 +31,7 @@ make enum HirExprKind {
     Copy,
     Constructor,
     Array,
+    Tuple,
     EnumVariant,
     Match,
     Sizeof,
@@ -136,6 +137,8 @@ make type HirStmt {
     @pub make range: util::Range = .{}
     @pub make group_range: util::Range = .{}
 
+    @pub make tuple_pattern: bool = false
+    @pub make tuple_arity: uint = 0
     @pub make local: uint = 0            // Let
     @pub make target: uint = 0           // Assign: place expression
     @pub make op: lexer::Token = .{}     // Assign: `=` or a compound operator such as `+=`

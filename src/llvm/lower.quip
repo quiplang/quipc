@@ -34,13 +34,13 @@ make type ScalarFunction {
 /// Lowers a MIR unit into a module owned by the caller.
 @pub @unsafe
 make build (context: ptr<any>, module: ptr<any>, m: ref<mir::MirModule>, module_name: str,
-    selected_entry: str, source: str, platform: str, report: ref<memr::MemReport>) -> bool {
+    selected_entry: str, source: str, platform: str, report: ref<memr::MemReport>, codegen_facts: ref<flow::Graph[]>) -> bool {
     make builder = api::LLVMCreateBuilderInContext(context)
     @unsafe make null: ptr<any> = 0
     make e = Emitter {
         context = context, module = module, builder = builder, null = null,
         module_name = module_name, entry = selected_entry, source = source, platform = platform,
-        mem_report = report, word = api::LLVMInt64TypeInContext(context),
+        codegen_facts = codegen_facts, mem_report = report, word = api::LLVMInt64TypeInContext(context),
         byte = api::LLVMInt8TypeInContext(context), pointer = api::LLVMPointerTypeInContext(context, 0),
         void_type = api::LLVMVoidTypeInContext(context), c_int = api::LLVMInt32TypeInContext(context),
         conversion = native::Conversion.create(context, builder),
@@ -50,7 +50,7 @@ make build (context: ptr<any>, module: ptr<any>, m: ref<mir::MirModule>, module_
     api::LLVMDisposeBuilder(builder)
     for function : e.scalar_functions {
         scalar::build(context, module, function.symbol.copy(), m.*.funcs[function.index].body.pin,
-            m.*.funcs[function.index].is_lambda, function.slots.pin, function.calls.pin, e.builder_layouts.pin)
+            m.*.funcs[function.index].is_lambda, function.slots.pin, function.calls.pin, e.builder_layouts.pin, codegen_facts.*[function.index].pin)
     }
     descriptors::build(context, module, e.descriptors.pin)
     if e.needs_string_equal { strings::build(context, module) }
@@ -138,6 +138,7 @@ make type Emitter {
     make cur_sret: bool = false
     make direct_result: bool = false
     make platform: str = "macos"
+    make codegen_facts: ref<flow::Graph[]>
     make mem_report: ref<memr::MemReport>
 
     // the unit's source text (to turn a byte offset into a line for runtime panics) and the module-level
@@ -497,6 +498,8 @@ make type Emitter {
 
         if this.ends_with(t !, "?") { return "" }
 
+        if t.len() > 0 && t[0] == '(' { return t }
+
         make lt = this.first_at(t !, '<')
 
         if lt >= t.len() { return t }
@@ -596,10 +599,19 @@ make type Emitter {
         return i
     }
 
-    /// removes an enclosing pair of parentheses from a type name.
+    /// removes grouping around a fallible payload, preserving tuple parentheses.
     @this
     make unparen (ty: str) -> str {
-        if ty.len() > 1 && ty[0] == '(' && ty[ty.len() - 1] == ')' {
+        if ty.len() > 2 && ty[0] == '(' && ty[1] == '!' && ty[ty.len() - 1] == ')' {
+            make depth: uint = 0
+            make i: uint = 1
+            while i + 1 < ty.len() {
+                make ch = ty[i]
+                if ch == ',' && depth == 0 { return ty }
+                if ch == '(' || ch == '<' { depth++ }
+                elif ch == ')' || ch == '>' { depth-- }
+                i++
+            }
             return this.slice(ty !, 1, ty.len() - 1)
         }
 
@@ -689,9 +701,9 @@ make type Emitter {
                 start = i + 1
 
                 while start < ty.len() && ty[start] == ' ' { start = start + 1 }
-            } elif c == '<' {
+            } elif c == '<' || c == '(' {
                 depth = depth + 1
-            } elif c == '>' {
+            } elif c == '>' || c == ')' {
                 depth = depth - 1
             }
 
@@ -796,7 +808,27 @@ make type Emitter {
         return ty == "fn" || (ty.len() > 3 && ty[0] == 'f' && ty[1] == 'n' && ty[2] == '<' && ty[ty.len() - 1] == '>')
     }
 
-    /// checks for closure.
+    // Tuple ownership is structural: use the existing value descriptors for
+    // buffers and owning fields, even when the tuple contains no closure.
+    @this
+    make tuple_field_managed (ty: str, depth: uint) -> bool {
+        if depth > 64 { return false }
+        if ty == "str" || ty == "String" || this.is_function(ty.copy()) || this.ends_with(ty.copy(), "[]") { return true }
+        if ty.len() > 6 && this.slice(ty.copy(), 0, 6) == "owned<" { return true }
+        if this.is_indirect(ty.copy()) { return false }
+        if this.is_optional(ty.copy()) { return this.tuple_field_managed(this.optional_payload(ty), depth + 1) }
+        if this.is_fallible(ty.copy()) { return this.tuple_field_managed(this.strip_bang(ty), depth + 1) }
+        if this.is_variant(ty.copy()) {
+            for member : this.variant_members(ty) { if this.tuple_field_managed(member, depth + 1) { return true } }
+            return false
+        }
+        make index = this.struct_index(ty)
+        if index < this.structs.len() {
+            for field : this.structs[index].*.fields { if this.tuple_field_managed(field.ty.copy(), depth + 1) { return true } }
+        }
+        return false
+    }
+
     @this
     make has_closure (ty: str) -> bool {
         if this.is_function(ty.copy()) { return true }
@@ -816,7 +848,8 @@ make type Emitter {
         this.managed_flags.push(false)
         make found = false
 
-        if this.ends_with(ty.copy(), "[]") { found = this.has_closure(this.pointee(ty.copy())) }
+        if ty.len() > 0 && ty[0] == '(' { found = this.tuple_field_managed(ty.copy(), 0) }
+        elif this.ends_with(ty.copy(), "[]") { found = this.has_closure(this.pointee(ty.copy())) }
         elif this.is_optional(ty.copy()) { found = this.has_closure(this.optional_payload(ty.copy())) }
         elif this.is_fallible(ty.copy()) { found = this.has_closure(this.strip_bang(ty.copy())) }
         elif this.is_variant(ty.copy()) {
@@ -949,6 +982,11 @@ make type Emitter {
     @this @unsafe
     make prepare_value (op: ref<mir::MirOperand>, ty: str) -> ptr<any> {
         make destination = this.allocate(this.size_of(ty.copy()))
+        if this.tuple_type(ty.copy()) && this.operand_type(op) != ty {
+            this.zero_value(destination, ty.copy())
+            this.convert_tuple(op, destination, ty)
+            return destination
+        }
 
         if op.*.kind == mir::MirOperandKind.Path || op.*.kind == mir::MirOperandKind.Const {
             if this.is_agg(ty.copy()) {
@@ -1962,7 +2000,8 @@ make type Emitter {
         make merged_entry = ssa::entry_is_first(f.*.body.pin)
         this.resolved_targets = []
         this.continuations = []
-        make groups = registers::groups(f.*.body.pin)
+        make facts = this.codegen_facts.*[report_index].pin
+        make groups = registers::groups(f.*.body.pin, facts)
         for root : groups.iter() {
             this.resolved_targets.push(this.resolved_targets.len())
             this.continuations.push(root != this.continuations.len())
@@ -2046,7 +2085,7 @@ make type Emitter {
             _ = local
             this.cleanup_active.push(false)
         }
-        this.registers = registers::create(f.*.body.pin, this.context, this.builder, this.ssa_locals.pin, this.blocks.pin, this.continuations.pin)
+        this.registers = registers::create(f.*.body.pin, this.context, this.builder, this.ssa_locals.pin, this.blocks.pin, this.continuations.pin, facts)
         make plan = slots::plan(f.*.body.locals.len(), this.mem_report, report_index)
         make next_unplanned_slot = plan.next_slot
         this.local_slots = plan.locals
@@ -2407,8 +2446,38 @@ make type Emitter {
         if owner != this.null { this.cleanup_active[op.*.place.local] = false }
     }
 
+    @this
+    make tuple_type (ty: str) -> bool {
+        return ty.len() >= 2 && ty[0] == '(' && ty[ty.len() - 1] == ')'
+    }
+
+    // Convert compatible tuple values field by field; wrappers may change layout.
+    @this @unsafe
+    make convert_tuple (value: ref<mir::MirOperand>, dest: ptr<any>, target: str) {
+        make source = this.struct_index(this.operand_type(value))
+        make aggregate = mir::MirRvalue { kind = mir::MirRvalueKind.Aggregate }
+        if source >= this.structs.len() { this.trap() return }
+        for field : this.structs[source].*.fields {
+            make operand = mir::MirOperand { kind = mir::MirOperandKind.Copy }
+            operand.place.local = value.*.place.local
+            for projection : value.*.place.projs {
+                operand.place.projs.push(mir::MirProj { kind = projection.kind, name = projection.name.copy(), index = projection.index })
+            }
+            operand.place.projs.push(mir::MirProj { kind = mir::MirProjKind.Field, name = field.name.copy() })
+            aggregate.ops.push(operand)
+        }
+        this.gen_assignment(aggregate.pin, dest, target)
+    }
+
     @this @unsafe
     make gen_assignment (source: ref<mir::MirRvalue>, dest: ptr<any>, dest_ty: str) {
+        if source.*.kind == mir::MirRvalueKind.Use && this.tuple_type(dest_ty.copy()) {
+            make actual = this.operand_type(source.*.a.pin)
+            if this.tuple_type(actual.copy()) && actual != dest_ty {
+                this.convert_tuple(source.*.a.pin, dest, dest_ty)
+                return
+            }
+        }
         if this.has_closure(dest_ty.copy()) {
             if source.*.kind == mir::MirRvalueKind.Use {
                 make actual = this.operand_type(source.*.a.pin)
@@ -2730,6 +2799,11 @@ make type Emitter {
             } elif fty == "str" || fty == "String" {
                 this.assign_string_operand(fp, rv.*.ops[i].pin)
             } elif f_is_agg {
+                if this.tuple_type(fty.copy()) && this.operand_type(rv.*.ops[i].pin) != fty {
+                    this.convert_tuple(rv.*.ops[i].pin, fp, fty.copy())
+                    i++
+                    continue
+                }
                 make src = this.operand_addr(rv.*.ops[i].pin)
 
                 if src != this.null { this.memcpy(fp, src, this.size_of(fty !)) }
@@ -2751,7 +2825,11 @@ make type Emitter {
         while i < rv.*.ops.len() {
             make item: ptr<any> = this.null
 
-            if this.has_closure(elem_ty.copy()) {
+            if this.tuple_type(elem_ty.copy()) && this.operand_type(rv.*.ops[i].pin) != elem_ty {
+                item = this.allocate(elem_size)
+                this.zero_value(item, elem_ty.copy())
+                this.convert_tuple(rv.*.ops[i].pin, item, elem_ty.copy())
+            } elif this.has_closure(elem_ty.copy()) {
                 item = this.prepare_value(rv.*.ops[i].pin, elem_ty.copy())
             } elif this.is_fallible(elem_ty.copy()) {
                 item = this.fallible_arg_addr(rv.*.ops[i].pin, elem_ty.copy())
@@ -2828,7 +2906,9 @@ make type Emitter {
             return
         }
 
-        this.trap()
+        this.zero_value(dest, dest_ty.copy())
+        this.store_i64(this.word_value(1), dest)
+        this.gen_assignment(rv, this.gep(dest, 8), payload_ty)
     }
 
     @this @unsafe
@@ -3019,6 +3099,30 @@ make type Emitter {
 
             make left_ty = this.operand_type(rv.*.a.pin)
             make right_ty = this.operand_type(rv.*.b.pin)
+            if (rv.*.op == "==" || rv.*.op == "!=") && this.tuple_type(left_ty.copy()) {
+                make sid = this.struct_index(left_ty.copy())
+                make result = this.word_value(1)
+                if sid < this.structs.len() {
+                    make i: uint = 0
+                    while i < this.structs[sid].*.fields.len() {
+                        make child = mir::MirRvalue { kind = mir::MirRvalueKind.Binary, op = "==" }
+                        child.a.kind = mir::MirOperandKind.Copy
+                        child.b.kind = mir::MirOperandKind.Copy
+                        child.a.place.local = rv.*.a.place.local
+                        child.b.place.local = rv.*.b.place.local
+                        for projection : rv.*.a.place.projs { child.a.place.projs.push(mir::MirProj { kind = projection.kind, name = projection.name.copy(), index = projection.index }) }
+                        for projection : rv.*.b.place.projs { child.b.place.projs.push(mir::MirProj { kind = projection.kind, name = projection.name.copy(), index = projection.index }) }
+                        make name = this.structs[sid].*.fields[i].name.copy()
+                        child.a.place.projs.push(mir::MirProj { kind = mir::MirProjKind.Field, name = name.copy() })
+                        child.b.place.projs.push(mir::MirProj { kind = mir::MirProjKind.Field, name = name })
+                        make equal = this.gen_rvalue(child.pin)
+                        result = this.gen_binop("&", result, equal, false)
+                        i++
+                    }
+                }
+                if rv.*.op == "!=" { return this.gen_binop("==", result, this.word_value(0), false) }
+                return result
+            }
             make cond_temp = (this.is_optional(left_ty.copy()) || this.is_optional(right_ty.copy()))
             make cond2_temp = (rv.*.op == "==" || rv.*.op == "!=")
 
@@ -3690,7 +3794,12 @@ make type Emitter {
                 arg_is_agg = term.*.arg_aggs[ai]
             }
 
-            if this.has_closure(pty.copy()) {
+            if this.tuple_type(pty.copy()) && this.operand_type(term.*.args[ai].pin) != pty {
+                make converted = this.allocate(this.size_of(pty.copy()))
+                this.zero_value(converted, pty.copy())
+                this.convert_tuple(term.*.args[ai].pin, converted, pty.copy())
+                args.push(converted)
+            } elif this.has_closure(pty.copy()) {
                 make prepared = this.prepare_value(term.*.args[ai].pin, pty.copy())
 
                 if arg_is_agg { args.push(prepared) }

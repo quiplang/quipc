@@ -335,6 +335,11 @@ make lower (program: ref<owned<ast::AST_Head>[]>, os: str, diagnostics: ref<diag
             ast::AST_Kind.Var {
                 @unsafe make v: ptr<ast::AST_Var> = node.*.var.unwrap()
 
+                if v.*.pattern != none {
+                    make d = diag::Diag.err(err::Err.InvalidSyntax, node.*.range.copy(), "tuple unpacking requires a local declaration")
+                    diagnostics.*.report(d)
+                }
+
                 // a compile-time type alias is parsed as a variable whose value is a type
                 // signature: `make Name<T>: Type = SomeType<T>`. it becomes a `HirTypeAlias`
                 // item instead of a global, so the alias resolves as a type.
@@ -1393,11 +1398,24 @@ make type ReturnInfo {
     make infer_expr_type (id: uint) -> uint {
         @unsafe make e: ptr<hir::HirExpr> = this.body.*.exprs[id].pin
 
+        if e.*.kind == hir::HirExprKind.Tuple {
+            make tuple = hir::HirType { name = "tuple", range = e.*.range.copy() }
+            for element : e.*.args { tuple.args.push(this.infer_expr_type(element)) }
+            return this.push_type(tuple)
+        }
+
         if e.*.kind == hir::HirExprKind.Literal {
             make t = hir::HirType {}
 
             match e.*.lit.kind {
-                lexer::TokenKind.LiteralNum { t.name = "int" }
+                lexer::TokenKind.LiteralNum {
+                    t.name = "int"
+                    make i: uint = 0
+                    while i < e.*.lit.lexeme.len() {
+                        if e.*.lit.lexeme[i] == '.' { t.name = "float" }
+                        i++
+                    }
+                }
 
                 lexer::TokenKind.LiteralString { t.name = "str" }
 
@@ -1576,7 +1594,13 @@ make type ReturnInfo {
                     this.body.*.stmts[sid].is_unsafe = true
                 }
 
-                ids.push(sid)
+                if this.body.*.stmts[sid].name == "$tuple_unpack" {
+                    make block = this.body.*.stmts[sid].then_block
+                    for child : this.body.*.blocks[block].stmts {
+                        this.body.*.stmts[child].is_unsafe = info.is_unsafe
+                        ids.push(child)
+                    }
+                } else { ids.push(sid) }
             }
 
             si = si + 1
@@ -1798,6 +1822,35 @@ make type ReturnInfo {
         st.kind = hir::HirStmtKind.Let
         st.range = h.*.range !
 
+        if v.*.pattern != none {
+            if v.*.val == none {
+                make d = diag::Diag.err(err::Err.InvalidSyntax, h.*.range.copy(), "tuple unpacking requires an initializer")
+                this.diagref.*.report(d)
+                return this.unsupported_stmt(h.*.range.copy(), "tuple unpacking requires an initializer")
+            }
+            @unsafe make pattern: ptr<ast::AST_Head> = v.*.pattern.unwrap()
+            @unsafe make value: ptr<ast::AST_Head> = v.*.val.unwrap()
+            make init = this.lower_expr(value)
+            make block = hir::HirBlock {}
+            make local = hir::HirLocal { name = "$tuple" + this.body.*.locals.len().to_str(), range = h.*.range.copy() }
+            local.is_const = node_has_tag(h, "const")
+            local.is_pure = node_has_compile_time_tag(h)
+            if v.*.sig_type != none {
+                @unsafe make sig: ptr<ast::AST_TypeSig> = v.*.sig_type.unwrap()
+                local.ty = this.lower_type(sig)
+                local.has_ty = true
+            }
+            make holder = this.declare(local)
+            make binding = hir::HirStmt { kind = hir::HirStmtKind.Let, local = holder, value = init, has_value = true, range = h.*.range.copy() }
+            block.stmts.push(this.push_stmt(binding))
+            make base = this.push_expr(hir::HirExpr { kind = hir::HirExprKind.Local, local = holder, range = h.*.range.copy() })
+            this.lower_tuple_pattern(pattern, base, block.pin, h)
+            st.kind = hir::HirStmtKind.Block
+            st.name = "$tuple_unpack"
+            st.then_block = this.push_block(block)
+            return this.push_stmt(st)
+        }
+
         // the initializer is lowered before the new name becomes visible: `make x = x + 1`
         if v.*.val != none {
             @unsafe make val: ptr<ast::AST_Head> = v.*.val.unwrap()
@@ -1835,6 +1888,42 @@ make type ReturnInfo {
         st.local = this.declare(local)
 
         return this.push_stmt(st)
+    }
+
+    @this
+    make lower_tuple_pattern (pattern: ptr<ast::AST_Head>, value: uint, block: ref<hir::HirBlock>, head: ptr<ast::AST_Head>) {
+        if pattern.*.expr == none {
+            make d = diag::Diag.err(err::Err.InvalidSyntax, pattern.*.range.copy(), "invalid tuple binding pattern")
+            this.diagref.*.report(d)
+            return
+        }
+        @unsafe make expression: ptr<ast::AST_Expr> = pattern.*.expr.unwrap()
+        if expression.*.kind == ast::ExprKind.Identifier {
+            if expression.*.literal.lexeme == "_" { return }
+            make local = hir::HirLocal { name = expression.*.literal.lexeme.copy(), name_span = expression.*.literal.span.copy(), range = pattern.*.range.copy() }
+            local.is_const = node_has_tag(head, "const")
+            local.is_pure = node_has_compile_time_tag(head)
+            make index = this.declare(local)
+            block.*.stmts.push(this.push_stmt(hir::HirStmt { kind = hir::HirStmtKind.Let, local = index, value = value, has_value = true, range = pattern.*.range.copy() }))
+            return
+        }
+        if expression.*.kind != ast::ExprKind.TupleLiteral || expression.*.constructor == none {
+            make d = diag::Diag.err(err::Err.InvalidSyntax, pattern.*.range.copy(), "expected a tuple of binding names")
+            this.diagref.*.report(d)
+            return
+        }
+        @unsafe make ctor: ptr<ast::ExprConstructor> = expression.*.constructor.unwrap()
+        make check = hir::HirStmt { kind = hir::HirStmtKind.Expr, value = value, has_value = true, tuple_pattern = true, tuple_arity = ctor.*.fields.len(), range = pattern.*.range.copy() }
+        block.*.stmts.push(this.push_stmt(check))
+        make i: uint = 0
+        while i < ctor.*.fields.len() {
+            make token = lexer::Token { kind = lexer::TokenKind.LiteralNum, lexeme = i.to_str() }
+            make position = this.push_expr(hir::HirExpr { kind = hir::HirExprKind.Literal, lit = token, range = pattern.*.range.copy() })
+            make element = this.push_expr(hir::HirExpr { kind = hir::HirExprKind.Index, lhs = value, rhs = position, range = pattern.*.range.copy() })
+            @unsafe make child: ptr<ast::AST_Head> = ctor.*.fields[i].*.pin
+            this.lower_tuple_pattern(child, element, block, head)
+            i++
+        }
     }
 
     // `elif` becomes an `if` nested inside the else block
@@ -1928,17 +2017,17 @@ make type ReturnInfo {
 
         this.enter()
 
-        make bind = hir::HirLocal {}
-
-        bind.name = f.*.inc.lexeme !
-        bind.name_span = f.*.inc.span.copy()
-        bind.scope_body = true
-        bind.range = range.copy()
-        make bind_local = this.declare(bind)
-
-        make body_block = this.lower_block(f.*.statements.pin)
-
-        this.leave()
+        make bind_local: uint = 0
+        if f.*.pattern != none {
+            bind_local = this.hidden_local("$for.item", range.copy())
+        } else {
+            make bind = hir::HirLocal {}
+            bind.name = f.*.inc.lexeme.copy()
+            bind.name_span = f.*.inc.span.copy()
+            bind.scope_body = true
+            bind.range = range.copy()
+            bind_local = this.declare(bind)
+        }
 
         make wrapped = hir::HirBlock {}
 
@@ -1960,6 +2049,19 @@ make type ReturnInfo {
         item_let.value = this.index_expr(index_base, this.local_expr(idx_local, range.copy()), range.copy())
         item_let.has_value = true
         wrapped.stmts.push(this.push_stmt(item_let))
+
+        if f.*.pattern != none {
+            @unsafe make pattern: ptr<ast::AST_Head> = f.*.pattern.unwrap()
+            make first_binding = this.body.*.locals.len()
+            make value = this.local_expr(bind_local, range.copy())
+            this.lower_tuple_pattern(pattern, value, wrapped.pin, h)
+            while first_binding < this.body.*.locals.len() {
+                this.body.*.locals[first_binding].scope_body = true
+                first_binding++
+            }
+        }
+        make body_block = this.lower_block(f.*.statements.pin)
+        this.leave()
 
         make inc = hir::HirStmt {}
 
@@ -2706,6 +2808,33 @@ make type ReturnInfo {
 
             ast::ExprKind.ArrayLiteral {
                 out.kind = hir::HirExprKind.Array
+
+                match e.*.constructor {
+                    none {
+                        return this.unsupported_expr(out.range !, "array")
+                    }
+
+                    arr_ctor: owned<ast::ExprConstructor> {
+                @unsafe make ctor: ptr<ast::ExprConstructor> = arr_ctor
+                make ai = 0
+
+                while ai < ctor.*.fields.len() {
+                    @unsafe make elem: ptr<ast::AST_Head> = ctor.*.fields[ai].*.pin
+                    out.args.push(this.lower_expr(elem))
+                    ai = ai + 1
+                }
+
+                if out.args.len() > 0 {
+                    make arg_first = this.body.*.exprs[out.args[0]].range !
+                    make arg_last = this.body.*.exprs[out.args[out.args.len() - 1]].range !
+                    out.range = this.join_ranges(arg_first, arg_last)
+                }
+                    }
+                }
+            }
+
+            ast::ExprKind.TupleLiteral {
+                out.kind = hir::HirExprKind.Tuple
 
                 match e.*.constructor {
                     none {

@@ -61,6 +61,7 @@ make enum ExprKind {
     Constructor,
     Deref,
     ArrayLiteral,
+    TupleLiteral,
     Match,
     Variant,        // contextual .variant,
     Error,          // error.variant
@@ -386,6 +387,7 @@ make type AST_If {
 
 @pub
 make type AST_For {
+    @pub make pattern: owned<AST_Head>? = none
     @pub make inc: lexer::Token = .{}
     @pub make cond: owned<AST_Head>? = none
 
@@ -395,6 +397,7 @@ make type AST_For {
     make copy () -> AST_For {
         make c = AST_For {}
 
+        c.pattern = copy_head_field(this.pattern)
         c.inc = this.inc
         c.cond = copy_head_field(this.cond)
         c.statements = this.statements.copy()
@@ -459,6 +462,7 @@ make type AST_Param {
 
 @pub
 make type AST_Var {
+    @pub make pattern: owned<AST_Head>? = none
     @pub make name: lexer::Token = .{}
     @pub make generics: lexer::Token[] = []
     @pub make sig_type: owned<AST_TypeSig>? = none
@@ -474,6 +478,7 @@ make type AST_Var {
 
         c.sig_type = copy_typesig_field(this.sig_type)
         c.val = copy_head_field(this.val)
+        c.pattern = copy_head_field(this.pattern)
 
         return c
     }

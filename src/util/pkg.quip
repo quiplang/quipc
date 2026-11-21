@@ -1,6 +1,6 @@
 @pure @const {
     make std = @import "std"
-    make um = @import "../core/unit_manager.quip"
+    make um = @import "../core/unit/pkg.quip"
 }
 
 /// stores the start and end offsets of a source span.

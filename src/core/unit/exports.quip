@@ -1,0 +1,297 @@
+@pure @const {
+    make symbols = @import "symbols.quip"
+    make ast = @import "../../util/ast.quip"
+    make hir = @import "../../repr/hir/hir.quip"
+    make hir_lower = @import "../../repr/hir/lower.quip"
+    make ty = @import "../../repr/types/pkg.quip"
+}
+
+// the last path segment of an import specifier, e.g. "./os/posix.quip" -> "posix.quip"
+@pub
+make basename_of (import_path: str) -> str {
+    make out: str = ""
+    make i: uint = 0
+
+    while i < import_path.len() {
+        make c = import_path[i]
+
+        if c == '/' {
+            out = ""
+        } else {
+            out = out + c
+        }
+
+        i = i + 1
+    }
+
+    return out
+}
+
+/// collects unit-valued variable exports from an ast declaration.
+make export_unit_var (node: ptr<ast::AST_Head>, out: ref<hir::HirExport[]>) {
+    match node.*.var {
+        none {}
+
+        var_box: owned<ast::AST_Var> {
+            if var_box.*.val != none {
+                match var_box.*.val {
+                    none {}
+
+                    val_box: owned<ast::AST_Head> {
+                        make val_is_import = false
+                        make ti2: uint = 0
+
+                        while ti2 < val_box.*.tags.len() {
+                            @unsafe make tag: ptr<ast::AST_Tag> = val_box.*.tags[ti2].*.pin
+
+                            if tag.*.name.lexeme == "import" {
+                                val_is_import = true
+                            }
+
+                            ti2 = ti2 + 1
+                        }
+
+                        if val_is_import && val_box.*.expr != none {
+                            match val_box.*.expr {
+                                none {}
+
+                                expr_box: owned<ast::AST_Expr> {
+                                    if expr_box.*.kind == ast::ExprKind.Literal {
+                                        make ue = hir::HirExport {}
+
+                                        ue.name = var_box.*.name.lexeme !
+                                        ue.is_unit = true
+                                        ue.unit_basename = basename_of(expr_box.*.literal.lexeme !)
+                                        out.*.push(ue)
+                                    }
+
+                                    val_box.*.expr = expr_box
+                                }
+                            }
+                        }
+
+                        var_box.*.val = val_box
+                    }
+                }
+            }
+
+            node.*.var = var_box
+        }
+    }
+}
+
+// one `some` match per helper: the reference compiler rejects nested `some` binds
+// with the same name (E1117)
+make export_const_var (node: ptr<ast::AST_Head>, out: ref<hir::HirExport[]>) {
+    match node.*.var {
+        some {
+            @unsafe make v: ptr<ast::AST_Var> = some
+            export_const_val(v, out)
+        }
+        none {}
+    }
+}
+
+/// collects an export from the initializer of a constant variable.
+make export_const_val (v: ptr<ast::AST_Var>, out: ref<hir::HirExport[]>) {
+    match v.*.val {
+        some {
+            @unsafe make val: ptr<ast::AST_Head> = some
+            export_const_expr(val, v.*.name.lexeme !, out)
+        }
+        none {}
+    }
+}
+
+/// records supported constant expressions as hir exports.
+make export_const_expr (val: ptr<ast::AST_Head>, name: str, out: ref<hir::HirExport[]>) {
+    match val.*.expr {
+        some {
+            @unsafe make ve: ptr<ast::AST_Expr> = some
+
+            if ve.*.kind == ast::ExprKind.Literal {
+                make ex = hir::HirExport {}
+
+                ex.name = name.copy()
+                ex.lit = ve.*.literal !
+                ex.has_lit = true
+                out.*.push(ex)
+            }
+        }
+        none {}
+    }
+}
+
+// the `@pub` symbols declared at the top level of a program, with their `@external` flag
+@pub
+make exports_of (program: ref<owned<ast::AST_Head>[]>, os: str) -> hir::HirExport[] {
+    make out: hir::HirExport[] = []
+
+    make selected = hir_lower::selected_nodes(program, os)
+    make i: uint = 0
+
+    while i < program.*.len() {
+        if !selected[i] {
+            i++
+            continue
+        }
+        @unsafe make node: ptr<ast::AST_Head> = program.*[i].*.pin
+
+        make before = out.len()
+        make is_const = false
+        make is_pure = false
+        make is_unsafe = false
+        make is_pub = false
+        make is_external = false
+        make is_noreturn = false
+        make ti: uint = 0
+
+        while ti < node.*.tags.len() {
+            @unsafe make tag: ptr<ast::AST_Tag> = node.*.tags[ti].*.pin
+
+            if tag.*.name.lexeme == "const" { is_const = true }
+            if tag.*.name.lexeme == "pure" { is_pure = true }
+            if tag.*.name.lexeme == "unsafe" { is_unsafe = true }
+            if tag.*.name.lexeme == "noreturn" { is_noreturn = true }
+
+            if tag.*.name.lexeme == "pub" {
+                is_pub = true
+            } elif tag.*.name.lexeme == "external" {
+                is_external = true
+            }
+
+            ti = ti + 1
+        }
+
+        if is_pub {
+            match node.*.kind {
+                ast::AST_Kind.Func {
+                    make ex = hir::HirExport {}
+
+                    ex.name = symbols::pub_func_name(node)
+                    ex.is_external = is_external
+                    out.push(ex)
+                }
+
+                ast::AST_Kind.Type {
+                    make ex = hir::HirExport {}
+
+                    ex.name = symbols::pub_type_name(node)
+                    ex.is_type = true
+                    out.push(ex)
+                }
+
+                ast::AST_Kind.Enum {
+                    make ex = hir::HirExport {}
+
+                    ex.name = symbols::pub_enum_name(node)
+                    ex.is_type = true
+                    ex.is_enum = true
+
+                    match node.*.enum_node {
+                        some {
+                            @unsafe make ee: ptr<ast::AST_Enum> = some
+                            make vi = 0
+
+                            while vi < ee.*.variants.len() {
+                                ex.variants.push(ee.*.variants[vi].lexeme !)
+                                vi = vi + 1
+                            }
+                        }
+                        none {}
+                    }
+
+                    out.push(ex)
+                }
+
+                // a `@pub` re-export of an imported unit makes that unit reachable as a nested
+                // namespace (`make syscall: unit = @import "syscall.quip"` -> `syscall::member`)
+                ast::AST_Kind.Var {
+                    export_unit_var(node, out.pin)
+                    make allocator = false
+                    make ai: uint = 0
+
+                    while ai < node.*.tags.len() {
+                        @unsafe make tag: ptr<ast::AST_Tag> = node.*.tags[ai].*.pin
+
+                        if tag.*.name.lexeme == "global_allocator" { allocator = true }
+
+                        ai = ai + 1
+                    }
+
+                    if allocator {
+                        @unsafe make variable: ptr<ast::AST_Var> = node.*.var.unwrap()
+
+                        if variable.*.sig_type != none {
+                            @unsafe make sig: ptr<ast::AST_TypeSig> = variable.*.sig_type.unwrap()
+                            make type_namespace: str = ""
+
+                            while sig.*.is_namespace && sig.*.inner.len() > 0 {
+                                @unsafe make prefix: ptr<ast::AST_TypeSig> = sig.*.inner[0].*.pin
+
+                                if type_namespace.len() > 0 { type_namespace = type_namespace + "::" }
+
+                                type_namespace = type_namespace + prefix.*.name.lexeme
+                                @unsafe make next: ptr<ast::AST_TypeSig> = sig.*.inner[sig.*.inner.len() - 1].*.pin
+                                sig = next
+                            }
+
+                            make ex = hir::HirExport {}
+
+                            ex.name = symbols::pub_var_name(node)
+                            ex.global_type = sig.*.name.lexeme.copy()
+                            ex.global_type_namespace = type_namespace
+                            out.push(ex)
+                        }
+                    }
+
+                    // compile-time type aliases are exported as types too, so importers can
+                    // resolve `pkg::Alias` to the type it names
+                    if symbols::is_type_alias_var(node) {
+                        make ex = hir::HirExport {}
+
+                        ex.name = symbols::pub_var_name(node)
+                        ex.is_type = true
+                        @unsafe make variable: ptr<ast::AST_Var> = node.*.var.unwrap()
+
+                        if variable.*.val != none {
+                            @unsafe make value: ptr<ast::AST_Head> = variable.*.val.unwrap()
+
+                            if value.*.expr != none {
+                                @unsafe make expression: ptr<ast::AST_Expr> = value.*.expr.unwrap()
+
+                                if expression.*.type_sig != none {
+                                    @unsafe make target: ptr<ast::AST_TypeSig> = expression.*.type_sig.unwrap()
+
+                                    if target.*.inner.len() == 0 && !target.*.is_array && !target.*.is_optional && !target.*.is_fallible && !target.*.is_namespace {
+                                        ex.alias_primitive = ty::TyInterner.prim(target.*.name.lexeme !)
+                                    }
+                                }
+                            }
+                        }
+
+                        out.push(ex)
+                    } else {
+                        // a literal constant (`STDOUT`, `MODE_FILE`, ...) is exported by value so
+                        // importers can inline `ns::NAME`
+                        export_const_var(node, out.pin)
+                    }
+                }
+
+                _ {}
+            }
+        }
+
+        while before < out.len() {
+            out[before].is_const = is_const
+            out[before].is_pure = is_pure
+            out[before].is_unsafe = is_unsafe
+            out[before].is_noreturn = is_noreturn
+            before = before + 1
+        }
+
+        i = i + 1
+    }
+
+    return out
+}

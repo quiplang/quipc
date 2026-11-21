@@ -1,0 +1,199 @@
+// Shared CFG and liveness facts for code generation. Local IDs remain stable.
+@pure @const {
+    make mir = @import "mir.quip"
+    make arrays = @import "../../../library/runtime/array.quip"
+}
+
+@pub
+make type Ids { @pub make values: uint[] = [] }
+
+@pub
+make type Graph {
+    @pub make predecessors: Ids[] = []
+    @pub make successors: Ids[] = []
+    @pub make statements: Ids[] = []
+    @pub make words: uint = 0
+    @pub make live_in: uint[] = []
+    @pub make live_out: uint[] = []
+}
+
+@pub
+make scalar (ty: str) -> bool {
+    if ty == "void" || ty == "bool" || ty == "char" || ty == "int" || ty == "uint" || ty == "float" || ty == "f32" || ty == "f64" { return true }
+    if ty == "i8" || ty == "i16" || ty == "i32" || ty == "i64" || ty == "u8" || ty == "u16" || ty == "u32" || ty == "u64" { return true }
+    return ty.len() > 4 && ty[ty.len() - 1] == '>' && ((ty[0] == 'p' && ty[1] == 't' && ty[2] == 'r' && ty[3] == '<') || (ty[0] == 'r' && ty[1] == 'e' && ty[2] == 'f' && ty[3] == '<'))
+}
+
+@pub
+make bit (set: ref<uint[]>, offset: uint, local: uint) -> bool {
+    return (set.*[offset + local / 64] & (1 << (local % 64))) != 0
+}
+@pub
+make insert (set: ref<uint[]>, offset: uint, local: uint) {
+    set.*[offset + local / 64] |= 1 << (local % 64)
+}
+@pub
+make remove (set: ref<uint[]>, offset: uint, local: uint) {
+    // uint.max() in the bootstrap library is only 32 bits. These sets use
+    // LLVM/Quip's 64-bit storage words, including local IDs 32 through 63.
+    make all: uint = 0xffffffffffffffff
+    set.*[offset + local / 64] &= all ^ (1 << (local % 64))
+}
+
+@pub
+make graph (body: ref<mir::MirBody>) -> Graph {
+    make result = Graph { words = (body.*.locals.len() + 63) / 64 }
+    for term : body.*.terms {
+        _ = term
+        result.predecessors.push(Ids {})
+        result.successors.push(Ids {})
+        result.statements.push(Ids {})
+    }
+    make block: uint = 0
+    for term : body.*.terms {
+        if term.kind == mir::MirTermKind.Goto || term.kind == mir::MirTermKind.Call || term.kind == mir::MirTermKind.Branch {
+            result.successors[block].values.push(term.target)
+        }
+        if term.kind == mir::MirTermKind.Branch && term.other != term.target { result.successors[block].values.push(term.other) }
+        for target : result.successors[block].values { result.predecessors[target].values.push(block) }
+        block++
+    }
+    make index: uint = 0
+    for statement : body.*.stmts {
+        result.statements[statement.block].values.push(index)
+        index++
+    }
+    return result
+}
+
+@pub
+make place_reads (set: ref<uint[]>, place: ref<mir::MirPlace>) {
+    insert(set, 0, place.*.local)
+    for projection : place.*.projs { if projection.kind == mir::MirProjKind.Index { insert(set, 0, projection.index) } }
+}
+@pub
+make operand_reads (set: ref<uint[]>, operand: ref<mir::MirOperand>) {
+    if operand.*.kind == mir::MirOperandKind.Copy || operand.*.kind == mir::MirOperandKind.Move { place_reads(set, operand.*.place.pin) }
+}
+@pub
+make rvalue_reads (set: ref<uint[]>, value: ref<mir::MirRvalue>) {
+    operand_reads(set, value.*.a.pin)
+    operand_reads(set, value.*.b.pin)
+    for operand : value.*.ops { operand_reads(set, operand.pin) }
+    if value.*.kind == mir::MirRvalueKind.Pin { place_reads(set, value.*.place.pin) }
+}
+
+@pub
+make statement_backwards (live: ref<uint[]>, statement: ref<mir::MirStmt>, body: ref<mir::MirBody>) {
+    if statement.*.kind == mir::MirStmtKind.Assign {
+        if statement.*.place.projs.len() == 0 { remove(live, 0, statement.*.place.local) }
+        else { place_reads(live, statement.*.place.pin) }
+        rvalue_reads(live, statement.*.rvalue.pin)
+    } elif statement.*.kind == mir::MirStmtKind.StorageDead && !scalar(body.*.locals[statement.*.local].ty.copy()) {
+        // Cleanup observes the value even if the source never reads it again.
+        insert(live, 0, statement.*.local)
+    }
+}
+@pub
+make terminator_backwards (live: ref<uint[]>, term: ref<mir::MirTerm>) {
+    if term.*.kind == mir::MirTermKind.Call {
+        if term.*.dest.projs.len() == 0 { remove(live, 0, term.*.dest.local) }
+        else { place_reads(live, term.*.dest.pin) }
+        operand_reads(live, term.*.func.pin)
+        for operand : term.*.args { operand_reads(live, operand.pin) }
+    } elif term.*.kind == mir::MirTermKind.Branch { operand_reads(live, term.*.cond.pin) }
+    elif term.*.kind == mir::MirTermKind.Return { insert(live, 0, 0) }
+}
+
+@pub
+make liveness (body: ref<mir::MirBody>) -> Graph {
+    make result = graph(body)
+    make count = result.words * body.*.terms.len()
+    result.live_in = arrays::zero_words(count)
+    result.live_out = arrays::zero_words(count)
+    make live: uint[] = []
+    while live.len() < result.words { live.push(0) }
+    // Each block's transfer is GEN | (OUT & ~DEF). Summarize statements
+    // once rather than walking them on every dataflow iteration.
+    make generated = arrays::zero_words(count)
+    make killed = arrays::zero_words(count)
+    make block: uint = 0
+    while block < body.*.terms.len() {
+        make word: uint = 0
+        while word < result.words {
+            live[word] = 0
+            word++
+        }
+        make term = body.*.terms[block].pin
+        terminator_backwards(live.pin, term)
+        if term.*.kind == mir::MirTermKind.Call && term.*.dest.projs.len() == 0 { insert(killed.pin, block * result.words, term.*.dest.local) }
+        make index = result.statements[block].values.len()
+        while index > 0 {
+            index--
+            make statement = body.*.stmts[result.statements[block].values[index]].pin
+            statement_backwards(live.pin, statement, body)
+            if statement.*.kind == mir::MirStmtKind.Assign && statement.*.place.projs.len() == 0 { insert(killed.pin, block * result.words, statement.*.place.local) }
+        }
+        word = 0
+        while word < result.words {
+            generated[block * result.words + word] = live[word]
+            word++
+        }
+        block++
+    }
+    make all: uint = 0xffffffffffffffff
+    make changed = true
+    while changed {
+        changed = false
+        block = body.*.terms.len()
+        while block > 0 {
+            block--
+            make offset = block * result.words
+            make word: uint = 0
+            while word < result.words {
+                make value: uint = 0
+                for target : result.successors[block].values { value |= result.live_in[target * result.words + word] }
+                result.live_out[offset + word] = value
+                make incoming = generated[offset + word] | (value & (all ^ killed[offset + word]))
+                if result.live_in[offset + word] != incoming {
+                    changed = true
+                    result.live_in[offset + word] = incoming
+                }
+                word++
+            }
+        }
+    }
+    return result
+}
+
+/// Storage markers alone do not require a physical slot for plain values.
+@pub
+make mentioned (body: ref<mir::MirBody>) -> bool[] {
+    make words: uint[] = []
+    while words.len() < (body.*.locals.len() + 63) / 64 { words.push(0) }
+    make local: uint = 0
+    while local <= body.*.param_count {
+        insert(words.pin, 0, local)
+        local++
+    }
+    for capture : body.*.capture_locals { insert(words.pin, 0, capture) }
+    for statement : body.*.stmts {
+        if statement.kind == mir::MirStmtKind.Assign {
+            place_reads(words.pin, statement.place.pin)
+            rvalue_reads(words.pin, statement.rvalue.pin)
+        }
+    }
+    for term : body.*.terms {
+        if term.kind == mir::MirTermKind.Call { place_reads(words.pin, term.dest.pin) }
+        operand_reads(words.pin, term.func.pin)
+        operand_reads(words.pin, term.cond.pin)
+        for operand : term.args { operand_reads(words.pin, operand.pin) }
+    }
+    make result: bool[] = []
+    local = 0
+    while local < body.*.locals.len() {
+        result.push(bit(words.pin, 0, local))
+        local++
+    }
+    return result
+}

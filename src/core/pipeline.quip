@@ -1,0 +1,100 @@
+@pure @const {
+    make session = @import "session.quip"
+    make model = @import "unit/pkg.quip"
+    make lower = @import "frontend/lower.quip"
+    make types = @import "frontend/check.quip"
+    make memory = @import "frontend/memory.quip"
+    make signatures = @import "signatures.quip"
+    make mono = @import "../repr/hir/mono.quip"
+    make qualify = @import "../analysis/hir/semantics/symbol/qualify.quip"
+    make profile = @import "analysis_profile.quip"
+    make memr = @import "../analysis/mir/memory/report.quip"
+    make std = @import "std"
+}
+
+/// Validates one unit using the session's completed declaration registry.
+@pub
+make check_unit (state: ref<session::Session>, id: uint, timings: ref<profile::Profile>) -> !void {
+    make unit = state.*.units[id].pin
+    unit.*.diag.render_on_report = state.*.render_diagnostics
+    types::check_types(unit, state.*.attached_sigs.pin, state.*.struct_sigs.pin, state.*.free_sigs.pin, timings) catch err { return err }
+    lower::lower_mir(unit, state.*.attached_sigs.pin, state.*.struct_sigs.pin, timings) catch err { return err }
+    memory::check_memory(unit, state.*.struct_sigs.pin, state.*.mem_ctx.pin, timings) catch err { return err }
+    return
+}
+
+/// Completes the global declaration barrier before any body is checked.
+@pub
+make prepare (state: ref<session::Session>, timings: ref<profile::Profile>) -> !void {
+    make index: uint = 0
+    while index < state.*.compilation_stack.len() {
+        make id = state.*.compilation_stack[index]
+        std::progress::phase("Lower", index, state.*.compilation_stack.len(), state.*.units[id].path_rel.get())
+        state.*.units[id].diag.render_on_report = state.*.render_diagnostics
+        lower::lower(state.*.units[id].pin, timings) catch err { return err }
+        index++
+    }
+    // instantiate generic types: every use of `Name<Args>` in any unit becomes a concrete
+    // type declared next to the template, before anything is type-checked
+    make started: uint = 0
+    make mono_units: mono::MonoUnit[] = []
+    make mi: uint = 0
+
+    while mi < state.*.units.len() {
+        make mu = mono::MonoUnit {
+            module_name = state.*.units[mi].path_rel.get(),
+            module = state.*.units[mi].hir_module.pin,
+            program = state.*.units[mi].program.pin,
+            namespaces = state.*.units[mi].hir_namespaces.pin,
+            os = state.*.units[mi].platform_name !,
+            diag = state.*.units[mi].diag.pin
+        }
+
+        mono_units.push(mu)
+        mi = mi + 1
+    }
+
+    std::progress::phase("Generics", 0, 0, "instantiate types")
+    if timings.*.enabled { started = profile::now() }
+    mono::run(mono_units.pin)
+    if timings.*.enabled {
+        timings.*.record(started, "generics", "<build>")
+        started = profile::now()
+    }
+    qualify::run(mono_units.pin)
+    signatures::build(state)
+    if timings.*.enabled { timings.*.record(started, "signatures", "<build>") }
+
+    // Resolved allocator symbols from dependencies must be visible
+    // to every caller, including the normal CLI compilation path.
+    make memory_context = memr::MemContext {}
+    mi = 0
+    while mi < state.*.units.len() {
+        memr::collect(state.*.units[mi].hir_module.pin, memory_context.pin)
+        mi = mi + 1
+    }
+
+
+    mi = 0
+
+    while mi < state.*.units.len() {
+        if state.*.units[mi].diag.has_errors() {
+            return error.CompilationAborted
+        }
+
+        mi = mi + 1
+    }
+
+    state.*.mem_ctx = memory_context
+    return
+}
+
+/// Editor-facing frontend entry point: no LLVM generation or linking.
+@pub
+make check (state: ref<session::Session>, timings: ref<profile::Profile>) -> !void {
+    prepare(state, timings) catch err { return err }
+    for id : state.*.compilation_stack {
+        check_unit(state, id, timings) catch err { return err }
+    }
+    return
+}

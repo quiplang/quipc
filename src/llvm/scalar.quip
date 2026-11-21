@@ -6,10 +6,10 @@
     make slots = @import "slots.quip"
     make ssa = @import "ssa.quip"
     make registers = @import "registers.quip"
-    make flow = @import "../mir/flow.quip"
+    make flow = @import "../repr/mir/flow.quip"
     make structs = @import "structs.quip"
     make lexer = @import "../core/token.quip"
-    make mir = @import "../mir/mir.quip"
+    make mir = @import "../repr/mir/mir.quip"
 }
 
 // LLVMOpcode and LLVMIntPredicate values from llvm-c/Core.h.

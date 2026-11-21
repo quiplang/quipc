@@ -2,14 +2,14 @@
     make std = @import "std"
     make profile = @import "analysis_profile.quip"
 
-    make um = @import "unit_manager.quip"
-    make workers = @import "object_workers.quip"
+    make session = @import "session.quip"
+    make deps = @import "deps.quip"
+    make pipeline = @import "pipeline.quip"
+    make codegen = @import "backend/codegen.quip"
+    make workers = @import "backend/jobs.quip"
     make configuration = @import "config.quip"
 
     make llvm = @import "../llvm/pkg.quip"
-    make memr = @import "../memory/report.quip"
-    make mono = @import "../hir/mono.quip"
-    make qualify = @import "../semantics/symbol/qualify.quip"
     make sources = @import "sources.quip"
 }
 
@@ -41,7 +41,7 @@ make ensure_dir (path: str) {
 @pub
 make type Driver {
 
-    @pub make manager: um::UnitManager? = none
+    @pub make manager: session::Session? = none
     @pub make config: configuration::Config
 
 
@@ -205,7 +205,7 @@ make type Driver {
         make started: uint = 0
 
         // Host lowers `name: Type` as Binding (always-match). Bare `some` is the optional
-        // Some-pattern with a null check — required for large optionals like UnitManager?.
+        // Some-pattern with a null check — required for large optionals like Session?.
         match this.config.input {
             none {
                 std::progress::clear()
@@ -227,12 +227,12 @@ make type Driver {
 
                 for path : this.config.package_paths.iter() { paths.push(path.copy()) }
 
-                make manager = um::UnitManager.init(some.copy(), this.config.package_names !,
+                make manager = deps::discover(some.copy(), this.config.package_names !,
                     paths, this.config.options.hide_warnings, this.config.platform_name.copy(), timings.pin) catch err { return err }
 
                 // phase 2 (Resolve): link every `@import` alias to its already-declared unit
                 if timings.enabled { started = profile::now() }
-                manager.resolve_all()
+                deps::resolve_all(manager.pin)
                 if timings.enabled { timings.record(started, "imports", some.get()) }
 
 
@@ -300,82 +300,10 @@ make type Driver {
                         _ {}
                     }
 
-                    mgr.*.units[id].lower(timings.pin) catch err {
-                        match err {
-                            error.IdentifierTooLong {
-                                std::progress::clear()
-                                std::io::println("identifier too long")
-                                return error.CompilationAborted
-                            }
-
-                            error.UnexpectedCharacter {
-                                std::progress::clear()
-                                std::io::println("unexpected character")
-                                return error.CompilationAborted
-                            }
-
-                            error.CompilationAborted {
-                                return error.CompilationAborted
-                            }
-
-                            _ {
-                                return error.Panic
-                            }
-                        }
-                    }
-
                     si = si + 1
                 }
 
-                // instantiate generic types: every use of `Name<Args>` in any unit becomes a concrete
-                // type declared next to the template, before anything is type-checked
-                make mono_units: mono::MonoUnit[] = []
-                make mi: uint = 0
-
-                while mi < mgr.*.units.len() {
-                    make mu = mono::MonoUnit {
-                        module_name = mgr.*.units[mi].path_rel.get(),
-                        module = mgr.*.units[mi].hir_module.pin,
-                        program = mgr.*.units[mi].program.pin,
-                        namespaces = mgr.*.units[mi].hir_namespaces.pin,
-                        os = mgr.*.units[mi].platform_name !,
-                        diag = mgr.*.units[mi].diag.pin
-                    }
-
-                    mono_units.push(mu)
-                    mi = mi + 1
-                }
-
-                std::progress::phase("Generics", 0, 0, "instantiate types")
-                if timings.enabled { started = profile::now() }
-                mono::run(mono_units.pin)
-                if timings.enabled {
-                    timings.record(started, "generics", "<build>")
-                    started = profile::now()
-                }
-                qualify::run(mono_units.pin)
-                mgr.*.build_signatures()
-                if timings.enabled { timings.record(started, "signatures", "<build>") }
-
-                // Resolved allocator symbols from dependencies must be visible
-                // to every caller, including the normal CLI compilation path.
-                make memory_context = memr::MemContext {}
-                mi = 0
-                while mi < mgr.*.units.len() {
-                    memr::collect(mgr.*.units[mi].hir_module.pin, memory_context.pin)
-                    mi = mi + 1
-                }
-
-
-                mi = 0
-
-                while mi < mgr.*.units.len() {
-                    if mgr.*.units[mi].diag.has_errors() {
-                        return error.CompilationAborted
-                    }
-
-                    mi = mi + 1
-                }
+                pipeline::prepare(mgr, timings.pin) catch err { return err }
 
                 make pool = workers::Pool { limit = this.config.options.jobs }
                 // typecheck only once every declaration, including `@impl`, is registered
@@ -384,8 +312,7 @@ make type Driver {
                 while si < mgr.*.compilation_stack.len() {
                     make id = mgr.*.compilation_stack[si]
                     std::progress::phase("Analyze", si, mgr.*.compilation_stack.len(), mgr.*.units[id].path_rel.get())
-                    mgr.*.units[id].mem_ctx = memory_context
-                    mgr.*.units[id].analyze(mgr.*.attached_sigs.pin, mgr.*.struct_sigs.pin, mgr.*.free_sigs.pin, timings.pin, true) catch err {
+                    pipeline::check_unit(mgr, id, timings.pin) catch err {
                         pool.drain()
                         match err {
                             error.IdentifierTooLong {
@@ -410,7 +337,10 @@ make type Driver {
                         }
                     }
 
-                    memory_context = mgr.*.units[id].mem_ctx
+                    if !mgr.*.units[id].defer_llvm && !this.config.emit_mem
+                        && !(this.config.emit_mir && !this.config.emit_llvm) {
+                        codegen::generate_llvm(mgr.*.units[id].pin, timings.pin, true) catch err { return err }
+                    }
                     if mgr.*.units[id].defer_llvm {
                         if timings.enabled { started = profile::now() }
                         pool.submit(mgr, timings.pin) catch err {

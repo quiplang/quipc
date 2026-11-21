@@ -1,0 +1,29 @@
+@pure @const {
+    make unit = @import "unit/pkg.quip"
+    make hir = @import "../repr/hir/hir.quip"
+    make memr = @import "../analysis/mir/memory/report.quip"
+    make std = @import "std"
+}
+
+@pub
+make type UnitLinks { @pub make ids: uint[] = [] }
+
+/// Owns the source graph and cross-unit declarations for one compilation.
+/// Analysis and backend scheduling live outside this data model.
+@pub
+make type Session {
+    @pub make mem_ctx: memr::MemContext = .{}
+    @pub make units: unit::Unit[] = []
+    @pub make package_names: str[] = []
+    @pub make package_paths: std::io::Path[] = []
+    @pub make dependencies: UnitLinks[] = []
+    @pub make importers: UnitLinks[] = []
+    @pub make compilation_stack: uint[] = []
+    @pub make attached_sigs: hir::HirAttachedSig[] = []
+    @pub make struct_sigs: hir::HirStructSig[] = []
+    @pub make free_sigs: hir::HirFuncSig[] = []
+    @pub make render_diagnostics: bool = true
+    @pub make hide_warnings: bool = false
+    @pub make platform_name: str = ""
+    @pub make visited: bool[] = []
+}

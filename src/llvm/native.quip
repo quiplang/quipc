@@ -1,7 +1,7 @@
 @pure @const {
     make api = @import "bindings.quip"
     make floating = @import "floating.quip"
-    make mir = @import "../mir/mir.quip"
+    make mir = @import "../repr/mir/mir.quip"
 }
 
 // LLVMTypeKind values from llvm-c/Core.h.

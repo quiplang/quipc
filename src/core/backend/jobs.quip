@@ -1,0 +1,122 @@
+@pure @const {
+    make std = @import "std"
+    make session = @import "../session.quip"
+    make codegen = @import "codegen.quip"
+    make profile = @import "../analysis_profile.quip"
+}
+
+// Fork isolates LLVM and Quip's single-threaded allocator. The parent owns
+// analysis and progress; children only read the completed unit graph.
+make type Worker {
+    make pid: i32 = 0
+    make unit: uint = 0
+}
+
+/// The parent queues analyzed units in compilation-stack order. Only finish()
+/// blocks, so a full worker pool never stalls analysis of the next unit.
+@pub
+make type Pool {
+    @pub make limit: uint = 1
+    make active: Worker[] = []
+    make launched: uint = 0
+    make ready: uint = 0
+
+    @this
+    make launch (manager: ref<session::Session>) -> !void {
+        make id = manager.*.compilation_stack[this.launched]
+        @unsafe make pid = std::os::fork() catch {
+            std::progress::clear()
+            std::io::println("unable to start LLVM object worker")
+            return error.CompilationAborted
+        }
+        if pid == 0 {
+            make timings = profile::Profile.init(false)
+            make code: i32 = 0
+            codegen::generate_llvm(manager.*.units[id].pin, timings.pin, false) catch { code = 1 }
+            @unsafe std::os::_exit(code)
+        }
+        this.active.push(Worker { pid = pid, unit = id })
+        this.launched++
+        return
+    }
+
+    @this
+    make reap (manager: ref<session::Session>, mode: std::os::WaitMode) -> !bool {
+        make status: i32 = 0
+        while true {
+            @unsafe make pid = std::os::waitpid(-1, status.pin, mode) catch {
+                if std::os::error_is(std::os::ErrorCode.Interrupted) { continue }
+                return error.CompilationAborted
+            }
+            if pid == 0 { return false }
+            make i: uint = 0
+            while i < this.active.len() {
+                if this.active[i].pid == pid {
+                    make id = this.active[i].unit
+                    make last = this.active.pop()
+                    if i < this.active.len() { this.active[i] = last }
+                    if status != 0 {
+                        std::progress::clear()
+                        std::io::println("LLVM object worker failed for " + manager.*.units[id].path_rel.get())
+                        return error.CompilationAborted
+                    }
+                    std::progress::unit_done()
+                    return true
+                }
+                i++
+            }
+        }
+        return false
+    }
+
+    @this
+    make fill (manager: ref<session::Session>) -> !void {
+        while this.launched < this.ready && this.active.len() < this.limit {
+            this.launch(manager) catch err { return err }
+        }
+        return
+    }
+
+    @pub @this
+    make submit (manager: ref<session::Session>, timings: ref<profile::Profile>) -> !void {
+        if this.limit == 0 || this.limit > 256 { return error.InvalidArgument }
+        make id = manager.*.compilation_stack[this.ready]
+        this.ready++
+        if this.limit == 1 || manager.*.compilation_stack.len() == 1 {
+            codegen::generate_llvm(manager.*.units[id].pin, timings, true) catch err { return err }
+            this.launched++
+            return
+        }
+        while this.active.len() > 0 {
+            make completed = this.reap(manager, std::os::WaitMode.NoHang) catch err { return err }
+            if !completed { break }
+        }
+        this.fill(manager) catch err { return err }
+        return
+    }
+
+    @pub @this
+    make finish (manager: ref<session::Session>) -> !void {
+        while this.active.len() > 0 {
+            this.reap(manager, std::os::WaitMode.Blocking) catch err { return err }
+            this.fill(manager) catch err { return err }
+        }
+        return
+    }
+
+    // On any frontend or worker error, discard queued work and join only
+    // children already writing outputs before unwinding the driver.
+    @pub @this
+    make drain () {
+        for worker : this.active.iter() {
+            make status: i32 = 0
+            while true {
+                @unsafe std::os::waitpid(worker.pid, status.pin, std::os::WaitMode.Blocking) catch {
+                    if std::os::error_is(std::os::ErrorCode.Interrupted) { continue }
+                    break
+                }
+                break
+            }
+        }
+    }
+}

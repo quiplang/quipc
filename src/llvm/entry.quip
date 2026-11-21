@@ -1,0 +1,137 @@
+@pure @const {
+    make std = @import "std"
+    make api = @import "bindings.quip"
+}
+
+/// The Quip entry ABI, resolved before building the native adapter.
+@pub
+make type Plan {
+    @pub make present: bool = false
+    @pub make valid: bool = false
+    @pub make parameter_count: uint = 0
+    @pub make argv_array: bool = false
+    @pub make result_size: uint = 0
+    @pub make result_void: bool = false
+}
+
+make type Adapter {
+    make context: ptr<any>
+    make builder: ptr<any>
+    make native_main: ptr<any>
+    make i32_type: ptr<any>
+    make word: ptr<any>
+    make pointer: ptr<any>
+    make byte: ptr<any>
+    make unnamed: str = ""
+
+    @this @unsafe
+    make argv_header (argc: ptr<any>, argv: ptr<any>) -> ptr<any> {
+        // Quip's array header borrows the C argv buffer.
+        make fields: ptr<any>[3] = [this.pointer, this.word, this.word]
+        @unsafe make field_ptr: ptr<ptr<any>> = fields[0].pin
+        make ty = api::LLVMStructTypeInContext(this.context, field_ptr, 3, 0)
+        make address = api::LLVMBuildAlloca(this.builder, ty, this.unnamed.data)
+        api::LLVMSetAlignment(address, 8)
+
+        make data = api::LLVMBuildStructGEP2(this.builder, ty, address, 0, this.unnamed.data)
+        make length = api::LLVMBuildStructGEP2(this.builder, ty, address, 1, this.unnamed.data)
+        make capacity = api::LLVMBuildStructGEP2(this.builder, ty, address, 2, this.unnamed.data)
+        api::LLVMSetAlignment(api::LLVMBuildStore(this.builder, argv, data), 8)
+        api::LLVMSetAlignment(api::LLVMBuildStore(this.builder, argc, length), 8)
+        api::LLVMSetAlignment(api::LLVMBuildStore(this.builder, argc, capacity), 8)
+        return address
+    }
+
+    @this @unsafe
+    make status_from_result (result: ptr<any>, result_void: bool) -> ptr<any> {
+        make zero = api::LLVMConstInt(this.word, 0, 0)
+        make code = api::LLVMBuildLoad2(this.builder, this.word, result, this.unnamed.data)
+        api::LLVMSetAlignment(code, 8)
+        // LLVMIntNE in llvm-c/Core.h.
+        make failed = api::LLVMBuildICmp(this.builder, 33, code, zero, this.unnamed.data)
+        make failure_name: str = "failed_main"
+        make success_name: str = "success_main"
+        make failure = api::LLVMAppendBasicBlockInContext(this.context, this.native_main, failure_name.data)
+        make success = api::LLVMAppendBasicBlockInContext(this.context, this.native_main, success_name.data)
+        api::LLVMBuildCondBr(this.builder, failed, failure, success)
+
+        api::LLVMPositionBuilderAtEnd(this.builder, failure)
+        api::LLVMBuildRet(this.builder, api::LLVMConstInt(this.i32_type, 1, 0))
+        api::LLVMPositionBuilderAtEnd(this.builder, success)
+        if result_void { return api::LLVMConstInt(this.i32_type, 0, 0) }
+
+        make offset = api::LLVMConstInt(this.word, 8, 0)
+        @unsafe make offset_ptr: ptr<ptr<any>> = offset.pin
+        make payload = api::LLVMBuildGEP2(this.builder, this.byte, result, offset_ptr, 1, this.unnamed.data)
+        make value = api::LLVMBuildLoad2(this.builder, this.word, payload, this.unnamed.data)
+        api::LLVMSetAlignment(value, 8)
+        return api::LLVMBuildTrunc(this.builder, value, this.i32_type, this.unnamed.data)
+    }
+
+    @this @unsafe
+    make call_user (user_main: ptr<any>, plan: ref<Plan>) -> ptr<any> {
+        make args: ptr<any>[] = []
+        @unsafe make result: ptr<any> = 0
+
+        if plan.*.result_size > 0 {
+            make size = api::LLVMConstInt(this.word, plan.*.result_size, 0)
+            result = api::LLVMBuildArrayAlloca(this.builder, this.byte, size, this.unnamed.data)
+            api::LLVMSetAlignment(result, 8)
+            args.push(result)
+        }
+
+        if plan.*.parameter_count >= 1 {
+            make argc = api::LLVMBuildSExt(this.builder, api::LLVMGetParam(this.native_main, 0), this.word, this.unnamed.data)
+            args.push(argc)
+            if plan.*.parameter_count >= 2 {
+                make argv = api::LLVMGetParam(this.native_main, 1)
+                if plan.*.argv_array { args.push(this.argv_header(argc, argv)) }
+                else { args.push(api::LLVMBuildPtrToInt(this.builder, argv, this.word, this.unnamed.data)) }
+            }
+        }
+
+        @unsafe make arg_ptr: ptr<ptr<any>> = 0
+        if args.len() > 0 {
+            @unsafe make first: ptr<ptr<any>> = args[0].pin
+            arg_ptr = first
+        }
+        @unsafe make count: u32 = args.len()
+        make value = api::LLVMBuildCall2(this.builder, api::LLVMGlobalGetValueType(user_main), user_main, arg_ptr, count, this.unnamed.data)
+        if plan.*.result_size > 0 { return this.status_from_result(result, plan.*.result_void) }
+        return api::LLVMBuildTrunc(this.builder, value, this.i32_type, this.unnamed.data)
+    }
+}
+
+/// Adapts the selected Quip function to the C main signature.
+@pub @unsafe
+make build (context: ptr<any>, module: ptr<any>, plan: ref<Plan>) -> bool {
+    if !plan.*.present { return true }
+    if !plan.*.valid {
+        std::progress::clear()
+        std::io::println("unsupported signature for the Quip entry function")
+        return false
+    }
+
+    make user_name: str = "__quip_user_main"
+    make main_name: str = "main"
+    make entry_name: str = "entry"
+    make user_main = api::LLVMGetNamedFunction(module, user_name.data)
+    make i32_type = api::LLVMInt32TypeInContext(context)
+    make pointer = api::LLVMPointerTypeInContext(context, 0)
+    make params: ptr<any>[2] = [i32_type, pointer]
+    @unsafe make param_ptr: ptr<ptr<any>> = params[0].pin
+    make signature = api::LLVMFunctionType(i32_type, param_ptr, 2, 0)
+    make native_main = api::LLVMAddFunction(module, main_name.data, signature)
+    make block = api::LLVMAppendBasicBlockInContext(context, native_main, entry_name.data)
+
+    make builder = api::LLVMCreateBuilderInContext(context)
+    api::LLVMPositionBuilderAtEnd(builder, block)
+    make adapter = Adapter {
+        context = context, builder = builder, native_main = native_main, i32_type = i32_type,
+        pointer = pointer, word = api::LLVMInt64TypeInContext(context), byte = api::LLVMInt8TypeInContext(context),
+    }
+    make status = adapter.call_user(user_main, plan)
+    api::LLVMBuildRet(builder, status)
+    api::LLVMDisposeBuilder(builder)
+    return true
+}

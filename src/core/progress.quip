@@ -1,0 +1,43 @@
+@external make quip_progress_begin (title: ref<str>, enabled: int, verbose: int) -> void
+@external make quip_progress_phase (phase: ref<str>, done: uint, total: uint, detail: ref<str>) -> void
+/// reports a completed unit through the runtime.
+@external make quip_progress_unit () -> void
+@external make quip_progress_clear () -> void
+@external make quip_progress_finish (success: int) -> void
+@external make quip_progress_run (name: ref<str>, args: ref<str[]>) -> int
+
+@pub
+make begin (title: str, enabled: bool, verbose: bool) {
+    make on: int = 0
+    make debug: int = 0
+
+    if enabled { on = 1 }
+
+    if verbose { debug = 1 }
+
+    quip_progress_begin(title.pin, on, debug)
+}
+
+@pub
+make phase (label: str, done: uint, total: uint, detail: str) {
+    quip_progress_phase(label.pin, done, total, detail.pin)
+}
+
+/// reports a completed unit.
+@pub
+make unit_done () { quip_progress_unit() }
+
+@pub
+make clear () { quip_progress_clear() }
+
+@pub
+make finish (success: bool) {
+    make ok: int = 0
+
+    if success { ok = 1 }
+
+    quip_progress_finish(ok)
+}
+
+@pub
+make run (name: str, args: str[]) -> int { return quip_progress_run(name.pin, args.pin) }

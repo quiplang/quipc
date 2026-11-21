@@ -1,0 +1,115 @@
+@pure @const {
+    make profile = @import "../analysis_profile.quip"
+    make std = @import "std"
+    make diags = @import "../../diag/diagnosis.quip"
+    make e = @import "../../diag/err.quip"
+    make hir = @import "../../repr/hir/hir.quip"
+    make hir_lower = @import "../../repr/hir/lower.quip"
+    make mir_build = @import "../../repr/mir/build.quip"
+    make mir_dump = @import "../../repr/mir/dump.quip"
+    make entry_point = @import "../../analysis/hir/entry_point.quip"
+    make symcheck = @import "../../analysis/hir/semantics/symbol/resolve.quip"
+    make semantics = @import "../../analysis/hir/semantics/check.quip"
+    make model = @import "../unit/pkg.quip"
+    make Unit: Type = model::Unit
+}
+
+@pub
+make lower (unit: ref<Unit>, timings: ref<profile::Profile>) -> !void {
+    unit.*.invalidate_analysis()
+    // translate to HIR (honouring @target groups for the selected platform)
+    make started: uint = 0
+
+    if timings.*.enabled { started = profile::now() }
+
+    unit.*.hir_module = hir_lower::lower(unit.*.program.pin, unit.*.platform_name, unit.*.diag.pin)
+
+    if timings.*.enabled { timings.*.record(started, "hir", unit.*.path_rel.get()) }
+
+    if timings.*.enabled { started = profile::now() }
+
+    // resolve symbols and reject duplicate declarations before anything consumes the module
+    unit.*.symbols = symcheck::check(unit.*.hir_module.pin, unit.*.diag.pin)
+    semantics::check_module(unit.*.hir_module.pin, unit.*.diag.pin)
+
+    if timings.*.enabled { timings.*.record(started, "symbols", unit.*.path_rel.get()) }
+
+    if unit.*.diag.is_aborting() || unit.*.diag.has_errors() {
+        unit.*.status = model::UnitStatus.Aborted
+
+        return error.CompilationAborted
+    }
+
+    // validate the entry point of the file the user asked to compile.
+    // the error is handled here (its tag is lost once re-returned through another function)
+    if unit.*.is_main {
+        if unit.*.entry_name.len() == 0 {
+            make count: uint = 0
+            make i: uint = 0
+
+            while i < unit.*.hir_module.funcs.len() {
+                make f = unit.*.hir_module.funcs[i].pin
+
+                for tag : f.*.tags.iter() {
+                    if tag == "entry" {
+                        unit.*.entry_name = f.*.name !
+                        count = count + 1
+                    }
+                }
+
+                i = i + 1
+            }
+
+            if count != 1 {
+                make d = diags::Diag.panic(e::Err.MissingEntryPoint, "build script must have exactly one @entry function; use --entry <name> to select one")
+                unit.*.diag.report(d)
+                return error.CompilationAborted
+            }
+        }
+
+        entry_point::check(unit.*.hir_module.pin, unit.*.entry_name) catch err {
+            unit.*.status = model::UnitStatus.Aborted
+
+            match err {
+                error.MissingEntryPoint {
+                    make d: owned<diags::Diag> = diags::Diag.panic(e::Err.MissingEntryPoint, "program is missing entry point tagged with @entry")
+                    unit.*.diag.report(d)
+                }
+
+                error.EntryPointNotPublic {
+                    make d = diags::Diag.panic(e::Err.EntryPointNotPublic, "entry point '" + unit.*.entry_name + "' is not tagged with @pub")
+                    unit.*.diag.report(d)
+                }
+
+                _ {}
+            }
+
+            return error.CompilationAborted
+        }
+    }
+
+    return
+}
+
+@pub
+make lower_mir (unit: ref<Unit>, sigs: ref<hir::HirAttachedSig[]>, structs: ref<hir::HirStructSig[]>, timings: ref<profile::Profile>) -> !void {
+    if !unit.*.typed.valid { return error.CompilationAborted }
+    unit.*.analyzed.mir_valid = false
+    unit.*.analyzed.memory_valid = false
+    std::progress::phase("Lower MIR", 0, 0, unit.*.path_rel.get())
+
+    // translate to MIR
+    make started: uint = 0
+    if timings.*.enabled { started = profile::now() }
+
+    unit.*.analyzed.mir_module = mir_build::build(unit.*.hir_module.pin, unit.*.typed.checked.pin, unit.*.typed.tys.pin, structs, sigs)
+
+    if timings.*.enabled { timings.*.record(started, "mir", unit.*.path_rel.get()) }
+
+    if unit.*.emit_mir {
+        mir_dump::print(unit.*.analyzed.mir_module.pin)
+    }
+
+    unit.*.analyzed.mir_valid = true
+    return
+}

@@ -1,0 +1,136 @@
+// heap obligations: open on an `@allocator` call, follow the owner through
+// moves, satisfied by the matching `@deallocator`, auto-released at the kill
+// line when the owner dies
+
+@pure @const {
+    make report = @import "report.quip"
+    make graph = @import "lifetimes/graph.quip"
+}
+
+make has_owner (o: ref<report::MemObligation>, local: uint) -> bool {
+    if o.*.local == local { return true }
+    make i = 0
+    while i < o.*.aliases.len() {
+        if o.*.aliases[i] == local { return true }
+        i = i + 1
+    }
+    return false
+}
+
+/// Removes a raw pointer alias when its local is overwritten.
+@pub
+make forget_alias (list: ref<report::MemObligation[]>, local: uint, invalid: uint) -> void {
+    make i = 0
+    while i < list.*.len() {
+        make o = list.*[i].pin
+        if !o.*.closed && !o.*.auto_cleanup {
+            if o.*.local == local { o.*.local = invalid }
+            make aliases: uint[] = []
+            make j = 0
+            while j < o.*.aliases.len() {
+                if o.*.aliases[j] != local { aliases.push(o.*.aliases[j]) }
+                j = j + 1
+            }
+            o.*.aliases = aliases
+        }
+        i = i + 1
+    }
+}
+
+// Raw pointer copies keep the allocation identity, without creating another
+// allocation or claiming that copying a pointer transfers ownership.
+@pub
+make alias (list: ref<report::MemObligation[]>, from: uint, to: uint) -> void {
+    make i = 0
+    while i < list.*.len() {
+        make o = list.*[i].pin
+        if !o.*.closed && has_owner(o, from) && !has_owner(o, to) { o.*.aliases.push(to) }
+        i = i + 1
+    }
+}
+
+/// records an outstanding allocation obligation for a local.
+@pub
+make open (list: ref<report::MemObligation[]>, local: uint, name: str, allocator: str, at: uint, nstmts: uint, size: uint, size_known: bool, auto_cleanup: bool) -> void {
+    make o = report::MemObligation {}
+
+    o.local = local
+    o.name = name
+    o.allocator = allocator
+    o.opened_at = at
+    o.closed_at = nstmts
+    o.size = size
+    o.size_known = size_known
+    o.auto_cleanup = auto_cleanup
+    list.*.push(o)
+    return
+}
+
+// `freed` marks an explicit deallocator, otherwise the obligation was handed
+// to a callee or another local
+/// marks a local allocation obligation as satisfied.
+@pub
+make satisfy (list: ref<report::MemObligation[]>, local: uint, at: uint, nstmts: uint, freed: bool) -> void {
+    make i = 0
+
+    while i < list.*.len() {
+        make o = list.*[i].pin
+
+        if has_owner(o, local) && !o.*.closed {
+            o.*.closed = true
+            o.*.closed_at = at
+            o.*.freed = freed
+            o.*.transferred = !freed
+        }
+
+        i = i + 1
+    }
+
+    return
+}
+
+/// transfers outstanding allocation obligations between locals.
+@pub
+make transfer (list: ref<report::MemObligation[]>, from: uint, to: uint, nstmts: uint) -> void {
+    make i = 0
+
+    while i < list.*.len() {
+        make o = list.*[i].pin
+
+        if o.*.local == from && !o.*.closed {
+            o.*.local = to
+        }
+
+        i = i + 1
+    }
+
+    return
+}
+
+// obligations still open at the end of the function are auto-released when
+// their owner reaches its kill line
+/// finalizes allocation obligations using the liveness graph.
+@pub
+make finalize (list: ref<report::MemObligation[]>, g: ref<graph::LivenessGraph>, nstmts: uint) -> void {
+    make i = 0
+
+    while i < list.*.len() {
+        make o = list.*[i].pin
+
+        if !o.*.closed {
+            if has_owner(o, 0) {
+                o.*.transferred = true
+                o.*.closed = true
+                o.*.closed_at = nstmts
+            } elif o.*.auto_cleanup && o.*.local < g.*.nlocals {
+                o.*.closed_at = graph::kill_line(g, o.*.local)
+                o.*.auto_released = true
+                o.*.closed = true
+            }
+        }
+
+        i = i + 1
+    }
+
+    return
+}

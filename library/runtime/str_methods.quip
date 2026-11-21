@@ -1,0 +1,73 @@
+@impl str
+make copy () -> str {
+    make c: str = ""
+
+    make i: int = 0
+    while i < this.length {
+        c.push(this[i])
+        i = i + 1
+    }
+
+    return c
+}
+
+// Allocation primitives are shared with compiler-generated cleanup during the
+// migration. Descriptor management and byte operations live in Quip.
+@unsafe @external make quip_heap_alloc (bytes: uint) -> ptr<char>
+@unsafe @external make quip_heap_free (buffer: ptr<char>) -> void
+
+/// Ensures space for additional bytes plus the trailing NUL.
+@impl str
+make reserve (additional: int) -> !void {
+    make length: int = this.length
+    make old_capacity: int = this.capacity
+
+    if additional < 0 || length > 9223372036854775806 - additional {
+        return error.InvalidCapacity
+    }
+
+    make required: int = length + additional + 1
+
+    if old_capacity >= required { return }
+
+    make capacity: int = required
+
+    if old_capacity <= 4611686018427387903 && old_capacity * 2 > capacity {
+        capacity = old_capacity * 2
+    }
+
+    if capacity < 16 { capacity = 16 }
+
+    @unsafe {
+        make data = quip_heap_alloc(capacity)
+        make null: ptr<char> = 0
+
+        if data == null { return error.OutOfMemory }
+
+        make old_data: ptr<char> = this.data
+        make i: int = 0
+        while i < length {
+            data[i] = old_data[i]
+            i = i + 1
+        }
+
+        data[length] = '\0'
+
+        if old_capacity > 0 { quip_heap_free(old_data) }
+
+        this.data = data
+        this.capacity = capacity
+    }
+}
+
+/// All bytes before length must have been initialized by the caller.
+@impl str @unsafe
+make set_length (length: int) -> !void {
+    make capacity: int = this.capacity
+
+    if length < 0 || length >= capacity { return error.InvalidLength }
+
+    make data: ptr<char> = this.data
+    data[length] = '\0'
+    this.length = length
+}

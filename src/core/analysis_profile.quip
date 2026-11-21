@@ -1,0 +1,124 @@
+@pure @const {
+    make std = @import "std"
+}
+
+/// Returns a monotonic timestamp, or zero when the clock is unavailable.
+@pub
+make now () -> uint {
+    make instant = std::time::Instant.now() catch { return 0 }
+    return instant.nanoseconds
+}
+
+make type Timing {
+    make name: str = ""
+    make elapsed: uint = 0
+}
+
+make add (rows: ref<Timing[]>, name: str, elapsed: uint) {
+    make i: uint = 0
+    while i < rows.*.len() {
+        if rows.*[i].name == name {
+            rows.*[i].elapsed += elapsed
+            return
+        }
+        i += 1
+    }
+
+    rows.*.push(Timing { name = name, elapsed = elapsed })
+}
+
+make print_rows (rows: ref<Timing[]>, limit: uint) {
+    make i: uint = 0
+    while i < limit && i < rows.*.len() {
+        make best = i
+        make j = i + 1
+        while j < rows.*.len() {
+            if rows.*[j].elapsed > rows.*[best].elapsed { best = j }
+            j += 1
+        }
+
+        std::io::println("  " + (rows.*[best].elapsed / 1000).to_str() + " us  " + rows.*[best].name)
+        if best != i {
+            rows.*[best].elapsed = rows.*[i].elapsed
+            rows.*[best].name = rows.*[i].name.copy()
+        }
+        i += 1
+    }
+}
+
+@pub
+make type Profile {
+    @pub make enabled: bool = false
+    make summary: bool = false
+    make trace: bool = false
+    make attributed: uint = 0
+    make phases: Timing[] = []
+    make units: Timing[] = []
+    make memory: Timing[] = []
+
+    @pub
+    make init (summary: bool) -> Profile {
+        make trace = std::process::Environment.get("QUIPC_PROFILE_ANALYSIS", "") == "1"
+        return Profile { enabled = summary || trace, summary = summary, trace = trace }
+    }
+
+    @pub @this
+    make record (started: uint, phase: str, path: str) {
+        if started == 0 { return }
+
+        make finished = now()
+        if finished < started { return }
+
+        make elapsed = finished - started
+        if this.trace {
+            make line = "quip-profile\t" + phase.copy() + "\t" + elapsed.to_str() + "\t" + path.copy() + "\n"
+            @unsafe { std::os::write(2, line.data, line.len()) catch {} }
+        }
+        if !this.summary { return }
+
+        if phase.len() >= 4 && phase[0] == 'm' && phase[1] == 'e' && phase[2] == 'm' && phase[3] == '_' {
+            if this.memory.len() < 10 {
+                this.memory.push(Timing { name = phase + "  " + path, elapsed = elapsed })
+                return
+            }
+
+            make smallest: uint = 0
+            make i: uint = 1
+            while i < this.memory.len() {
+                if this.memory[i].elapsed < this.memory[smallest].elapsed { smallest = i }
+                i += 1
+            }
+
+            if elapsed > this.memory[smallest].elapsed {
+                this.memory[smallest] = Timing { name = phase + "  " + path, elapsed = elapsed }
+            }
+            return
+        }
+
+        this.attributed += elapsed
+        add(this.phases.pin, phase.copy(), elapsed)
+        if phase != "imports" && path != "<build>" { add(this.units.pin, path, elapsed) }
+    }
+
+    @pub @this
+    make print (started: uint, output: str) {
+        make finished = now()
+        if started == 0 || finished < started {
+            std::io::println("Compiler benchmark unavailable: monotonic clock failed")
+            return
+        }
+
+        make wall = finished - started
+        if wall > this.attributed { add(this.phases.pin, "unattributed", wall - this.attributed) }
+
+        std::io::println("Compiler benchmark: " + output + " (" + (wall / 1000).to_str() + " us wall time)")
+        std::io::println("Phases")
+        print_rows(this.phases.pin, this.phases.len())
+        std::io::println("Slowest source units")
+        print_rows(this.units.pin, 10)
+        if this.memory.len() > 0 {
+            std::io::println("Memory analysis hotspots (included in memory)")
+            print_rows(this.memory.pin, 10)
+        }
+    }
+}

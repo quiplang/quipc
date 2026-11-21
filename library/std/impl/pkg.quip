@@ -1,0 +1,6 @@
+@pub @pure @const {
+
+    make __uint: unit = @import "./uint.quip"
+    make __int: unit = @import "./int.quip"
+
+}

@@ -1,4 +1,7 @@
 @pub @pure @const {
-make driver = @import "driver.quip"
-make config = @import "config.quip"
+    make driver = @import "driver.quip"
+    make config = @import "config.quip"
+    make session = @import "session.quip"
+    make deps = @import "deps.quip"
+    make pipeline = @import "pipeline.quip"
 }

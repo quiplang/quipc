@@ -1,0 +1,195 @@
+// Conservative promotion of MIR words before LLVM IR construction.
+@pure @const {
+    make mir = @import "../repr/mir/mir.quip"
+}
+
+make type Analysis {
+    make eligible: bool[] = []
+    make definitions: uint[] = []
+    make counts: uint[] = []
+    make available: uint[] = []
+    // Row d marks blocks reachable from entry without executing definition block d.
+    make bypass: bool[] = []
+    make rows: uint[] = []
+    make blocks: uint = 0
+    make body: ref<mir::MirBody>
+
+    @this
+    make bypasses (definition: uint, block: uint) -> bool {
+        if this.rows[definition] == 0 {
+            make reachable: bool[] = []
+            while reachable.len() < this.blocks { reachable.push(false) }
+            make pending: uint[] = []
+            if definition != 0 {
+                pending.push(0)
+                reachable[0] = true
+            }
+            make cursor: uint = 0
+            while cursor < pending.len() {
+                make current = pending[cursor]
+                cursor++
+                make term = this.body.*.terms[current].pin
+                if term.*.kind == mir::MirTermKind.Goto || term.*.kind == mir::MirTermKind.Call || term.*.kind == mir::MirTermKind.Branch {
+                    make target = term.*.target
+                    if target != definition && !reachable[target] {
+                        reachable[target] = true
+                        pending.push(target)
+                    }
+                }
+                if term.*.kind == mir::MirTermKind.Branch {
+                    make target = term.*.other
+                    if target != definition && !reachable[target] {
+                        reachable[target] = true
+                        pending.push(target)
+                    }
+                }
+            }
+            this.rows[definition] = this.bypass.len() + 1
+            for reached : reachable { this.bypass.push(reached) }
+        }
+        return this.bypass[this.rows[definition] - 1 + block]
+    }
+
+    @this
+    make read (local: uint, block: uint) {
+        if local >= this.eligible.len() || !this.eligible[local] || this.available[local] == block + 1 { return }
+        if local > 0 && local <= this.body.*.param_count && this.counts[local] == 1 { return }
+        make definition = this.definitions[local]
+        if this.counts[local] != 1 || definition >= block || this.bypasses(definition, block) {
+            this.eligible[local] = false
+        }
+    }
+
+    @this
+    make place (value: ref<mir::MirPlace>, block: uint) {
+        if value.*.projs.len() > 0 { this.eligible[value.*.local] = false }
+        else { this.read(value.*.local, block) }
+        for projection : value.*.projs {
+            if projection.kind == mir::MirProjKind.Index { this.read(projection.index, block) }
+        }
+    }
+
+    @this
+    make operand (value: ref<mir::MirOperand>, block: uint) {
+        if value.*.kind == mir::MirOperandKind.Copy || value.*.kind == mir::MirOperandKind.Move {
+            this.place(value.*.place.pin, block)
+        }
+    }
+}
+
+/// Address users retain storage. Other words can be SSA when every use has
+/// an earlier dominating definition, or a definition within its own block.
+@pub
+make plan (body: ref<mir::MirBody>) -> bool[] {
+    make analysis = Analysis { blocks = body.*.terms.len(), body = body }
+    for local : body.*.locals {
+        _ = local
+        analysis.eligible.push(true)
+        analysis.definitions.push(analysis.blocks)
+        analysis.counts.push(0)
+        analysis.available.push(0)
+    }
+    make i: uint = 1
+    while i <= body.*.param_count {
+        analysis.counts[i] = 1
+        i++
+    }
+    for capture : body.*.capture_locals { analysis.eligible[capture] = false }
+    for statement : body.*.stmts {
+        if statement.kind != mir::MirStmtKind.Assign { continue }
+        make local = statement.place.local
+        if statement.place.projs.len() > 0 { analysis.eligible[local] = false }
+        else {
+            analysis.counts[local]++
+            analysis.definitions[local] = statement.block
+        }
+        if statement.rvalue.kind == mir::MirRvalueKind.Pin { analysis.eligible[statement.rvalue.place.local] = false }
+    }
+    i = 0
+    for term : body.*.terms {
+        if term.kind == mir::MirTermKind.Call {
+            analysis.counts[term.dest.local]++
+            analysis.definitions[term.dest.local] = i
+            // The native conversion helper writes directly to destination storage.
+            if term.c_abi || term.ret_agg || term.dest.projs.len() > 0 { analysis.eligible[term.dest.local] = false }
+        }
+        i++
+    }
+
+    // Most temporaries are used within their defining block. Compute graph
+    // reachability only for definition blocks with cross-block uses.
+    while analysis.rows.len() < analysis.blocks { analysis.rows.push(0) }
+    make end = body.*.stmts.len()
+    make heads: uint[] = []
+    make next: uint[] = []
+    while heads.len() < analysis.blocks { heads.push(end) }
+    while next.len() < end { next.push(end) }
+    i = end
+    while i > 0 {
+        i--
+        make block = body.*.stmts[i].block
+        next[i] = heads[block]
+        heads[block] = i
+    }
+
+    // Preserve MIR order inside each block, including call arguments before results.
+    make block: uint = 0
+    while block < analysis.blocks {
+        make statement_index = heads[block]
+        while statement_index < end {
+            make statement = body.*.stmts[statement_index].pin
+            statement_index = next[statement_index]
+            if statement.*.kind != mir::MirStmtKind.Assign { continue }
+            make rv = statement.*.rvalue.pin
+            analysis.operand(rv.*.a.pin, block)
+            analysis.operand(rv.*.b.pin, block)
+            if rv.*.kind == mir::MirRvalueKind.Pin { analysis.place(rv.*.place.pin, block) }
+            for operand : rv.*.ops { analysis.operand(operand.pin, block) }
+            if statement.*.place.projs.len() > 0 { analysis.place(statement.*.place.pin, block) }
+            else { analysis.available[statement.*.place.local] = block + 1 }
+        }
+        make term = body.*.terms[block].pin
+        if term.*.kind == mir::MirTermKind.Branch { analysis.operand(term.*.cond.pin, block) }
+        if term.*.kind == mir::MirTermKind.Call {
+            analysis.operand(term.*.func.pin, block)
+            for operand : term.*.args { analysis.operand(operand.pin, block) }
+        }
+        if term.*.kind == mir::MirTermKind.Return { analysis.read(0, block) }
+        block++
+    }
+    return analysis.eligible
+}
+
+/// Bypass empty goto chains, retaining cycles and the function's first block.
+@pub
+make targets (body: ref<mir::MirBody>) -> uint[] {
+    make empty: bool[] = []
+    for term : body.*.terms { empty.push(term.kind == mir::MirTermKind.Goto) }
+    for statement : body.*.stmts {
+        // Storage markers may carry cleanup effects on the general emitter.
+        empty[statement.block] = false
+    }
+    make result: uint[] = []
+    make block: uint = 0
+    while block < body.*.terms.len() {
+        make target = block
+        make steps: uint = 0
+        while target != 0 && empty[target] && steps < body.*.terms.len() {
+            target = body.*.terms[target].target
+            steps++
+        }
+        if steps == body.*.terms.len() { target = block }
+        result.push(target)
+        block++
+    }
+    return result
+}
+
+@pub
+make entry_is_first (body: ref<mir::MirBody>) -> bool {
+    for term : body.*.terms {
+        if (term.kind == mir::MirTermKind.Goto || term.kind == mir::MirTermKind.Call || term.kind == mir::MirTermKind.Branch) && term.target == 0 { return false }
+        if term.kind == mir::MirTermKind.Branch && term.other == 0 { return false }
+    }
+    return true
+}

@@ -1,0 +1,38 @@
+@pure @const {
+    make p: unit = @import "path.quip"
+
+    make os: unit = @import "../os/pkg.quip"
+}
+
+
+@pub
+make type Dir {
+
+    @pub
+    make mkdir (path: ref<p::Path>, mode: int) -> !void {
+        make filename = path.*.get()
+        for ch : filename ! {
+            if ch == '\0' { os::set_errno(os::ErrorCode.Invalid) return error.InvalidPath }
+        }
+        filename.push('\0')
+        make exists = true
+        @unsafe os::access(filename.data, os::AccessMode.Exists) catch { exists = false }
+        if exists { return }
+        if mode < 0 || mode > 4095 { return error.InvalidMode }
+        @unsafe make permissions: u32 = mode
+        @unsafe os::mkdir(filename.data, permissions) catch { return error.DirCreationFailed }
+
+    }
+
+    @pub
+    make rmdir (path: ref<p::Path>) -> !void {
+        make filename = path.*.get()
+        for ch : filename ! {
+            if ch == '\0' { os::set_errno(os::ErrorCode.Invalid) return error.InvalidPath }
+        }
+        filename.push('\0')
+        @unsafe os::rmdir(filename.data) catch { return error.DirRemovalFailed }
+
+    }
+
+}

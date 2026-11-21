@@ -7,7 +7,7 @@
     make diag = @import "../diag/diagnosis.quip"
     make err = @import "../diag/err.quip"
 
-    make um = @import "unit_manager.quip"
+    make um = @import "unit/pkg.quip"
 
     make util = @import "../util/pkg.quip"
 }

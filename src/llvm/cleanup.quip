@@ -13,8 +13,8 @@ make type Local {
 }
 
 @pure @const {
-    make mir = @import "../mir/mir.quip"
-    make flow = @import "../mir/flow.quip"
+    make mir = @import "../repr/mir/mir.quip"
+    make flow = @import "../repr/mir/flow.quip"
 }
 
 @pub

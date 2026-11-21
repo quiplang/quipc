@@ -216,7 +216,7 @@ make type Diag {
 /// collects and renders diagnostics for a source file.
 @pub
 make type Diagnostic {
-    make diags: owned<Diag>[]
+    @pub make diags: owned<Diag>[]
     make limit: u32
     make error_count: u32 = 0
 
@@ -226,6 +226,8 @@ make type Diagnostic {
     make has_source: bool = false
     make aborting: bool = false
     @pub make hide_warnings: bool = false
+    // Editor clients collect diagnostics; CLI callers keep immediate rendering.
+    @pub make render_on_report: bool = true
 
     /// Suggests replacing the source line containing the supplied offset.
     @pub @this
@@ -273,8 +275,10 @@ make type Diagnostic {
         }
 
         if diag.*.kind == DiagKind.Error && this.error_count > this.limit {
-            std::progress::clear()
-            std::io::println(paint(C_MAGENTA(), "fatal") + paint(C_BOLD(), ": too many errors, compilation aborted"))
+            if this.render_on_report {
+                std::progress::clear()
+                std::io::println(paint(C_MAGENTA(), "fatal") + paint(C_BOLD(), ": too many errors, compilation aborted"))
+            }
 
             this.aborting = true
 
@@ -285,7 +289,8 @@ make type Diagnostic {
             this.aborting = true
         }
 
-        this.render(diag)
+        if this.render_on_report { this.render(diag) }
+        else { this.diags.push(diag) }
 
         return this.aborting
     }

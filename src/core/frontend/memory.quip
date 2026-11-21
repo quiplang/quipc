@@ -1,0 +1,70 @@
+@pure @const {
+    make profile = @import "../analysis_profile.quip"
+    make std = @import "std"
+    make hir = @import "../../repr/hir/hir.quip"
+    make closures = @import "../../analysis/hir/closures.quip"
+    make initialization = @import "../../analysis/hir/initialization.quip"
+    make mem = @import "../../analysis/mir/memory/pkg.quip"
+    make memr = @import "../../analysis/mir/memory/report.quip"
+    make model = @import "../unit/pkg.quip"
+    make Unit: Type = model::Unit
+}
+
+@pub
+make check_memory (unit: ref<Unit>, structs: ref<hir::HirStructSig[]>, context: ref<memr::MemContext>, timings: ref<profile::Profile>) -> !void {
+    if !unit.*.analyzed.mir_valid { return error.CompilationAborted }
+    unit.*.analyzed.memory_valid = false
+    std::progress::phase("Memory check", 0, 0, unit.*.path_rel.get())
+
+    make started: uint = 0
+    if timings.*.enabled { started = profile::now() }
+
+    // memory-rule validation
+    make memory_index: uint = 0
+
+    while memory_index < unit.*.hir_module.funcs.len() && memory_index < unit.*.typed.checked.funcs.len() {
+        make function = unit.*.hir_module.funcs[memory_index].pin
+        make result = unit.*.typed.checked.funcs[memory_index].pin
+        closures::check(function, unit.*.typed.tys.pin, result.*.closure_checks.pin, result.*.closure_shapes.pin, result.*.closure_uses.pin, result.*.expr_tys.pin, unit.*.diag.pin)
+        memory_index = memory_index + 1
+    }
+
+    memory_index = 0
+
+    while memory_index < unit.*.hir_module.funcs.len() && memory_index < unit.*.typed.checked.funcs.len() {
+        initialization::check(unit.*.hir_module.funcs[memory_index].body.pin, unit.*.typed.checked.funcs[memory_index].field_checks.pin, structs, unit.*.diag.pin)
+        memory_index = memory_index + 1
+    }
+
+    unit.*.status = model::UnitStatus.MemAnalysis
+    make previous = memr::MemReport {}
+    make reuse: bool[] = []
+    unit.*.analyzed.mem_report = mem::check_cached(unit.*.analyzed.mir_module.pin, unit.*.diag.pin, context, unit.*.path_rel.get(), previous.pin, reuse.pin, timings, unit.*.emit_mem)
+
+    if timings.*.enabled { timings.*.record(started, "memory", unit.*.path_rel.get()) }
+
+    if unit.*.emit_mem {
+        make show = unit.*.is_main || unit.*.verbose
+
+        if !show {
+            make path_str = unit.*.path_rel.get()
+
+            if !memr::is_library_path(path_str) {
+                show = true
+            }
+        }
+
+        if show {
+            memr::print(unit.*.analyzed.mem_report.pin)
+        }
+    }
+
+    if unit.*.diag.is_aborting() || unit.*.diag.has_errors() {
+        unit.*.status = model::UnitStatus.Aborted
+
+        return error.CompilationAborted
+    }
+
+    unit.*.analyzed.memory_valid = true
+    return
+}

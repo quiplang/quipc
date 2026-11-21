@@ -2,8 +2,8 @@
 // after every MIR block has been emitted, so block numbering is immaterial.
 @pure @const {
     make api = @import "bindings.quip"
-    make mir = @import "../mir/mir.quip"
-    make flow = @import "../mir/flow.quip"
+    make mir = @import "../repr/mir/mir.quip"
+    make flow = @import "../repr/mir/flow.quip"
     make native = @import "native.quip"
     make arrays = @import "../../library/runtime/array.quip"
 }

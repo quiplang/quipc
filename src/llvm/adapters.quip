@@ -2,7 +2,7 @@
     make std = @import "std"
     make api = @import "bindings.quip"
     make native = @import "native.quip"
-    make mir = @import "../mir/mir.quip"
+    make mir = @import "../repr/mir/mir.quip"
 }
 
 @pub

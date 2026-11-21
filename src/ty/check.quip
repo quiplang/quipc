@@ -350,11 +350,17 @@ make type Checker {
 
         oi = 0
 
-        while oi < this.out.local_tys.len() { out.local_tys.push(this.out.local_tys[oi]) oi = oi + 1 }
+        while oi < this.out.local_tys.len() {
+            out.local_tys.push(this.out.local_tys[oi])
+            oi = oi + 1
+        }
 
         oi = 0
 
-        while oi < this.out.uses.len() { out.uses.push(this.out.uses[oi]) oi = oi + 1 }
+        while oi < this.out.uses.len() {
+            out.uses.push(this.out.uses[oi])
+            oi = oi + 1
+        }
 
         while this.out.call_names.len() > 0 {
             out.call_exprs.push(this.out.call_exprs.pop())
@@ -504,6 +510,10 @@ make type Checker {
             } else {
                 id = this.fresh()
             }
+        } elif ht.*.name == "tuple" {
+            make tuple = ty::Ty { kind = ty::TyKind.Tuple }
+            for argument : ht.*.args { tuple.args.push(this.lower_type(body, argument)) }
+            id = this.tys.*.intern(tuple)
         } elif ht.*.name == "fn" && ht.*.args.len() > 0 {
             make function = ty::Ty {}
 
@@ -772,6 +782,22 @@ make type Checker {
             return aa
         }
 
+        if this.tys.*.kind_of(aa) == ty::TyKind.Tuple || this.tys.*.kind_of(bb) == ty::TyKind.Tuple {
+            if this.tys.*.kind_of(aa) != ty::TyKind.Tuple || this.tys.*.kind_of(bb) != ty::TyKind.Tuple { return ty::TY_ERROR }
+            make left = this.tys.*.args_of(aa)
+            make right = this.tys.*.args_of(bb)
+            if left.len() != right.len() { return ty::TY_ERROR }
+            make tuple = ty::Ty { kind = ty::TyKind.Tuple }
+            make i: uint = 0
+            while i < left.len() {
+                make element = this.unify(left[i], right[i])
+                if element == ty::TY_ERROR { return ty::TY_ERROR }
+                tuple.args.push(element)
+                i++
+            }
+            return this.tys.*.intern(tuple)
+        }
+
         if this.tys.*.kind_of(aa) == ty::TyKind.Adt && this.tys.*.kind_of(bb) == ty::TyKind.Adt {
             if this.adt_name(aa) == this.adt_name(bb) { return aa }
 
@@ -957,6 +983,19 @@ make type Checker {
 
             ty::TyKind.Array { return this.ty_name(this.tys.*.elem_of(rid)) + "[]" }
 
+            ty::TyKind.Tuple {
+                make result: str = "("
+                make args = this.tys.*.args_of(rid)
+                make i: uint = 0
+                while i < args.len() {
+                    if i > 0 { result = result + ", " }
+                    result = result + this.ty_name(args[i])
+                    i++
+                }
+                if args.len() == 1 { result = result + "," }
+                return result + ")"
+            }
+
             ty::TyKind.Optional { return this.ty_name(this.tys.*.elem_of(rid)) + "?" }
 
             ty::TyKind.Fallible { return "!" + this.ty_name(this.tys.*.elem_of(rid))  }
@@ -1058,6 +1097,11 @@ make type Checker {
 
         if this.tys.*.kind_of(rid) == ty::TyKind.Text {
             return ty::TY_STR
+        }
+        if this.tys.*.kind_of(rid) == ty::TyKind.Tuple {
+            make tuple = ty::Ty { kind = ty::TyKind.Tuple }
+            for element : this.tys.*.args_of(rid) { tuple.args.push(this.default_text(element)) }
+            return this.tys.*.intern(tuple)
         }
 
         if this.tys.*.kind_of(rid) == ty::TyKind.Array || this.tys.*.kind_of(rid) == ty::TyKind.Optional || this.tys.*.kind_of(rid) == ty::TyKind.Fallible || this.tys.*.kind_of(rid) == ty::TyKind.Ptr || this.tys.*.kind_of(rid) == ty::TyKind.Owned || this.tys.*.kind_of(rid) == ty::TyKind.Ref {
@@ -1167,6 +1211,14 @@ make type Checker {
             this.unsafe_depth = this.unsafe_depth + 1
         }
 
+        if s.*.tuple_pattern {
+            make tuple = this.resolve(this.check_expr(body, s.*.value, UseKind.Place))
+            if tuple != ty::TY_ERROR && (this.tys.*.kind_of(tuple) != ty::TyKind.Tuple || this.tys.*.args_of(tuple).len() != s.*.tuple_arity) {
+                make d = diags::Diag.err(e::Err.TypeMismatch, s.*.range.copy(), "tuple binding pattern must match the tuple structure and length")
+                this.diag.*.report(d)
+            }
+            return
+        }
         match s.*.kind {
             hir::HirStmtKind.Let {
                 make ty_id = this.out.local_tys[s.*.local]
@@ -1540,6 +1592,27 @@ make type Checker {
 
             hir::HirExprKind.Call { id = this.check_call(body, idx, ex, how != UseKind.None) }
 
+            hir::HirExprKind.Tuple {
+                make tuple = ty::Ty { kind = ty::TyKind.Tuple }
+                make expected = this.resolve(this.out.expr_tys[idx])
+                make fields = this.tys.*.args_of(expected)
+                make contextual = this.tys.*.kind_of(expected) == ty::TyKind.Tuple && fields.len() == ex.*.args.len()
+                make i: uint = 0
+                for argument : ex.*.args {
+                    make actual = this.check_expr(body, argument, UseKind.Copy)
+                    if contextual {
+                        make unified = this.unify(fields[i], actual)
+                        if unified == ty::TY_ERROR && actual != ty::TY_ERROR {
+                            make d = diags::Diag.err(e::Err.TypeMismatch, body.*.exprs[argument].range.copy(), "tuple element does not match its declared type")
+                            this.diag.*.report(d)
+                        }
+                        tuple.args.push(unified)
+                    } else { tuple.args.push(actual) }
+                    i++
+                }
+                id = this.tys.*.intern(tuple)
+            }
+
             hir::HirExprKind.Index {
                 id = this.check_index(body, ex)
                 this.note_use(idx, id, how)
@@ -1699,7 +1772,7 @@ make type Checker {
             return this.can_explicit_copy(this.tys.*.elem_of(rid))
         }
 
-        if this.tys.*.kind_of(rid) == ty::TyKind.Variant {
+        if this.tys.*.kind_of(rid) == ty::TyKind.Tuple || this.tys.*.kind_of(rid) == ty::TyKind.Variant {
             make args = this.tys.*.args_of(rid)
             make i: uint = 0
 
@@ -1885,6 +1958,15 @@ make type Checker {
             }
         }
 
+        if this.tys.*.kind_of(this.resolve(lt)) == ty::TyKind.Tuple || this.tys.*.kind_of(this.resolve(rt)) == ty::TyKind.Tuple {
+            if (op != lexer::TokenKind.EqualEqual && op != lexer::TokenKind.NotEqual) ||
+                this.default_text(lt) != this.default_text(rt) || !this.tuple_equality_type(this.default_text(lt)) {
+                make d = diags::Diag.err(e::Err.TypeMismatch, ex.*.range.copy(), "tuples support equality only with matching, equality-comparable element types")
+                this.diag.*.report(d)
+                return ty::TY_ERROR
+            }
+            return ty::TY_BOOL
+        }
         make joined = this.unify(lt, rt)
 
         if joined == ty::TY_ERROR {
@@ -1925,6 +2007,21 @@ make type Checker {
         }
 
         return joined
+    }
+
+    @this
+    make tuple_equality_type (id: uint) -> bool {
+        make kind = this.tys.*.kind_of(id)
+        if kind == ty::TyKind.Tuple {
+            for element : this.tys.*.args_of(id) { if !this.tuple_equality_type(element) { return false } }
+            return true
+        }
+        if this.tys.*.is_numeric(id) || this.tys.*.is_str(id) || kind == ty::TyKind.Bool || kind == ty::TyKind.Char || this.is_pointer_kind(kind) { return true }
+        if kind == ty::TyKind.Adt {
+            make def = this.tys.*.def_of(id)
+            return def < this.module.*.items.len() && this.module.*.items[def].kind == hir::HirItemKind.Enum
+        }
+        return false
     }
 
     @this
@@ -2094,6 +2191,78 @@ make type Checker {
     }
 
     @this
+    make tuple_index_literal (text: str) -> uint {
+        make max: uint = 18446744073709551615
+        make result: uint = 0
+        make i: uint = 0
+        make base: uint = 10
+        if text.len() > 2 && text[0] == '0' {
+            if text[1] == 'x' || text[1] == 'X' { base = 16 i = 2 }
+            elif text[1] == 'b' || text[1] == 'B' { base = 2 i = 2 }
+            elif text[1] == 'o' || text[1] == 'O' { base = 8 i = 2 }
+        }
+        if text.len() == 0 { return 18446744073709551615 }
+        while i < text.len() {
+            make ch = text[i]
+            i++
+            if ch == '_' { continue }
+            @unsafe make digit: uint = ch
+            if ch >= '0' && ch <= '9' { digit = digit - 48 }
+            elif ch >= 'a' && ch <= 'f' { digit = digit - 87 }
+            elif ch >= 'A' && ch <= 'F' { digit = digit - 55 }
+            else { return 18446744073709551615 }
+            if digit >= base || result > (max - digit) / base { return 18446744073709551615 }
+            result = result * base + digit
+        }
+        return result
+    }
+
+    // Evaluate integer index expressions without admitting runtime locals or calls.
+    // Limit recursion for malformed/cyclic constants, and reject unsigned overflow.
+    @this
+    make tuple_index_constant (body: ref<hir::HirBody>, index: uint, depth: uint) -> uint {
+        if depth > 64 || index >= body.*.exprs.len() { return 18446744073709551615 }
+        make ex = body.*.exprs[index].pin
+        make max: uint = 18446744073709551615
+        if ex.*.kind == hir::HirExprKind.Literal && ex.*.lit.kind == lexer::TokenKind.LiteralNum {
+            return this.tuple_index_literal(ex.*.lit.lexeme.copy())
+        }
+        if ex.*.kind == hir::HirExprKind.Local && body.*.locals[ex.*.local].is_const {
+            for statement : body.*.stmts {
+                if statement.kind == hir::HirStmtKind.Let && statement.local == ex.*.local && statement.has_value {
+                    return this.tuple_index_constant(body, statement.value, depth + 1)
+                }
+            }
+        }
+        if ex.*.kind == hir::HirExprKind.Path || ex.*.kind == hir::HirExprKind.Field {
+            make i: uint = 0
+            while i < this.out.const_exprs.len() {
+                if this.out.const_exprs[i] == index {
+                    return this.tuple_index_literal(this.out.const_lits[i].lexeme.copy())
+                }
+                i++
+            }
+        }
+        if ex.*.kind == hir::HirExprKind.Binary {
+            make left = this.tuple_index_constant(body, ex.*.lhs, depth + 1)
+            make right = this.tuple_index_constant(body, ex.*.rhs, depth + 1)
+            if left == max || right == max { return 18446744073709551615 }
+            make a = left
+            make b = right
+            make op = ex.*.lit.kind
+            if op == lexer::TokenKind.Plus { if a <= max - b { return a + b } }
+            elif op == lexer::TokenKind.Minus { if a >= b { return a - b } }
+            elif op == lexer::TokenKind.Asterisk { if b == 0 { return 0 } if a <= max / b { return a * b } }
+            elif op == lexer::TokenKind.Slash { if b != 0 { return a / b } }
+            elif op == lexer::TokenKind.Percent { if b != 0 { return a % b } }
+            elif op == lexer::TokenKind.Ampersand { return a & b }
+            elif op == lexer::TokenKind.Pipe { return a | b }
+            elif op == lexer::TokenKind.Caret { return a ^ b }
+        }
+        return 18446744073709551615
+    }
+
+    @this
     make check_index (body: ref<hir::HirBody>, ex: ref<hir::HirExpr>) -> uint {
         make base = this.resolve(this.check_expr(body, ex.*.lhs, UseKind.Place))
         make index = this.resolve(this.check_expr(body, ex.*.rhs, UseKind.Copy))
@@ -2119,6 +2288,22 @@ make type Checker {
         // `String` is immutable: indexing reads a `char`, writes are rejected by `Assign`
         if bk == ty::TyKind.Text || bk == ty::TyKind.Str || bk == ty::TyKind.StrBuf {
             return ty::TY_CHAR
+        }
+
+        if bk == ty::TyKind.Tuple {
+            make element = body.*.exprs[ex.*.rhs].pin
+            make args = this.tys.*.args_of(base)
+            make constant = this.tuple_index_constant(body, ex.*.rhs, 0)
+            if constant != 18446744073709551615 {
+                make position = constant
+                if position < args.len() {
+                    ex.*.name = position.to_str()
+                    return args[position]
+                }
+            }
+            make d = diags::Diag.err(e::Err.TypeMismatch, element.*.range.copy(), "tuple index must be a constant integer within bounds")
+            this.diag.*.report(d)
+            return ty::TY_ERROR
         }
 
         if bk == ty::TyKind.Array {
@@ -2212,7 +2397,7 @@ make type Checker {
 
         if kind == ty::TyKind.Array || kind == ty::TyKind.Optional || kind == ty::TyKind.Fallible || kind == ty::TyKind.Owned {
             children.push(this.tys.*.elem_of(resolved))
-        } elif kind == ty::TyKind.Variant {
+        } elif kind == ty::TyKind.Tuple || kind == ty::TyKind.Variant {
             for member : this.tys.*.args_of(resolved) { children.push(member) }
         } elif kind == ty::TyKind.Adt {
             make name = this.adt_name(resolved)
@@ -3143,6 +3328,10 @@ make type Checker {
                     id = this.tys.*.wrap(ty::TyKind.Ref, inner)
                 }
             }
+        } elif sig.*.name == "tuple" {
+            make tuple = ty::Ty { kind = ty::TyKind.Tuple }
+            for argument : sig.*.args { tuple.args.push(this.sig_type_of(argument.pin)) }
+            id = this.tys.*.intern(tuple)
         } elif sig.*.name == "fn" && sig.*.args.len() > 0 {
             make function = ty::Ty {}
 
@@ -3210,7 +3399,7 @@ make type Checker {
 
         if kind == ty::TyKind.Fallible { return true }
 
-        if kind == ty::TyKind.Array || kind == ty::TyKind.Optional || kind == ty::TyKind.Variant {
+        if kind == ty::TyKind.Tuple || kind == ty::TyKind.Array || kind == ty::TyKind.Optional || kind == ty::TyKind.Variant {
             return true
         }
 
@@ -3462,8 +3651,6 @@ make type Checker {
 
         make expression = body.*.exprs[index].pin
 
-        if expression.*.kind != hir::HirExprKind.Constructor || expression.*.name.len() > 0 { return }
-
         make base = this.resolve(expected)
         make kind = this.tys.*.kind_of(base)
 
@@ -3472,6 +3659,23 @@ make type Checker {
             kind = this.tys.*.kind_of(base)
         }
 
+        if expression.*.kind == hir::HirExprKind.Array && kind == ty::TyKind.Array {
+            for element : expression.*.args { this.check_anonymous_fields(body, element, this.tys.*.elem_of(base)) }
+            return
+        }
+        if expression.*.kind == hir::HirExprKind.Tuple && kind == ty::TyKind.Tuple {
+            make fields = this.tys.*.args_of(base)
+            if fields.len() == expression.*.args.len() {
+                this.out.expr_tys[index] = base
+                make i: uint = 0
+                while i < fields.len() {
+                    this.check_anonymous_fields(body, expression.*.args[i], fields[i])
+                    i++
+                }
+            }
+            return
+        }
+        if expression.*.kind != hir::HirExprKind.Constructor || expression.*.name.len() > 0 { return }
         if kind != ty::TyKind.Adt { return }
 
         make name = this.adt_name(base)

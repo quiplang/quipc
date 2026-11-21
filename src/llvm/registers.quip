@@ -148,8 +148,8 @@ make type State {
 }
 
 @pub @unsafe
-make create (body: ref<mir::MirBody>, context: ptr<any>, builder: ptr<any>, enabled: ref<bool[]>, blocks: ref<ptr<any>[]>, continuations: ref<bool[]>) -> State {
-    make result = State { count = body.*.locals.len(), word = api::LLVMInt64TypeInContext(context), bit = api::LLVMInt1TypeInContext(context), builder = builder, facts = flow::liveness(body) }
+make create (body: ref<mir::MirBody>, context: ptr<any>, builder: ptr<any>, enabled: ref<bool[]>, blocks: ref<ptr<any>[]>, continuations: ref<bool[]>, facts: ref<flow::Graph>) -> State {
+    make result = State { count = body.*.locals.len(), word = api::LLVMInt64TypeInContext(context), bit = api::LLVMInt1TypeInContext(context), builder = builder, facts = facts.* }
     make word_zero = api::LLVMConstInt(result.word, 0, 0)
     make bit_zero = api::LLVMConstInt(result.bit, 0, 0)
     for local : body.*.locals {
@@ -189,14 +189,13 @@ make create (body: ref<mir::MirBody>, context: ptr<any>, builder: ptr<any>, enab
 
 /// Ordinary call continuations with one predecessor can share an LLVM block.
 @pub
-make groups (body: ref<mir::MirBody>) -> uint[] {
-    make facts = flow::graph(body)
+make groups (body: ref<mir::MirBody>, facts: ref<flow::Graph>) -> uint[] {
     make result: uint[] = []
     make block: uint = 0
     while block < body.*.terms.len() {
         make root = block
-        if block > 0 && facts.predecessors[block].values.len() == 1 {
-            make predecessor = facts.predecessors[block].values[0]
+        if block > 0 && facts.*.predecessors[block].values.len() == 1 {
+            make predecessor = facts.*.predecessors[block].values[0]
             if predecessor < block && body.*.terms[predecessor].kind == mir::MirTermKind.Call {
                 make name = body.*.terms[predecessor].func.name.copy()
                 make ordinary = body.*.terms[predecessor].func.kind == mir::MirOperandKind.Path && !body.*.terms[predecessor].has_receiver

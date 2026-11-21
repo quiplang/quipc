@@ -307,7 +307,7 @@ make type Unit {
 
     /// type-checks, lowers to mir, checks memory, and optionally emits llvm for this unit.
     @pub @this
-    make analyze (sigs: ref<hir::HirAttachedSig[]>, structs: ref<hir::HirStructSig[]>, funcs: ref<hir::HirFuncSig[]>, timings: ref<profile::Profile>) -> !void {
+    make analyze (sigs: ref<hir::HirAttachedSig[]>, structs: ref<hir::HirStructSig[]>, funcs: ref<hir::HirFuncSig[]>, timings: ref<profile::Profile>, allocators_collected: bool) -> !void {
         this.status = UnitStatus.Checking
         for imported : this.imports {
             if imported.resolved && imported.alias.len() == 0 {
@@ -415,7 +415,7 @@ make type Unit {
         }
 
         this.status = UnitStatus.MemAnalysis
-        memr::collect(this.hir_module.pin, this.mem_ctx.pin)
+        if !allocators_collected { memr::collect(this.hir_module.pin, this.mem_ctx.pin) }
         make previous = memr::MemReport {}
         make reuse: bool[] = []
         this.mem_report = mem::check_cached(this.mir_module.pin, this.diag.pin, this.mem_ctx.pin, this.path_rel.get(), previous.pin, reuse.pin, timings, this.emit_mem)
@@ -485,7 +485,7 @@ make type Unit {
             return err
         }
 
-        this.analyze(sigs, structs, funcs, timings.pin) catch err {
+        this.analyze(sigs, structs, funcs, timings.pin, false) catch err {
             return err
         }
 
@@ -1414,7 +1414,7 @@ make type UnitManager {
         while si < this.compilation_stack.len() {
             make id = this.compilation_stack[si]
             this.units[id].mem_ctx = acc
-            this.units[id].analyze(this.attached_sigs.pin, this.struct_sigs.pin, this.free_sigs.pin, timings.pin) catch err {
+            this.units[id].analyze(this.attached_sigs.pin, this.struct_sigs.pin, this.free_sigs.pin, timings.pin, false) catch err {
                 return err
             }
 
@@ -1507,7 +1507,17 @@ make portable_type_name (sig: ref<hir::HirTypeSig>) -> str {
 
     if sig.*.prim == ty::TY_CHAR { name = "char" }
 
-    if sig.*.args.len() > 0 {
+    if sig.*.name == "tuple" {
+        name = "("
+        make i: uint = 0
+        while i < sig.*.args.len() {
+            if i > 0 { name = name + ", " }
+            name = name + portable_type_name(sig.*.args[i].pin)
+            i++
+        }
+        if sig.*.args.len() == 1 { name = name + "," }
+        name = name + ")"
+    } elif sig.*.args.len() > 0 {
         name = name + "<"
         make i = 0
 
@@ -1612,7 +1622,7 @@ make collect_sigs_into (out: ref<hir::HirAttachedSig[]>, module: ref<hir::HirMod
 make portable_type_is_aggregate (sig: ref<hir::HirTypeSig>, struct_names: ref<str[]>) -> bool {
     if sig.*.is_fallible { return true }
 
-    if sig.*.name == "variant" && !sig.*.is_ref && !sig.*.is_ptr { return true }
+    if (sig.*.name == "variant" || sig.*.name == "tuple") && !sig.*.is_ref && !sig.*.is_ptr { return true }
 
     if sig.*.is_array || sig.*.is_optional {
         return true

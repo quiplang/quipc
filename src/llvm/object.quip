@@ -6,6 +6,7 @@
     make lower = @import "lower.quip"
     make memory = @import "../memory/report.quip"
     make mir = @import "../mir/mir.quip"
+    make flow = @import "../mir/flow.quip"
     make optimize = @import "../mir/optimize.quip"
     make graph = @import "../memory/lifetimes/graph.quip"
     make planning = @import "../memory/plan.quip"
@@ -196,14 +197,19 @@ make compile (mir_module: ref<mir::MirModule>, report: ref<memory::MemReport>, f
     @unsafe {
         make started: uint = 0
         if timings.*.enabled { started = profile::now() }
+        // Indexed by MIR function, including empty entries for external declarations.
+        make codegen_facts: flow::Graph[] = []
         make index: uint = 0
         while index < mir_module.*.funcs.len() {
             make function = mir_module.*.funcs[index].pin
+            make cfg = flow::Graph {}
             if !function.*.is_external {
                 optimize::run(function.*.body.pin, mir_module.*.structs.pin)
+                cfg = flow::liveness(function.*.body.pin)
                 make facts = graph::build(function.*.body.pin)
-                if index < report.*.funcs.len() { report.*.funcs[index].slots = planning::build(facts.pin, function.*.body.pin, mir_module.*.structs.pin) }
+                if index < report.*.funcs.len() { report.*.funcs[index].slots = planning::build_with_facts(facts.pin, function.*.body.pin, mir_module.*.structs.pin, cfg.pin) }
             }
+            codegen_facts.push(cfg)
             index++
         }
         if timings.*.enabled {
@@ -214,7 +220,7 @@ make compile (mir_module: ref<mir::MirModule>, report: ref<memory::MemReport>, f
         make module = api::LLVMModuleCreateWithNameInContext(filename.data, context)
         api::LLVMSetSourceFileName(module, filename.data, filename.len())
 
-        make success = lower::build(context, module, mir_module, filename.copy(), selected_entry, source, platform, report)
+        make success = lower::build(context, module, mir_module, filename.copy(), selected_entry, source, platform, report, codegen_facts.pin)
         if timings.*.enabled { timings.*.record(started, "llvm_ir", filename.copy()) }
         if success {
             if show_progress && !print_ir { std::progress::phase("Generate object", 0, 0, filename.copy()) }

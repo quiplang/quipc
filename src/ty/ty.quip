@@ -42,7 +42,8 @@ make enum TyKind {
     F32, F64, Float,
     Text,               // string literal, must be translated to 'Str' or 'StrBuf'
     Str, StrBuf, Char,
-    Array,
+    Array,              // dynamic array T[], static array T[n] (can live on the stack)
+    Tuple,              // tuple (T1, T2) (can live on the stack)
     Optional,
     Fallible,
     ErrorVal, // the type of any `error.Name` expression; unifies with Fallible<T>
@@ -74,7 +75,6 @@ make type TyInterner {
     @pub
     make create () -> TyInterner {
         make it = TyInterner {}
-
         it.push_kind(TyKind.Error)
         it.push_kind(TyKind.Void)
         it.push_kind(TyKind.Bool)
@@ -97,6 +97,7 @@ make type TyInterner {
         it.push_kind(TyKind.Char)
         it.push_kind(TyKind.ErrorVal)
         it.push_kind(TyKind.Infer)
+
         return it
     }
 
@@ -335,6 +336,10 @@ make type TyInterner {
     make is_copy (id: uint) -> bool {
         make kind = this.kind_of(id)
 
+        if kind == TyKind.Tuple {
+            for element : this.args_of(id) { if !this.is_copy(element) { return false } }
+            return true
+        }
         match kind {
             TyKind.Error { return true }
 

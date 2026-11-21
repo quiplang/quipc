@@ -385,7 +385,7 @@ make type Driver {
                     make id = mgr.*.compilation_stack[si]
                     std::progress::phase("Analyze", si, mgr.*.compilation_stack.len(), mgr.*.units[id].path_rel.get())
                     mgr.*.units[id].mem_ctx = memory_context
-                    mgr.*.units[id].analyze(mgr.*.attached_sigs.pin, mgr.*.struct_sigs.pin, mgr.*.free_sigs.pin, timings.pin) catch err {
+                    mgr.*.units[id].analyze(mgr.*.attached_sigs.pin, mgr.*.struct_sigs.pin, mgr.*.free_sigs.pin, timings.pin, true) catch err {
                         pool.drain()
                         match err {
                             error.IdentifierTooLong {

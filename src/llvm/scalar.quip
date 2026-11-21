@@ -1046,7 +1046,7 @@ make type Builder {
 
 /// Builds a function using the scalar lowering and its slot plan.
 @pub @unsafe
-make build (context: ptr<any>, module: ptr<any>, symbol: str, body: ref<mir::MirBody>, is_lambda: bool, plan: ref<slots::SlotPlan>, calls: ref<str[]>, layouts: ref<structs::Layout[]>) {
+make build (context: ptr<any>, module: ptr<any>, symbol: str, body: ref<mir::MirBody>, is_lambda: bool, plan: ref<slots::SlotPlan>, calls: ref<str[]>, layouts: ref<structs::Layout[]>, facts: ref<flow::Graph>) {
     make function = api::LLVMGetNamedFunction(module, symbol.data)
     make word = api::LLVMInt64TypeInContext(context)
     make handle = api::LLVMCreateBuilderInContext(context)
@@ -1206,7 +1206,7 @@ make build (context: ptr<any>, module: ptr<any>, symbol: str, body: ref<mir::Mir
         } else { builder.argument_slots.push(result_address) }
     }
 
-    make groups = registers::groups(body)
+    make groups = registers::groups(body, facts)
     for root : groups.iter() {
         builder.resolved_targets.push(builder.resolved_targets.len())
         builder.continuations.push(root != builder.continuations.len())
@@ -1227,7 +1227,7 @@ make build (context: ptr<any>, module: ptr<any>, symbol: str, body: ref<mir::Mir
         builder.blocks[i] = builder.blocks[builder.resolved_targets[i]]
         i++
     }
-    builder.registers = registers::create(body, context, handle, builder.pure_ssa.pin, builder.blocks.pin, builder.continuations.pin)
+    builder.registers = registers::create(body, context, handle, builder.pure_ssa.pin, builder.blocks.pin, builder.continuations.pin, facts)
     i = 0
     while i < body.*.param_count {
         @unsafe make index: u32 = i + argument_start

@@ -94,6 +94,22 @@ make type Path {
     }
 
     @pub @this
+    make to_str () -> str {
+        make r: str = ""
+
+        if this.is_absolute { r += this.delimeter }
+
+        make i = 0
+        while i < this.content.len() {
+            r += this.content[i]
+            if i < this.content.len() - 1 { r += this.delimeter }
+            i += 1
+        }
+
+        return r
+    }
+
+    @pub @this
     make absolute () -> Path {
         if this.is_absolute {
             return Path {

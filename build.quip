@@ -63,18 +63,20 @@ make add_link_inputs (exe: ref<std::Executable>, args: str[]) -> bool {
             progress::fail("expected --link followed by a linker input")
             return false
         }
-        exe.*.native_libraries.push(args[i + 1].copy())
+
+        exe.*.add_dependency(none, args[i + 1].copy())
+
         i += 2
     }
 
-    if exe.*.native_libraries.len() > 0 { return true }
+    if args.len() > 0 { return true }
 
     @target "macos" {
         make inputs = macos_llvm_inputs() catch {
             progress::fail("unable to find LLVM 22 static libraries, zstd, and the macOS SDK; install them or pass explicit --link arguments")
             return false
         }
-        exe.*.native_libraries = inputs
+        for input : inputs { exe.*.add_dependency(none, input) }
         return true
     }
 

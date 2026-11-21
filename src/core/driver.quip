@@ -53,6 +53,21 @@ make type Driver {
         }
     }
 
+    @this
+    make source_dependencies () -> (str?, std::io::Path)[] {
+        make inputs: (str?, std::io::Path)[] = []
+        for (name, path) : this.config.dependencies.iter() {
+            match name {
+                some {
+                    make alias: str? = some.copy()
+                    inputs.push((alias, path.copy()))
+                }
+                none {}
+            }
+        }
+        return inputs
+    }
+
     /// compiles and runs the project build script using the current compiler.
     @pub @this
     make build () -> !void {
@@ -100,9 +115,7 @@ make type Driver {
         runner.config.options.mode = std::Mode.Debug
         runner.config.options.optimization = std::Optimization.None
         runner.config.intermediate_directory = this.profile_path() + "/intermediate/build/files"
-        runner.config.package_names = this.config.package_names !
-
-        for path : this.config.package_paths.iter() { runner.config.package_paths.push(path.copy()) }
+        runner.config.dependencies = this.source_dependencies()
 
         // Accept either main/build (or another uniquely tagged entry function).
         runner.config.entry = ""
@@ -133,19 +146,21 @@ make type Driver {
         if !this.config.options.progress_enabled { args.push("--no-progress") }
         if this.config.options.show_quipc_debug { args.push("--verbose") }
 
-        make pi: uint = 0
-        while pi < this.config.package_names.len() {
-            args.push("--alias")
-            args.push(this.config.package_names[pi].copy())
-            args.push(this.config.package_paths[pi].get())
-            pi++
+        for (name, path) : this.config.dependencies.iter() {
+            match name {
+                some {
+                    args.push("--import")
+                    args.push(some.copy())
+                    args.push(path.get())
+                }
+                none {
+                    args.push("--link")
+                    args.push(path.get())
+                }
+            }
         }
         args.push("--")
 
-        for library : this.config.native_libraries.iter() {
-            args.push("--link")
-            args.push(library.copy())
-        }
         for argument : this.config.build_args.iter() { args.push(argument.copy()) }
 
         std::progress::phase("Run script", 0, 0, "build.quip")
@@ -223,12 +238,16 @@ make type Driver {
                 // phase 1 (Declare): parse the entry file and everything it imports,
                 // recursively, building the dependency-ordered compilation stack
                 std::progress::phase("Discover", 0, 0, some.get())
+                make names: str[] = []
                 make paths: std::io::Path[] = []
-
-                for path : this.config.package_paths.iter() { paths.push(path.copy()) }
-
-                make manager = deps::discover(some.copy(), this.config.package_names !,
-                    paths, this.config.options.hide_warnings, this.config.platform_name.copy(), timings.pin) catch err { return err }
+                for (name, path) : this.config.dependencies.iter() {
+                    if name != none {
+                        names.push(name.unwrap())
+                        paths.push(path.copy())
+                    }
+                }
+                make manager = deps::discover(some.copy(), names, paths,
+                    this.config.options.hide_warnings, this.config.platform_name.copy(), timings.pin) catch err { return err }
 
                 // phase 2 (Resolve): link every `@import` alias to its already-declared unit
                 if timings.enabled { started = profile::now() }
@@ -374,7 +393,9 @@ make type Driver {
                         std::io::println("linking " + exe)
                     }
 
-                    for library : this.config.native_libraries.iter() { objs.push(library !) }
+                    for (name, path) : this.config.dependencies.iter() {
+                        if name == none { objs.push(path.get()) }
+                    }
                     if timings.enabled { started = profile::now() }
                     make link_status = llvm::link::link(objs !, exe.copy())
                     if timings.enabled { timings.record(started, "link", "<build>") }

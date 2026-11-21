@@ -8,7 +8,7 @@
 
 // flatten a type from a HIR body into a portable shape, resolving namespace paths to their final
 // member so that it can be looked up by name in another unit
-make collect_type_sig (body: ref<hir::HirBody>, idx: uint) -> hir::HirTypeSig {
+make collect_type_sig (state: ref<session::Session>, unit: uint, body: ref<hir::HirBody>, idx: uint, depth: uint) -> hir::HirTypeSig {
     make out = hir::HirTypeSig {}
 
     if idx >= body.*.types.len() {
@@ -23,6 +23,33 @@ make collect_type_sig (body: ref<hir::HirBody>, idx: uint) -> hir::HirTypeSig {
         node = body.*.types[node.*.args[node.*.args.len() - 1]].pin
     }
 
+    if depth < 64 {
+        make owner = unit
+        if ht.*.is_namespace {
+            make prefix = ht.*.name.copy()
+            make segment: uint = 0
+            while segment + 1 < ht.*.args.len() {
+                prefix = prefix + "::" + body.*.types[ht.*.args[segment]].name.copy()
+                segment++
+            }
+            for namespace : state.*.units[unit].hir_namespaces {
+                if namespace.path == prefix { owner = namespace.unit }
+            }
+        }
+        for alias : state.*.units[owner].hir_module.type_aliases.iter() {
+            if alias.name == node.*.name && alias.generics.len() == 0 && alias.has_target {
+                make resolved = collect_type_sig(state, owner, alias.body.pin, alias.target, depth + 1)
+                resolved.is_ptr = resolved.is_ptr || ht.*.is_ptr
+                resolved.is_ref = resolved.is_ref || ht.*.is_ref
+                resolved.is_array = resolved.is_array || ht.*.is_array
+                resolved.is_optional = resolved.is_optional || ht.*.is_optional
+                resolved.is_fallible = resolved.is_fallible || ht.*.is_fallible
+                resolved.span = out.span.copy()
+                return resolved
+            }
+        }
+    }
+
     make p = ty::TyInterner.prim(node.*.name !)
 
     if p != ty::TY_ERROR {
@@ -34,7 +61,7 @@ make collect_type_sig (body: ref<hir::HirBody>, idx: uint) -> hir::HirTypeSig {
     make ai: uint = 0
 
     while ai < node.*.args.len() {
-        out.args.push(collect_type_sig(body, node.*.args[ai]))
+        out.args.push(collect_type_sig(state, unit, body, node.*.args[ai], depth + 1))
         ai = ai + 1
     }
 
@@ -89,7 +116,17 @@ make portable_type_name (sig: ref<hir::HirTypeSig>) -> str {
 
     if sig.*.prim == ty::TY_CHAR { name = "char" }
 
-    if sig.*.args.len() > 0 {
+    if sig.*.name == "tuple" {
+        name = "("
+        make field: uint = 0
+        while field < sig.*.args.len() {
+            if field > 0 { name = name + ", " }
+            name = name + portable_type_name(sig.*.args[field].pin)
+            field++
+        }
+        if sig.*.args.len() == 1 { name = name + "," }
+        name = name + ")"
+    } elif sig.*.args.len() > 0 {
         name = name + "<"
         make i = 0
 
@@ -120,7 +157,7 @@ make portable_type_name (sig: ref<hir::HirTypeSig>) -> str {
 // appending them to `out`. signatures are reconstructed here (rather than copied) because they
 // own strings.
 @pub
-make collect_sigs_into (out: ref<hir::HirAttachedSig[]>, module: ref<hir::HirModule>, path: str, source: ref<str>, struct_names: ref<str[]>) {
+make collect_sigs_into (state: ref<session::Session>, unit: uint, out: ref<hir::HirAttachedSig[]>, module: ref<hir::HirModule>, path: str, source: ref<str>, struct_names: ref<str[]>) {
     make i: uint = 0
 
     while i < module.*.attached_funcs.len() {
@@ -153,7 +190,7 @@ make collect_sigs_into (out: ref<hir::HirAttachedSig[]>, module: ref<hir::HirMod
                     make param = f.*.body.locals[pi].pin
 
                     if param.*.has_ty && param.*.ty < f.*.body.types.len() {
-                        make param_ty = collect_type_sig(f.*.body.pin, param.*.ty)
+                        make param_ty = collect_type_sig(state, unit, f.*.body.pin, param.*.ty, 0)
                         sig.param_aggs.push(portable_type_is_aggregate(param_ty.pin, struct_names))
                         sig.param_tys.push(param_ty)
                     } else {
@@ -180,7 +217,7 @@ make collect_sigs_into (out: ref<hir::HirAttachedSig[]>, module: ref<hir::HirMod
 
             if f.*.has_ret_ty && f.*.ret_ty < f.*.body.types.len() {
                 sig.has_ret = true
-                sig.ret_ty = collect_type_sig(f.*.body.pin, f.*.ret_ty)
+                sig.ret_ty = collect_type_sig(state, unit, f.*.body.pin, f.*.ret_ty, 0)
                 sig.ret_agg = portable_type_is_aggregate(sig.ret_ty.pin, struct_names)
             }
 
@@ -230,7 +267,7 @@ make portable_type_is_aggregate (sig: ref<hir::HirTypeSig>, struct_names: ref<st
 // `hir::HirStructSig`), appending them to `out`. field types use the same primitive-id / base-name
 // representation as attached-function return types.
 @pub
-make collect_struct_sigs_into (out: ref<hir::HirStructSig[]>, module: ref<hir::HirModule>, path: str, source: ref<str>) {
+make collect_struct_sigs_into (state: ref<session::Session>, unit: uint, out: ref<hir::HirStructSig[]>, module: ref<hir::HirModule>, path: str, source: ref<str>) {
     make si: uint = 0
 
     while si < module.*.structs.len() {
@@ -274,7 +311,7 @@ make collect_struct_sigs_into (out: ref<hir::HirStructSig[]>, module: ref<hir::H
                     }
                 }
 
-                fs.ty = collect_type_sig(hs.*.body.pin, hf.*.ty)
+                fs.ty = collect_type_sig(state, unit, hs.*.body.pin, hf.*.ty, 0)
                 fs.type_name = portable_type_name(fs.ty.pin)
                 sig.fields.push(fs)
             } else {
@@ -300,7 +337,7 @@ make collect_struct_sigs_into (out: ref<hir::HirStructSig[]>, module: ref<hir::H
 
 // flatten a module's free functions into portable signatures, appending them to `out`
 @pub
-make collect_free_sigs_into (out: ref<hir::HirFuncSig[]>, module: ref<hir::HirModule>, module_name: str, source: ref<str>, struct_names: ref<str[]>) {
+make collect_free_sigs_into (state: ref<session::Session>, unit: uint, out: ref<hir::HirFuncSig[]>, module: ref<hir::HirModule>, module_name: str, source: ref<str>, struct_names: ref<str[]>) {
     make fi: uint = 0
 
     while fi < module.*.funcs.len() {
@@ -340,7 +377,7 @@ make collect_free_sigs_into (out: ref<hir::HirFuncSig[]>, module: ref<hir::HirMo
                     make param = f.*.body.locals[pi].pin
 
                     if param.*.has_ty && param.*.ty < f.*.body.types.len() {
-                        make param_ty = collect_type_sig(f.*.body.pin, param.*.ty)
+                        make param_ty = collect_type_sig(state, unit, f.*.body.pin, param.*.ty, 0)
                         sig.param_aggs.push(portable_type_is_aggregate(param_ty.pin, struct_names))
                         sig.param_tys.push(param_ty)
                     } else {
@@ -357,7 +394,7 @@ make collect_free_sigs_into (out: ref<hir::HirFuncSig[]>, module: ref<hir::HirMo
 
             if f.*.has_ret_ty && f.*.ret_ty < f.*.body.types.len() {
                 sig.has_ret = true
-                sig.ret_ty = collect_type_sig(f.*.body.pin, f.*.ret_ty)
+                sig.ret_ty = collect_type_sig(state, unit, f.*.body.pin, f.*.ret_ty, 0)
                 sig.ret_agg = portable_type_is_aggregate(sig.ret_ty.pin, struct_names)
             }
 
@@ -425,9 +462,9 @@ make build (state: ref<session::Session>) -> void {
         make id = state.*.compilation_stack[i]
         make module = state.*.units[id].hir_module.pin
         make module_name = state.*.units[id].path_rel.get()
-        collect_sigs_into(state.*.attached_sigs.pin, module, module_name.copy(), state.*.units[id].content.pin, struct_names.pin)
-        collect_struct_sigs_into(state.*.struct_sigs.pin, module, module_name.copy(), state.*.units[id].content.pin)
-        collect_free_sigs_into(state.*.free_sigs.pin, module, module_name, state.*.units[id].content.pin, struct_names.pin)
+        collect_sigs_into(state, id, state.*.attached_sigs.pin, module, module_name.copy(), state.*.units[id].content.pin, struct_names.pin)
+        collect_struct_sigs_into(state, id, state.*.struct_sigs.pin, module, module_name.copy(), state.*.units[id].content.pin)
+        collect_free_sigs_into(state, id, state.*.free_sigs.pin, module, module_name, state.*.units[id].content.pin, struct_names.pin)
         i = i + 1
     }
 }

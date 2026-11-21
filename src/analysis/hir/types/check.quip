@@ -126,6 +126,14 @@ make type Checker {
     make run () -> ModuleTypeck {
         make mod = ModuleTypeck {}
 
+        // Imported tuple fields need layouts even when no expression projects
+        // into them: aggregate copies and cleanup still traverse these fields.
+        for definition : this.structs.* {
+            for field : definition.fields {
+                if field.ty.name == "tuple" { make _ = this.sig_type_of(field.ty.pin) }
+            }
+        }
+
         // Array-copy return types require the type resolver; declaration shape and
         // duplicate implementations are checked in the semantic pass.
         make method_index: uint = 0

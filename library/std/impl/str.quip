@@ -27,5 +27,33 @@ make split (delimeter: char) -> str[] {
     return result
 }
 
+@impl str
+make starts (s: str) -> bool {
+    if s.len() > this.len() { return false }
+
+    make i = 0
+    while i < s.len() {
+        if this[i] != s[i] { return false }
+        i++
+    }
+
+    return true
+}
+
+@impl str
+make ends (s: str) -> bool {
+    if s.len() > this.len() { return false }
+
+    make start = this.len() - s.len()
+    make i: uint = 0
+
+    while i < s.len() {
+        if this[start + i] != s[i] { return false }
+        i++
+    }
+
+    return true
+}
+
 
 @import "../../runtime/str_methods.quip"

@@ -64,6 +64,7 @@ make type Allocation {
     make context: ptr<any>
 }
 
+// ABI shared with std/mem/owned.quip for explicit allocator results.
 make type OwnedHeader {
     make deallocate: ptr<any>
     make context: ptr<any>

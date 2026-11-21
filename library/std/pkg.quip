@@ -78,43 +78,8 @@ make enum Optimization {
     Memory,
 }
 
-// Tuple strings are passed directly as argv values, without shell interpretation.
-make package_quote (text: str) -> str {
-    make out: str = "\""
-    make i: uint = 0
-
-    while i < text.len() {
-        make c = text[i]
-
-        if c == '\\' || c == '"' { out.push('\\') }
-
-        out.push(c)
-        i = i + 1
-    }
-
-    out.push('"')
-    return out
-}
-
-@pub
-make type Package {
-
-    @pub {
-        make name: str?
-        make version: str
-        make path: io::Path
-    }
-
-    @pub
-    make create (name: str, path: str) -> Package {
-        return Package {
-            name = name,
-            path = io::Path.create(path),
-            version = "0.0.1"
-        }
-    }
-
-}
+@pub @pure @const
+make Dependencies: Type = (str?, io::Path)
 
 @pub
 make type Executable {
@@ -127,8 +92,9 @@ make type Executable {
 
         make entry_file: io::Path
         make entry_point: str
-        make packages: Package[] = []
-        make native_libraries: str[] = []
+
+        make dependencies: Dependencies[] = []
+
         make args: str[] = []
 
         // a test runner that prints its own case counts and failure names
@@ -147,9 +113,16 @@ make type Executable {
         }
     }
 
-    /// registers a source module under an import name.
+
     @pub @this
-    make add_import (name: str, path: str) { this.packages.push(Package.create(name, path)) }
+    make add_import (name: str, path: str) {
+        this.add_dependency(name, path)
+    }
+
+    @pub @this
+    make add_dependency (name: str?, path: str) {
+        this.dependencies.push((name, io::Path.create(path)))
+    }
 
     @pub @this
     make construct_args () {
@@ -194,17 +167,19 @@ make type Executable {
         this.args.push("--entry")
         this.args.push(this.entry_point.copy())
 
-        for pkg : this.packages.iter() {
-            match pkg.name {
-                none {}
-                some { this.args.push("--alias=(" + package_quote(some) + "," + package_quote(pkg.path.get()) + ")") }
+        for (name, path) : this.dependencies.iter() {
+            match name {
+                some {
+                    this.args.push("--import")
+                    this.args.push(some)
+                    this.args.push(path.get())
+                }
+
+                none {
+                    this.args.push("--link")
+                    this.args.push(path.get())
+                }
             }
-        }
-
-
-        for library : this.native_libraries.iter() {
-            this.args.push("--link")
-            this.args.push(library !)
         }
 
         this.args.push("compile")
@@ -244,7 +219,7 @@ make type Build {
         make steps: BuildStep[] = []
         make selected_step: str = ""
 
-        make packages: Package[] = []
+        make dependencies: Dependencies[] = []
     }
 
     @pub
@@ -472,11 +447,10 @@ make type Build {
     }
 
     @pub @this
-
-    @pub @this
-    make add_package (pkg: Package) -> void {
-        this.packages.push(pkg)
+    make add_dependency (name: str?, path: str) -> void {
+        this.dependencies.push((name, io::Path.create(path)))
     }
+
 
     @pub @this
     make construct_args () {
@@ -489,11 +463,16 @@ make type Build {
             _ {}
         }
 
-        for pkg : this.packages.iter() {
-            match pkg.name {
-                none {}
+        for (name, path) : this.dependencies.iter() {
+            match name {
+                none {
+                    this.args.push("--link")
+                    this.args.push(path.get())
+                }
                 some {
-                    this.args.push("--alias=(" + package_quote(some) + "," + package_quote(pkg.path.get()) + ")")
+                    this.args.push("--import")
+                    this.args.push(some.copy())
+                    this.args.push(path.get())
                 }
             }
         }
@@ -580,9 +559,19 @@ make load_build_args (b: ref<Build>, argv: ptr<char>[]) -> !uint {
             "--extra-warnings" { b.*.options.extra_warnings = true }
             "--hide-warnings" { b.*.options.hide_warnings = true }
             "--verbose" { b.*.options.show_quipc_debug = true }
+            "--import" {
+                if i + 2 >= argv.len() { return error.InvalidBuildArguments }
+                b.*.add_dependency(c_ffi::to_str(argv[i + 1]), c_ffi::to_str(argv[i + 2]))
+                i += 2
+            }
+            "--link" {
+                if i + 1 >= argv.len() { return error.InvalidBuildArguments }
+                b.*.add_dependency(none, c_ffi::to_str(argv[i + 1]))
+                i++
+            }
             "--alias" {
                 if i + 2 >= argv.len() { return error.InvalidBuildArguments }
-                b.*.add_package(Package.create(c_ffi::to_str(argv[i + 1]), c_ffi::to_str(argv[i + 2])))
+                b.*.add_dependency(c_ffi::to_str(argv[i + 1]), c_ffi::to_str(argv[i + 2]))
                 i += 2
             }
             _ { return error.InvalidBuildArguments }
@@ -607,10 +596,11 @@ make load_legacy_build_context (b: ref<Build>) {
         make suffix = i.to_str()
         make name = process::Environment.get("QUIPC_PACKAGE_NAME_" + suffix.copy(), "")
         if name.len() == 0 { break }
-        b.*.add_package(Package.create(name, process::Environment.get("QUIPC_PACKAGE_PATH_" + suffix, "")))
+        b.*.add_dependency(name, process::Environment.get("QUIPC_PACKAGE_PATH_" + suffix, ""))
         i++
     }
 }
+
 
 @impl char
 make is_space () -> bool {

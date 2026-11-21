@@ -101,6 +101,16 @@ make build_cached (module: ref<hir::HirModule>, checked: ref<typeck::ModuleTypec
 
             if hf.*.has_ty {
                 mf.ty = type_name(hs.*.body.pin, hf.*.ty)
+                // Exported signatures expand tuple aliases into their storage shape.
+                for signature : external_structs.* {
+                    if signature.name == hs.*.name {
+                        for field : signature.fields {
+                            if field.name == hf.*.name && field.ty.name == "tuple" {
+                                mf.ty = field.type_name.copy()
+                            }
+                        }
+                    }
+                }
             }
 
             if hf.*.has_default && hf.*.default < hs.*.body.exprs.len() {

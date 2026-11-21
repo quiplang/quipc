@@ -11,6 +11,7 @@
 
 @pure @const {
     make os: unit = @import "../os/pkg.quip"
+    make owned_memory = @import "owned.quip"
 
     make std: unit = @import "../pkg.quip"
     make io: unit = @import "../io/pkg.quip"
@@ -135,11 +136,10 @@ make type Pool {
 
     @pub @this @allocator
     make alloc (req_size: int) -> !owned<any> {
-        if req_size <= 0 {
-            return error.ZeroAllocation
-        }
+        if req_size <= 0 { return error.ZeroAllocation }
+        if req_size > 9223372036854775807 - owned_memory::overhead() { return error.OutOfMemory }
 
-        make cls: int = Pool.class_of(req_size)
+        make cls: int = Pool.class_of(req_size + owned_memory::overhead())
 
         if cls >= 64 {
             return error.OutOfMemory
@@ -154,7 +154,8 @@ make type Pool {
                 make link: ptr<Link> = head.*.next.unwrap()
                 head.*.next = link.*.next
                 this.alloc_count = this.alloc_count + 1
-                @unsafe return link
+                @unsafe make context: ptr<any> = this
+                @unsafe return owned_memory::wrap(link, pool_free_address(), context)
             }
 
             // otherwise carve a new one: 16 header bytes, then the class's payload
@@ -176,7 +177,8 @@ make type Pool {
             tag.*.cls = cls
 
             this.alloc_count = this.alloc_count + 1
-            @unsafe return payload
+            @unsafe make context: ptr<any> = this
+            @unsafe return owned_memory::wrap(payload, pool_free_address(), context)
         }
 
         return error.OutOfMemory
@@ -184,6 +186,11 @@ make type Pool {
 
     @pub @this @deallocator
     make free (raw_ptr: owned<any>) -> void {
+        @unsafe this.free_raw(owned_memory::unwrap(raw_ptr))
+    }
+
+    @this
+    make free_raw (raw_ptr: ptr<any>) -> void {
         @unsafe {
             this.free_count = this.free_count + 1
 
@@ -206,4 +213,13 @@ make type Pool {
         io::println("Debug leaks: " + (this.alloc_count - this.free_count).to_str())
         io::println("Debug mapped: " + this.mapped.to_str())
     }
+}
+
+@unsafe @external @intrinsic "native_address:quip_std_pool_free"
+make pool_free_address () -> ptr<any>
+
+@pub @unsafe @export "quip_std_pool_free"
+make pool_free_owned (context: ptr<any>, buffer: ptr<any>) -> void {
+    @unsafe make owner: ptr<Pool> = context
+    owner.*.free_raw(buffer)
 }

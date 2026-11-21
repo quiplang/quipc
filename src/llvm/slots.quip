@@ -1,5 +1,5 @@
 @pure @const {
-    make memory = @import "../memory/report.quip"
+    make memory = @import "../analysis/mir/memory/report.quip"
 }
 
 @pub

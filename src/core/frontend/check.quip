@@ -1,0 +1,89 @@
+@pure @const {
+    make profile = @import "../analysis_profile.quip"
+    make std = @import "std"
+    make hir = @import "../../repr/hir/hir.quip"
+    make typeck = @import "../../analysis/hir/types/check.quip"
+    make semantics = @import "../../analysis/hir/semantics/check.quip"
+    make model = @import "../unit/pkg.quip"
+    make Unit: Type = model::Unit
+}
+
+@pub
+make check_types (unit: ref<Unit>, sigs: ref<hir::HirAttachedSig[]>, structs: ref<hir::HirStructSig[]>, funcs: ref<hir::HirFuncSig[]>, timings: ref<profile::Profile>) -> !void {
+    // A new typed result invalidates all downstream analysis.
+    unit.*.invalidate_analysis()
+    unit.*.status = model::UnitStatus.Checking
+    for imported : unit.*.imports {
+        if imported.resolved && imported.alias.len() == 0 {
+            semantics::check_unbound_import(unit.*.hir_module.pin, imported.exports.pin, imported.path.copy(), imported.span.start, unit.*.diag.pin)
+        }
+    }
+    semantics::check_bodies(unit.*.hir_module.pin, unit.*.diag.pin)
+    semantics::check_array_copies(unit.*.hir_module.pin, sigs, unit.*.diag.pin)
+
+    if unit.*.diag.is_aborting() || unit.*.diag.has_errors() {
+        unit.*.status = model::UnitStatus.Aborted
+        return error.CompilationAborted
+    }
+
+    std::progress::phase("Type check", 0, 0, unit.*.path_rel.get())
+
+    make started: uint = 0
+
+    if timings.*.enabled { started = profile::now() }
+
+    unit.*.typed.checked = typeck::check(unit.*.hir_module.pin, unit.*.hir_imports.pin, unit.*.hir_namespaces.pin, sigs, structs, funcs, unit.*.typed.tys.pin, unit.*.diag.pin)
+
+    if timings.*.enabled { timings.*.record(started, "type", unit.*.path_rel.get()) }
+
+    if unit.*.diag.is_aborting() {
+        unit.*.status = model::UnitStatus.Aborted
+
+        return error.CompilationAborted
+    }
+
+    if timings.*.enabled { started = profile::now() }
+
+    // Array-copy return types are resolved by type checking and validated here.
+    make copy_index: uint = 0
+
+    while copy_index < unit.*.typed.checked.array_copy_funcs.len() {
+        make method = unit.*.hir_module.attached_funcs[unit.*.typed.checked.array_copy_funcs[copy_index]].pin
+        semantics::check_array_copy_return(unit.*.hir_module.funcs[method.*.func].pin, method.*.type_name.copy(), unit.*.typed.checked.array_copy_returns[copy_index].copy(), unit.*.diag.pin)
+        copy_index = copy_index + 1
+    }
+
+    // Resolved uses remain checkable when an unrelated type could not be inferred.
+    make types_valid = !unit.*.diag.has_errors()
+    make typed_index: uint = 0
+
+    while typed_index < unit.*.typed.checked.funcs.len() && typed_index < unit.*.hir_module.funcs.len() {
+        make result = unit.*.typed.checked.funcs[typed_index].pin
+
+        if types_valid && !unit.*.diag.hide_warnings && !unit.*.hir_module.funcs[typed_index].is_external {
+            semantics::warn_body(unit.*.hir_module.funcs[typed_index].body.pin, result.*.expr_tys.pin, unit.*.typed.tys.pin, unit.*.diag.pin, unit.*.extra_warnings)
+        }
+        if types_valid { semantics::check_typed_function(unit.*.hir_module.pin, typed_index, unit.*.typed.tys.pin, result.*.local_tys.pin, result.*.ret_ty, unit.*.diag.pin) }
+
+        semantics::check_uses(unit.*.hir_module.funcs[typed_index].body.pin, result.*.semantic_checks.pin, result.*.expr_tys.pin, unit.*.typed.tys.pin, structs, unit.*.diag.pin)
+        typed_index = typed_index + 1
+    }
+
+    if unit.*.diag.is_aborting() || unit.*.diag.has_errors() {
+        unit.*.status = model::UnitStatus.Aborted
+        return error.CompilationAborted
+    }
+
+    if !unit.*.diag.has_errors() && !unit.*.diag.hide_warnings {
+        for imported : unit.*.imports {
+            if imported.resolved && !imported.is_public && imported.alias.len() > 0 {
+                semantics::warn_import(unit.*.tokens.pin, imported.alias.copy(), imported.span.copy(), imported.path.copy(), imported.provides_methods, unit.*.diag.pin)
+            }
+        }
+    }
+
+    if timings.*.enabled { timings.*.record(started, "typed_semantics", unit.*.path_rel.get()) }
+
+    unit.*.typed.valid = true
+    return
+}

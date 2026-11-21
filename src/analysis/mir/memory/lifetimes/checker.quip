@@ -1,0 +1,326 @@
+// driving the memory pass over a module: dataflow fixpoint, dangling-ref
+// checks and the stack slot / obligation reports
+
+@pure @const {
+    make e = @import "../../../../diag/err.quip"
+    make mir = @import "../../../../repr/mir/mir.quip"
+    make hir = @import "../../../../repr/hir/hir.quip"
+    make diags = @import "../../../../diag/diagnosis.quip"
+    make util = @import "../../../../util/pkg.quip"
+
+    make graph = @import "graph.quip"
+    make state = @import "liveness.quip"
+    make infer = @import "inference.quip"
+    make errors = @import "errors.quip"
+    make report = @import "../report.quip"
+    make plan = @import "../../../../llvm/storage/plan.quip"
+    make obligations = @import "../obligations.quip"
+    make profile = @import "../../../../core/analysis_profile.quip"
+}
+
+/// checks each mir function and appends its memory report.
+@pub
+make check (mir_mod: ref<mir::MirModule>, hir_mod: ref<hir::HirModule>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, out: ref<report::MemReport>) -> void {
+    make timings = profile::Profile {}
+    make i = 0
+
+    while i < mir_mod.*.funcs.len() {
+        if diag.*.is_aborting() { return }
+
+        check_func(mir_mod.*.funcs[i].pin, diag, ctx, out, mir_mod.*.structs.pin, mir_mod.*.funcs.pin, timings.pin, true)
+        i = i + 1
+    }
+
+    return
+}
+
+/// reuses eligible function reports and checks the remaining mir functions.
+@pub
+make check_cached (mir_mod: ref<mir::MirModule>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, out: ref<report::MemReport>, previous: ref<report::MemReport>, reuse: ref<bool[]>, timings: ref<profile::Profile>, plan_slots: bool = true) -> void {
+    make i: uint = 0
+
+    while i < mir_mod.*.funcs.len() {
+        if diag.*.is_aborting() { return }
+
+        // Callee effects can change even when this function's MIR is reused.
+        // Recheck callers with pins until effect summaries are cache keys.
+        if i < reuse.*.len() && reuse.*[i] && i < previous.*.funcs.len() && !has_pin_and_call(mir_mod.*.funcs[i].body.pin) {
+            out.*.funcs.push(previous.*.funcs[i])
+            out.*.reused_functions = out.*.reused_functions + 1
+        } else { check_func(mir_mod.*.funcs[i].pin, diag, ctx, out, mir_mod.*.structs.pin, mir_mod.*.funcs.pin, timings, plan_slots) }
+
+        i = i + 1
+    }
+}
+
+make has_pin_and_call (body: ref<mir::MirBody>) -> bool {
+    make has_pin = false
+    make i = 0
+    while i < body.*.stmts.len() {
+        if body.*.stmts[i].kind == mir::MirStmtKind.Assign && body.*.stmts[i].rvalue.kind == mir::MirRvalueKind.Pin { has_pin = true }
+
+        i = i + 1
+    }
+
+    if !has_pin { return false }
+
+    i = 0
+
+    while i < body.*.terms.len() {
+        if body.*.terms[i].kind == mir::MirTermKind.Call { return true }
+
+        i = i + 1
+    }
+
+    return false
+}
+
+/// returns the successor block ids of a mir terminator.
+make successors (t: ref<mir::MirTerm>) -> uint[] {
+    make out: uint[] = []
+
+    match t.*.kind {
+        mir::MirTermKind.Goto { out.push(t.*.target) }
+
+        mir::MirTermKind.Branch {
+            out.push(t.*.target)
+            out.push(t.*.other)
+        }
+
+        mir::MirTermKind.Call { out.push(t.*.target) }
+        _ {}
+    }
+
+    return out
+}
+
+/// checks the function.
+make check_func (f: ref<mir::MirFunc>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, out: ref<report::MemReport>, structs: ref<mir::MirStruct[]>, funcs: ref<mir::MirFunc[]>, timings: ref<profile::Profile>, plan_slots: bool = true) -> void {
+    make fr = report::MemFuncReport {}
+
+    fr.name = f.*.name !
+    fr.is_external = f.*.is_external
+
+    make body = f.*.body.pin
+
+    if body.*.terms.len() > 0 && body.*.locals.len() > 0 {
+        run(body, diag, ctx, fr.pin, structs, funcs, timings, plan_slots)
+    }
+
+    if !diag.*.hide_warnings && !diag.*.has_errors() {
+        for obligation : fr.obligations {
+            if !obligation.closed && !obligation.freed && !obligation.transferred && !obligation.auto_released && !obligation.auto_cleanup {
+                make d = diags::Diag.warn(e::Warn.PossibleMemoryLeak, obligation.allocation_range.copy(), "allocation may leak")
+                d.label("allocation has no tracked deallocation or ownership transfer")
+                d.note("allocation made by `" + obligation.allocator.copy() + "`; raw-pointer escapes may require manual ownership verification")
+                d.help("free this allocation with its matching deallocator on every exit path, return or transfer ownership explicitly, or use an automatically cleaned owned value")
+                diag.*.report(d)
+            }
+        }
+    }
+
+    fr.managed_heap_sites = report::count_managed_sites(body)
+    report::compute_summary(fr.pin)
+
+    out.*.funcs.push(fr)
+    return
+}
+
+make block_input (block: uint, body: ref<mir::MirBody>, preds: ref<graph::IdList[]>,
+    processed: ref<uint[]>, outs: ref<state::LocalState[]>, zero: ref<state::LocalState>,
+    result: ref<state::LocalState>) {
+    state::reset_to(result, zero)
+    if block == 0 {
+        state::init_entry(result, body.*.param_count, body.*.capture_locals.pin)
+        return
+    }
+    for pred : preds.*[block].ids {
+        if processed.*[pred] != 0 { state::merge_into(result, outs.*[pred].pin) }
+    }
+}
+
+make run (body: ref<mir::MirBody>, diag: ref<diags::Diagnostic>, ctx: ref<report::MemContext>, fr: ref<report::MemFuncReport>, structs: ref<mir::MirStruct[]>, funcs: ref<mir::MirFunc[]>, timings: ref<profile::Profile>, plan_slots: bool = true) -> void {
+    make started: uint = 0
+
+    if timings.*.enabled { started = profile::now() }
+
+    make g = graph::build(body)
+
+    if timings.*.enabled {
+        timings.*.record(started, "mem_graph", fr.*.name.copy())
+        started = profile::now()
+    }
+
+    make nblocks = body.*.terms.len()
+    make nlocals = body.*.locals.len()
+
+    // statements bucketed by their block, in program order
+    make by_block: graph::IdList[] = []
+
+    make bi = 0
+
+    while bi < nblocks {
+        by_block.push(graph::IdList {})
+        bi = bi + 1
+    }
+
+    make si = 0
+
+    while si < body.*.stmts.len() {
+        make b = body.*.stmts[si].block
+
+        if b < nblocks {
+            by_block[b].ids.push(si)
+        }
+
+        si = si + 1
+    }
+
+    // predecessors, used to recompute block entry states from scratch. the entry
+    // state must reflect the *current* out-states of every predecessor: a pin can
+    // be released on an edge, and an incremental union would keep the stale
+    // `pinned` bit forever once a predecessor had set it.
+    make preds: graph::IdList[] = []
+    bi = 0
+
+    while bi < nblocks {
+        preds.push(graph::IdList {})
+        bi = bi + 1
+    }
+
+    // the control-flow edges do not change between dataflow sweeps.
+    // retain them here instead of allocating successor arrays on every visit.
+    make succs_by_block: graph::IdList[] = []
+    bi = 0
+
+    while bi < nblocks {
+        make edges = graph::IdList {}
+        edges.ids = successors(body.*.terms[bi].pin)
+        make pk = 0
+
+        while pk < edges.ids.len() {
+            make sb = edges.ids[pk]
+
+            if sb < nblocks {
+                preds[sb].ids.push(bi)
+            }
+
+            pk = pk + 1
+        }
+
+        succs_by_block.push(edges)
+        bi = bi + 1
+    }
+
+    // Only outputs persist per block. Reconstruct inputs from predecessors
+    // in MIR order so diagnostics retain their original contributing sites.
+    make outs: state::LocalState[] = []
+    make processed: uint[] = []
+    make dirty: uint[] = []
+    bi = 0
+    while bi < nblocks {
+        outs.push(state::LocalState {})
+        processed.push(0)
+        dirty.push(0)
+        bi++
+    }
+
+    make it = infer::Infer.create(body, g.pin, diag, ctx, fr, structs, funcs)
+    make zero = state::create(nlocals, g.pins.len())
+    make scratch = state::create(nlocals, g.pins.len())
+    dirty[0] = 1
+    make pending: uint = 1
+    make sweep: uint = 0
+    while pending > 0 && sweep < 512 {
+        if diag.*.is_aborting() { return }
+        sweep++
+        bi = 0
+        while bi < nblocks {
+            if dirty[bi] != 0 {
+                dirty[bi] = 0
+                pending--
+                block_input(bi, body, preds.pin, processed.pin, outs.pin, zero.pin, scratch.pin)
+                it.block(bi, by_block.pin, scratch.pin)
+                make first = processed[bi] == 0
+                if first || !state::equal(scratch.pin, outs[bi].pin) {
+                    if first { outs[bi] = state::create(nlocals, g.pins.len()) }
+                    state::reset_to(outs[bi].pin, scratch.pin)
+                    processed[bi] = 1
+                    for successor : succs_by_block[bi].ids {
+                        if successor < nblocks && dirty[successor] == 0 {
+                            dirty[successor] = 1
+                            pending++
+                        }
+                    }
+                }
+            }
+            bi++
+        }
+    }
+
+    if timings.*.enabled {
+        timings.*.record(started, "mem_flow", fr.*.name.copy())
+        started = profile::now()
+    }
+
+    // reporting pass
+    it.emit = true
+    bi = 0
+
+    while bi < nblocks {
+        if processed[bi] != 0 {
+            block_input(bi, body, preds.pin, processed.pin, outs.pin, zero.pin, scratch.pin)
+            it.block(bi, by_block.pin, scratch.pin)
+        }
+
+        bi = bi + 1
+    }
+
+    // dangling references are decided purely by kill lines
+    make pi = 0
+
+    while pi < g.pins.len() {
+        make src = g.pins[pi].src
+        make holder = g.pins[pi].holder
+        make source_ty = body.*.locals[src].ty.copy()
+        make owned = source_ty.len() >= 6 && source_ty[0] == 'o' && source_ty[1] == 'w' && source_ty[2] == 'n' && source_ty[3] == 'e' && source_ty[4] == 'd' && source_ty[5] == '<'
+
+        if pi < g.return_pins.len() && g.return_pins[pi] != 0 && !body.*.locals[src].is_param && !g.pins[pi].indirect && !owned {
+            make d = errors::return_stack_ref(body, g.pins[pi].range.copy(), src)
+            d.attach(diags::Label.create(body.*.locals[src].range.copy(), "source storage declared here"))
+            diag.*.report(d)
+        }
+
+        if g.has_dead[src] != 0 {
+            make holder_kill = graph::kill_line(g.pin, holder)
+
+            if holder_kill > g.dead[src] {
+                make d = errors::ref_outlives(body, g.pins[pi].range.copy(), holder, src, holder_kill, g.dead[src])
+                d.attach(diags::Label.create(body.*.locals[src].range.copy(), "source storage declared here"))
+
+                if g.dead[src] < body.*.stmts.len() { d.attach(diags::Label.create(body.*.stmts[g.dead[src]].range.copy(), "source storage ends here")) }
+
+                d.attach(diags::Label.create(errors::last_use_range(body, g.pin, holder), "reference is still used here"))
+                diag.*.report(d)
+            }
+        }
+
+        pi = pi + 1
+    }
+
+    // obligations still open auto-release at the owner's kill line
+    obligations::finalize(fr.*.obligations.pin, g.pin, g.nstmts)
+
+    if timings.*.enabled {
+        timings.*.record(started, "mem_report", fr.*.name.copy())
+        started = profile::now()
+    }
+
+    // Codegen rebuilds storage after optimizing MIR. Diagnostics do not
+    // depend on slot colors; only an explicit memory report needs this plan.
+    if plan_slots { fr.*.slots = plan::build(g.pin, body, structs) }
+
+    if timings.*.enabled { timings.*.record(started, "mem_plan", fr.*.name.copy()) }
+
+    return
+}

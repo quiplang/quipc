@@ -1,0 +1,82 @@
+@pure @const {
+    make profile = @import "../analysis_profile.quip"
+    make lexer = @import "../token.quip"
+    make parser = @import "../parser.quip"
+    make util = @import "../../util/pkg.quip"
+    make diags = @import "../../diag/diagnosis.quip"
+    make e = @import "../../diag/err.quip"
+    make symbols = @import "../unit/symbols.quip"
+    make imports = @import "../unit/imports.quip"
+    make model = @import "../unit/pkg.quip"
+    make Unit: Type = model::Unit
+}
+
+@pub
+make parse_self (unit: ref<Unit>, timings: ref<profile::Profile>) -> !void {
+    unit.*.status = model::UnitStatus.Lexing
+    make failure_offset: uint = 0
+    make started: uint = 0
+
+    if timings.*.enabled { started = profile::now() }
+
+    unit.*.tokens = lexer::tokenize_at(unit.*.content, failure_offset.pin) catch err {
+        unit.*.status = model::UnitStatus.Aborted
+        make message: str = "unexpected character while tokenizing source"
+
+        match err {
+            error.IdentifierTooLong { message = "identifier exceeds the tokenizer limit" }
+
+            error.UnexpectedEndOfFile { message = "unterminated literal" }
+            _ {}
+        }
+        make range = util::Range.of(failure_offset, failure_offset + 1)
+        make d = diags::Diag.err(e::Err.InvalidSyntax, range, message)
+
+        match err {
+            error.UnexpectedEndOfFile {
+                d.*.code = e::err_code(e::Err.UnexpectedEndOfFile)
+                d.label("literal starts here but has no matching closing quote")
+                d.attach(diags::Label.create(util::Range.of(unit.*.content.len(), unit.*.content.len()), "end of file reached while reading this literal"))
+                d.help("close the literal with the same quote character; escape quotes that belong in the value")
+            }
+
+            error.IdentifierTooLong {
+                d.label("identifier exceeds the 255-character limit here")
+                make start = failure_offset
+
+                while start > 0 && (unit.*.content[start - 1].is_alnum() || unit.*.content[start - 1] == '_') { start = start - 1 }
+
+                d.attach(diags::Label.create(util::Range.of(start, start + 1), "identifier starts here"))
+                d.help("shorten this identifier or split a long qualified name into namespaces")
+            }
+            _ {
+                d.label("this character cannot begin a valid token")
+                d.help("remove the character or write a valid identifier, literal, or operator")
+            }
+        }
+
+        unit.*.diag.report(d)
+        return error.CompilationAborted
+    }
+
+    if timings.*.enabled { timings.*.record(started, "lex", unit.*.path_rel.get()) }
+
+    if timings.*.enabled { started = profile::now() }
+
+    make p = parser::Parser.init(unit.*.tokens.pin)
+    unit.*.status = model::UnitStatus.Parsing
+    unit.*.program = p.proceed(unit)
+
+    if timings.*.enabled { timings.*.record(started, "parse", unit.*.path_rel.get()) }
+
+    if unit.*.diag.is_aborting() || unit.*.diag.has_errors() {
+        unit.*.status = model::UnitStatus.Aborted
+
+        return error.CompilationAborted
+    }
+
+    unit.*.public_symbols = symbols::public_symbols_of(unit.*.program.pin)
+    unit.*.imports = imports::collect_imports(unit.*.program.pin, unit.*.platform_name.copy())
+
+    return
+}

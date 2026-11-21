@@ -1,0 +1,129 @@
+@pure @const {
+    make ast = @import "../../util/ast.quip"
+}
+
+@pub
+make pub_func_name (node: ptr<ast::AST_Head>) -> str {
+    match node.*.func {
+        none { return "" }
+        some {
+            make n = some.*.name.lexeme !
+            node.*.func = some
+            return n
+        }
+    }
+}
+
+/// returns the variable name from an ast node, or an empty string.
+@pub
+make pub_var_name (node: ptr<ast::AST_Head>) -> str {
+    match node.*.var {
+        none { return "" }
+        some {
+            make n = some.*.name.lexeme !
+            node.*.var = some
+            return n
+        }
+    }
+
+}
+
+// `make Alias: Type = ...` is a compile-time type alias even though it is parsed as a variable
+@pub
+make is_type_alias_var (node: ptr<ast::AST_Head>) -> bool {
+    make result = false
+
+    match node.*.var {
+        none {}
+
+        var_box: owned<ast::AST_Var> {
+            if var_box.*.sig_type != none {
+                @unsafe make sig: ptr<ast::AST_TypeSig> = var_box.*.sig_type.unwrap()
+
+                if sig.*.name.lexeme == "Type" {
+                    result = true
+                }
+            }
+
+            node.*.var = var_box
+        }
+    }
+
+    return result
+}
+
+/// returns the type name from an ast node, or an empty string.
+@pub
+make pub_type_name (node: ptr<ast::AST_Head>) -> str {
+    match node.*.type_node {
+        none { return "" }
+        some {
+            make n = some.*.name.lexeme !
+            node.*.type_node = some
+            return n
+        }
+    }
+}
+
+/// returns the enum name from an ast node, or an empty string.
+@pub
+make pub_enum_name (node: ptr<ast::AST_Head>) -> str {
+    match node.*.enum_node {
+        none { return "" }
+        some {
+            make n = some.*.name.lexeme !
+            node.*.enum_node = some
+            return n
+        }
+    }
+}
+
+/// collects names of public declarations from a parsed program.
+@pub
+make public_symbols_of (program: ref<owned<ast::AST_Head>[]>) -> str[] {
+    make out: str[] = []
+
+    make i: uint = 0
+
+    while i < program.*.len() {
+        @unsafe make node: ptr<ast::AST_Head> = program.*[i].*.pin
+
+        make is_pub = false
+        make ti: uint = 0
+
+        while ti < node.*.tags.len() {
+            @unsafe make tag: ptr<ast::AST_Tag> = node.*.tags[ti].*.pin
+
+            if tag.*.name.lexeme == "pub" {
+                is_pub = true
+            }
+
+            ti = ti + 1
+        }
+
+        if is_pub {
+            match node.*.kind {
+                ast::AST_Kind.Func {
+                    out.push(pub_func_name(node))
+                }
+
+                ast::AST_Kind.Var {
+                    out.push(pub_var_name(node))
+                }
+
+                ast::AST_Kind.Type {
+                    out.push(pub_type_name(node))
+                }
+
+                ast::AST_Kind.Enum {
+                    out.push(pub_enum_name(node))
+                }
+                _ {}
+            }
+        }
+
+        i = i + 1
+    }
+
+    return out
+}

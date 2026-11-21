@@ -1,6 +1,6 @@
 // Conservative promotion of MIR words before LLVM IR construction.
 @pure @const {
-    make mir = @import "../mir/mir.quip"
+    make mir = @import "../repr/mir/mir.quip"
 }
 
 make type Analysis {

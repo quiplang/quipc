@@ -1,0 +1,38 @@
+@pure @const {
+    make std = @import "std"
+}
+
+// resolves an `@import` string relative to the directory of the file that contains it
+@pub
+make resolve_import (from: std::io::Path, import_path: str) -> std::io::Path {
+    if import_path.len() > 0 {
+        if import_path[0] == '/' || import_path[0] == '~' { return std::io::Path.create(import_path) }
+    }
+
+    make base = from.copy()
+
+    if base.content.len() > 0 {
+        base.content.pop() // drop the file name, keep the directory
+    }
+
+    for part : std::collections::split(import_path, '/').iter() {
+        if part == "." {
+            // stay in the same directory
+        } elif part == ".." {
+            if base.content.len() > 0 {
+                base.content.pop()
+            }
+        } else {
+            base.content.push(part !)
+        }
+    }
+
+    return base
+}
+
+@pub
+make can_open_import (path: ref<std::io::Path>) -> bool {
+    make file = std::io::File.open(path, "r") catch { return false }
+    file.close()
+    return true
+}

@@ -34,13 +34,13 @@ make type ScalarFunction {
 /// Lowers a MIR unit into a module owned by the caller.
 @pub @unsafe
 make build (context: ptr<any>, module: ptr<any>, m: ref<mir::MirModule>, module_name: str,
-    selected_entry: str, source: str, platform: str, report: ref<memr::MemReport>) -> bool {
+    selected_entry: str, source: str, platform: str, report: ref<memr::MemReport>, codegen_facts: ref<flow::Graph[]>) -> bool {
     make builder = api::LLVMCreateBuilderInContext(context)
     @unsafe make null: ptr<any> = 0
     make e = Emitter {
         context = context, module = module, builder = builder, null = null,
         module_name = module_name, entry = selected_entry, source = source, platform = platform,
-        mem_report = report, word = api::LLVMInt64TypeInContext(context),
+        codegen_facts = codegen_facts, mem_report = report, word = api::LLVMInt64TypeInContext(context),
         byte = api::LLVMInt8TypeInContext(context), pointer = api::LLVMPointerTypeInContext(context, 0),
         void_type = api::LLVMVoidTypeInContext(context), c_int = api::LLVMInt32TypeInContext(context),
         conversion = native::Conversion.create(context, builder),
@@ -50,7 +50,7 @@ make build (context: ptr<any>, module: ptr<any>, m: ref<mir::MirModule>, module_
     api::LLVMDisposeBuilder(builder)
     for function : e.scalar_functions {
         scalar::build(context, module, function.symbol.copy(), m.*.funcs[function.index].body.pin,
-            m.*.funcs[function.index].is_lambda, function.slots.pin, function.calls.pin, e.builder_layouts.pin)
+            m.*.funcs[function.index].is_lambda, function.slots.pin, function.calls.pin, e.builder_layouts.pin, codegen_facts.*[function.index].pin)
     }
     descriptors::build(context, module, e.descriptors.pin)
     if e.needs_string_equal { strings::build(context, module) }
@@ -138,6 +138,7 @@ make type Emitter {
     make cur_sret: bool = false
     make direct_result: bool = false
     make platform: str = "macos"
+    make codegen_facts: ref<flow::Graph[]>
     make mem_report: ref<memr::MemReport>
 
     // the unit's source text (to turn a byte offset into a line for runtime panics) and the module-level
@@ -1999,7 +2000,8 @@ make type Emitter {
         make merged_entry = ssa::entry_is_first(f.*.body.pin)
         this.resolved_targets = []
         this.continuations = []
-        make groups = registers::groups(f.*.body.pin)
+        make facts = this.codegen_facts.*[report_index].pin
+        make groups = registers::groups(f.*.body.pin, facts)
         for root : groups.iter() {
             this.resolved_targets.push(this.resolved_targets.len())
             this.continuations.push(root != this.continuations.len())
@@ -2083,7 +2085,7 @@ make type Emitter {
             _ = local
             this.cleanup_active.push(false)
         }
-        this.registers = registers::create(f.*.body.pin, this.context, this.builder, this.ssa_locals.pin, this.blocks.pin, this.continuations.pin)
+        this.registers = registers::create(f.*.body.pin, this.context, this.builder, this.ssa_locals.pin, this.blocks.pin, this.continuations.pin, facts)
         make plan = slots::plan(f.*.body.locals.len(), this.mem_report, report_index)
         make next_unplanned_slot = plan.next_slot
         this.local_slots = plan.locals

@@ -1,0 +1,108 @@
+@pure @const {
+    make ast = @import "../../util/ast.quip"
+    make hir_lower = @import "../../repr/hir/lower.quip"
+    make model = @import "pkg.quip"
+    make ImportInfo: Type = model::ImportInfo
+}
+
+make collect_import_from_var (node: ptr<ast::AST_Head>, out: ref<ImportInfo[]>) {
+    match node.*.var {
+        none {}
+
+        var_box: owned<ast::AST_Var> {
+            if var_box.*.val != none {
+                match var_box.*.val {
+                    none {}
+
+                    val_box: owned<ast::AST_Head> {
+                        make is_import = false
+                        make is_public = false
+                        make ti: uint = 0
+
+                        while ti < val_box.*.tags.len() {
+                            @unsafe make tag: ptr<ast::AST_Tag> = val_box.*.tags[ti].*.pin
+
+                            if tag.*.name.lexeme == "import" {
+                                is_import = true
+                            }
+
+                            ti = ti + 1
+                        }
+
+                        ti = 0
+
+                        while ti < node.*.tags.len() {
+                            @unsafe make tag2: ptr<ast::AST_Tag> = node.*.tags[ti].*.pin
+
+                            if tag2.*.name.lexeme == "pub" { is_public = true }
+                            if tag2.*.name.lexeme == "import" {
+                                is_import = true
+                            }
+
+                            ti = ti + 1
+                        }
+
+                        if is_import && val_box.*.expr != none {
+                            match val_box.*.expr {
+                                none {}
+
+                                expr_box: owned<ast::AST_Expr> {
+                                    if expr_box.*.kind == ast::ExprKind.Literal {
+                                        make info = ImportInfo {}
+
+                                        info.span = var_box.*.name.span.copy()
+                                        info.is_public = is_public
+                                        info.alias = var_box.*.name.lexeme !
+                                        info.path = expr_box.*.literal.lexeme !
+                                        out.*.push(info)
+                                    }
+
+                                    val_box.*.expr = expr_box
+                                }
+                            }
+                        }
+
+                        var_box.*.val = val_box
+                    }
+                }
+            }
+
+            node.*.var = var_box
+        }
+    }
+}
+
+@pub
+make collect_imports (program: ref<owned<ast::AST_Head>[]>, os: str) -> ImportInfo[] {
+    make out: ImportInfo[] = []
+
+    make selected = hir_lower::selected_nodes(program, os)
+    make i: uint = 0
+
+    while i < program.*.len() {
+        if !selected[i] {
+            i++
+            continue
+        }
+        @unsafe make node: ptr<ast::AST_Head> = program.*[i].*.pin
+
+        if node.*.var != none {
+            collect_import_from_var(node, out.pin)
+        }
+
+        if node.*.kind == ast::AST_Kind.Expr && node.*.expr != none {
+            @unsafe make expression: ptr<ast::AST_Expr> = node.*.expr.unwrap()
+            if expression.*.kind == ast::ExprKind.Literal {
+                for tag : node.*.tags {
+                    if tag.*.name.lexeme == "import" {
+                        out.push(ImportInfo { path = expression.*.literal.lexeme.copy(), span = node.*.range.start.copy() })
+                    }
+                }
+            }
+        }
+
+        i = i + 1
+    }
+
+    return out
+}

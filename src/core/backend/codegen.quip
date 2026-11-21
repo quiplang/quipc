@@ -1,0 +1,32 @@
+@pure @const {
+    make profile = @import "../analysis_profile.quip"
+    make std = @import "std"
+    make llvm = @import "../../llvm/pkg.quip"
+    make model = @import "../unit/pkg.quip"
+    make Unit: Type = model::Unit
+}
+
+@pub
+make generate_llvm (unit: ref<Unit>, timings: ref<profile::Profile>, show_progress: bool) -> !void {
+    if !unit.*.analyzed.memory_valid { return error.CompilationAborted }
+    if unit.*.emit_llvm {
+        unit.*.status = model::UnitStatus.LLVM
+        if show_progress { std::progress::phase("Generate IR", 0, 0, unit.*.path_rel.get()) }
+
+        make dump_path: str = ""
+        if unit.*.keep_llvm && !unit.*.print_llvm { dump_path = unit.*.llvm_ll.copy() }
+
+        if !llvm::object::compile(unit.*.analyzed.mir_module.pin, unit.*.analyzed.mem_report.pin, unit.*.path_rel.get(),
+            unit.*.entry_name !, unit.*.content !, unit.*.platform_name !, unit.*.llvm_out !,
+            unit.*.llvm_optimization !, unit.*.print_llvm, dump_path, timings, show_progress, unit.*.print_llvm_optimized) {
+            std::progress::clear()
+            std::io::println("LLVM generation failed for " + unit.*.path_rel.get())
+            return error.CompilationAborted
+        }
+
+        if show_progress && !unit.*.print_llvm { std::progress::unit_done() }
+    }
+
+
+    return
+}

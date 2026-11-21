@@ -1,0 +1,433 @@
+@pure @const {
+    make session = @import "session.quip"
+    make facts = @import "../analysis/hir/facts.quip"
+    make util = @import "../util/pkg.quip"
+    make hir = @import "../repr/hir/hir.quip"
+    make ty = @import "../repr/types/pkg.quip"
+}
+
+// flatten a type from a HIR body into a portable shape, resolving namespace paths to their final
+// member so that it can be looked up by name in another unit
+make collect_type_sig (body: ref<hir::HirBody>, idx: uint) -> hir::HirTypeSig {
+    make out = hir::HirTypeSig {}
+
+    if idx >= body.*.types.len() {
+        return out
+    }
+
+    make ht = body.*.types[idx].pin
+    out.span = util::Span { start = ht.*.range.start.start, end = ht.*.range.end.end }
+    make node = ht
+
+    while node.*.is_namespace && node.*.args.len() > 0 {
+        node = body.*.types[node.*.args[node.*.args.len() - 1]].pin
+    }
+
+    make p = ty::TyInterner.prim(node.*.name !)
+
+    if p != ty::TY_ERROR {
+        out.prim = p
+    } else {
+        out.name = node.*.name !
+    }
+
+    make ai: uint = 0
+
+    while ai < node.*.args.len() {
+        out.args.push(collect_type_sig(body, node.*.args[ai]))
+        ai = ai + 1
+    }
+
+    out.is_ptr = ht.*.is_ptr
+    out.is_ref = ht.*.is_ref
+    out.is_array = ht.*.is_array
+    out.is_optional = ht.*.is_optional
+    out.is_fallible = ht.*.is_fallible
+
+    return out
+}
+
+/// renders a portable hir type signature as a source-level name.
+make portable_type_name (sig: ref<hir::HirTypeSig>) -> str {
+    make name = sig.*.name !
+
+    if sig.*.prim == ty::TY_VOID { name = "void" }
+
+    if sig.*.prim == ty::TY_BOOL { name = "bool" }
+
+    if sig.*.prim == ty::TY_I8 { name = "i8" }
+
+    if sig.*.prim == ty::TY_I16 { name = "i16" }
+
+    if sig.*.prim == ty::TY_I32 { name = "i32" }
+
+    if sig.*.prim == ty::TY_I64 { name = "i64" }
+
+    if sig.*.prim == ty::TY_U8 { name = "u8" }
+
+    if sig.*.prim == ty::TY_U16 { name = "u16" }
+
+    if sig.*.prim == ty::TY_U32 { name = "u32" }
+
+    if sig.*.prim == ty::TY_U64 { name = "u64" }
+
+    if sig.*.prim == ty::TY_INT { name = "int" }
+
+    if sig.*.prim == ty::TY_UINT { name = "uint" }
+
+    if sig.*.prim == ty::TY_F32 { name = "f32" }
+
+    if sig.*.prim == ty::TY_F64 { name = "f64" }
+
+    if sig.*.prim == ty::TY_FLOAT { name = "float" }
+
+    if sig.*.prim == ty::TY_STR { name = "str" }
+
+    if sig.*.prim == ty::TY_STRBUF { name = "String" }
+
+    if sig.*.prim == ty::TY_TEXT { name = "text" }
+
+    if sig.*.prim == ty::TY_CHAR { name = "char" }
+
+    if sig.*.args.len() > 0 {
+        name = name + "<"
+        make i = 0
+
+        while i < sig.*.args.len() {
+            if i > 0 { name = name + ", " }
+
+            name = name + portable_type_name(sig.*.args[i].pin)
+            i = i + 1
+        }
+
+        name = name + ">"
+    }
+
+    if sig.*.is_ptr { name = "ptr<" + name + ">" }
+
+    if sig.*.is_ref { name = "ref<" + name + ">" }
+
+    if sig.*.is_array { name = name + "[]" }
+
+    if sig.*.is_optional { name = name + "?" }
+
+    if sig.*.is_fallible { name = "!" + name }
+
+    return name
+}
+
+// flatten a module's attached functions into portable signatures (see `hir::HirAttachedSig`),
+// appending them to `out`. signatures are reconstructed here (rather than copied) because they
+// own strings.
+@pub
+make collect_sigs_into (out: ref<hir::HirAttachedSig[]>, module: ref<hir::HirModule>, path: str, source: ref<str>, struct_names: ref<str[]>) {
+    make i: uint = 0
+
+    while i < module.*.attached_funcs.len() {
+        make m = module.*.attached_funcs[i].pin
+
+        if m.*.func < module.*.funcs.len() {
+            make f = module.*.funcs[m.*.func].pin
+
+            make sig = hir::HirAttachedSig {}
+
+            sig.path = path.copy()
+            sig.source = source
+            sig.name_span = f.*.name_span.copy()
+            sig.is_noreturn = facts::noreturn_function(f)
+            sig.symbol = f.*.name !
+            sig.type_name = m.*.type_name !
+            sig.name = m.*.name !
+            sig.param_count = f.*.body.param_count
+            sig.has_this = f.*.has_this
+
+            for tag : f.*.tags {
+                if tag == "pure" { sig.is_pure = true }
+                if tag == "unsafe" { sig.is_unsafe = true }
+            }
+
+            make pi: uint = 0
+
+            while pi < sig.param_count {
+                if pi < f.*.body.locals.len() {
+                    make param = f.*.body.locals[pi].pin
+
+                    if param.*.has_ty && param.*.ty < f.*.body.types.len() {
+                        make param_ty = collect_type_sig(f.*.body.pin, param.*.ty)
+                        sig.param_aggs.push(portable_type_is_aggregate(param_ty.pin, struct_names))
+                        sig.param_tys.push(param_ty)
+                    } else {
+                        sig.param_aggs.push(false)
+                    sig.param_tys.push(hir::HirTypeSig {})
+                    }
+                } else {
+                    sig.param_aggs.push(false)
+                    sig.param_tys.push(hir::HirTypeSig {})
+                }
+
+                pi = pi + 1
+            }
+
+            make ti: uint = 0
+
+            while ti < f.*.tags.len() {
+                if f.*.tags[ti] == "copy" {
+                    sig.is_copy_fn = true
+                }
+
+                ti = ti + 1
+            }
+
+            if f.*.has_ret_ty && f.*.ret_ty < f.*.body.types.len() {
+                sig.has_ret = true
+                sig.ret_ty = collect_type_sig(f.*.body.pin, f.*.ret_ty)
+                sig.ret_agg = portable_type_is_aggregate(sig.ret_ty.pin, struct_names)
+            }
+
+            out.*.push(sig)
+        }
+
+        i = i + 1
+    }
+}
+
+/// checks whether a portable type uses aggregate representation.
+make portable_type_is_aggregate (sig: ref<hir::HirTypeSig>, struct_names: ref<str[]>) -> bool {
+    if sig.*.is_fallible { return true }
+
+    if sig.*.name == "variant" && !sig.*.is_ref && !sig.*.is_ptr { return true }
+
+    if sig.*.is_array || sig.*.is_optional {
+        return true
+    }
+
+    make result = false
+
+    if sig.*.prim == ty::TY_STR || sig.*.prim == ty::TY_STRBUF {
+        result = true
+    }
+
+    if sig.*.prim == ty::TY_ERROR && !sig.*.is_ptr && !sig.*.is_ref
+        && !sig.*.is_array && !sig.*.is_optional
+        && sig.*.name != "variant" {
+        // The declaration may live in another unit, so consult the compilation-wide struct
+        // registry rather than this module's items. Enums are not named here and stay scalars.
+        make i: uint = 0
+
+        while i < struct_names.*.len() {
+            if struct_names.*[i] == sig.*.name {
+                result = true
+            }
+
+            i = i + 1
+        }
+    }
+
+    return result
+}
+
+// flatten a module's struct declarations into portable field signatures (see
+// `hir::HirStructSig`), appending them to `out`. field types use the same primitive-id / base-name
+// representation as attached-function return types.
+@pub
+make collect_struct_sigs_into (out: ref<hir::HirStructSig[]>, module: ref<hir::HirModule>, path: str, source: ref<str>) {
+    make si: uint = 0
+
+    while si < module.*.structs.len() {
+        make hs = module.*.structs[si].pin
+
+        make sig = hir::HirStructSig {}
+
+        sig.name = hs.*.name !
+        sig.path = path.copy()
+        sig.source = source
+        sig.display_name = hs.*.declaration_name.copy()
+        sig.name_span = hs.*.name_span.copy()
+
+        make fi: uint = 0
+
+        while fi < hs.*.fields.len() {
+            make hf = hs.*.fields[fi].pin
+
+            if hf.*.has_ty && hf.*.ty < hs.*.body.types.len() {
+                make ht = hs.*.body.types[hf.*.ty].pin
+
+                make fs = hir::HirFieldSig {}
+
+                fs.name_span = hf.*.name_span.copy()
+                fs.is_pub = hf.*.is_pub
+                fs.is_const = hf.*.is_const
+                fs.is_pure = hf.*.is_pure
+                fs.is_unsafe = hf.*.is_unsafe
+                fs.name = hf.*.name !
+                fs.default_init = hf.*.default_init.copy()
+                fs.has_default = hf.*.has_default
+
+                if hf.*.has_default && hf.*.default < hs.*.body.exprs.len() {
+                    make value = hs.*.body.exprs[hf.*.default].pin
+
+                    if value.*.kind == hir::HirExprKind.Literal {
+                        fs.default_lit.kind = value.*.lit.kind
+                        fs.default_lit.lexeme = value.*.lit.lexeme.copy()
+                        fs.default_lit.span = value.*.lit.span
+                        fs.has_default_lit = true
+                    }
+                }
+
+                fs.ty = collect_type_sig(hs.*.body.pin, hf.*.ty)
+                fs.type_name = portable_type_name(fs.ty.pin)
+                sig.fields.push(fs)
+            } else {
+                // Visibility exists even when a field has no written type.
+                make fs = hir::HirFieldSig {}
+
+                fs.name_span = hf.*.name_span.copy()
+                fs.name = hf.*.name.copy()
+                fs.is_pub = hf.*.is_pub
+                fs.is_const = hf.*.is_const
+                fs.is_pure = hf.*.is_pure
+                fs.is_unsafe = hf.*.is_unsafe
+                sig.fields.push(fs)
+            }
+
+            fi = fi + 1
+        }
+
+        out.*.push(sig)
+        si = si + 1
+    }
+}
+
+// flatten a module's free functions into portable signatures, appending them to `out`
+@pub
+make collect_free_sigs_into (out: ref<hir::HirFuncSig[]>, module: ref<hir::HirModule>, module_name: str, source: ref<str>, struct_names: ref<str[]>) {
+    make fi: uint = 0
+
+    while fi < module.*.funcs.len() {
+        make attached = false
+        make ai: uint = 0
+
+        while ai < module.*.attached_funcs.len() {
+            if module.*.attached_funcs[ai].func == fi {
+                attached = true
+            }
+
+            ai = ai + 1
+        }
+
+        if !attached {
+            make f = module.*.funcs[fi].pin
+            make sig = hir::HirFuncSig {}
+
+            sig.path = module_name.copy()
+            sig.source = source
+            sig.name_span = f.*.name_span.copy()
+            sig.is_noreturn = facts::noreturn_function(f)
+            sig.module = module_name.copy()
+            sig.name = f.*.name !
+            sig.is_variadic = f.*.is_variadic
+
+            for tag : f.*.tags {
+                if tag == "unsafe" {
+                    sig.is_unsafe = true
+                }
+            }
+
+            make pi: uint = 0
+
+            while pi < f.*.body.param_count {
+                if pi < f.*.body.locals.len() {
+                    make param = f.*.body.locals[pi].pin
+
+                    if param.*.has_ty && param.*.ty < f.*.body.types.len() {
+                        make param_ty = collect_type_sig(f.*.body.pin, param.*.ty)
+                        sig.param_aggs.push(portable_type_is_aggregate(param_ty.pin, struct_names))
+                        sig.param_tys.push(param_ty)
+                    } else {
+                        sig.param_aggs.push(false)
+                        sig.param_tys.push(hir::HirTypeSig {})
+                    }
+                } else {
+                    sig.param_aggs.push(false)
+                    sig.param_tys.push(hir::HirTypeSig {})
+                }
+
+                pi = pi + 1
+            }
+
+            if f.*.has_ret_ty && f.*.ret_ty < f.*.body.types.len() {
+                sig.has_ret = true
+                sig.ret_ty = collect_type_sig(f.*.body.pin, f.*.ret_ty)
+                sig.ret_agg = portable_type_is_aggregate(sig.ret_ty.pin, struct_names)
+            }
+
+            out.*.push(sig)
+        }
+
+        fi = fi + 1
+    }
+}
+
+@pub
+make build (state: ref<session::Session>) -> void {
+    make providers: bool[] = []
+    for unit : state.*.units { providers.push(unit.hir_module.attached_funcs.len() > 0) }
+    make changed = true
+    while changed {
+        changed = false
+        make host: uint = 0
+        while host < state.*.units.len() {
+            for imported : state.*.units[host].imports {
+                if imported.resolved && providers[imported.unit] && !providers[host] {
+                    providers[host] = true
+                    changed = true
+                }
+            }
+            host++
+        }
+    }
+    make host: uint = 0
+    while host < state.*.units.len() {
+        make index: uint = 0
+        while index < state.*.units[host].imports.len() {
+            make imported = state.*.units[host].imports[index].pin
+            imported.*.provides_methods = imported.*.resolved && providers[imported.*.unit]
+            index++
+        }
+        host++
+    }
+    state.*.attached_sigs = []
+    state.*.struct_sigs = []
+    state.*.free_sigs = []
+
+    // Collect every struct name in the compilation first. A signature's return type can be
+    // declared in a different unit than the function (e.g. `hir::lower` returns `HirModule`
+    // from `hir.quip`), so classification cannot look at the function's own module alone.
+    make struct_names: str[] = []
+    make si: uint = 0
+
+    while si < state.*.compilation_stack.len() {
+        make module = state.*.units[state.*.compilation_stack[si]].hir_module.pin
+        make mi: uint = 0
+
+        while mi < module.*.structs.len() {
+            make hs = module.*.structs[mi].pin
+            struct_names.push(hs.*.name !)
+            mi = mi + 1
+        }
+
+        si = si + 1
+    }
+
+    make i: uint = 0
+
+    while i < state.*.compilation_stack.len() {
+        make id = state.*.compilation_stack[i]
+        make module = state.*.units[id].hir_module.pin
+        make module_name = state.*.units[id].path_rel.get()
+        collect_sigs_into(state.*.attached_sigs.pin, module, module_name.copy(), state.*.units[id].content.pin, struct_names.pin)
+        collect_struct_sigs_into(state.*.struct_sigs.pin, module, module_name.copy(), state.*.units[id].content.pin)
+        collect_free_sigs_into(state.*.free_sigs.pin, module, module_name, state.*.units[id].content.pin, struct_names.pin)
+        i = i + 1
+    }
+}

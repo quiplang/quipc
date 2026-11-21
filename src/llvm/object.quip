@@ -4,12 +4,11 @@
     make c = @import "../../library/std/ffi/c.quip"
     make api = @import "bindings.quip"
     make lower = @import "lower.quip"
-    make memory = @import "../memory/report.quip"
-    make mir = @import "../mir/mir.quip"
-    make flow = @import "../mir/flow.quip"
-    make optimize = @import "../mir/optimize.quip"
-    make graph = @import "../memory/lifetimes/graph.quip"
-    make planning = @import "../memory/plan.quip"
+    make memory = @import "../analysis/mir/memory/report.quip"
+    make mir = @import "../repr/mir/mir.quip"
+    make optimize = @import "../repr/mir/optimize.quip"
+    make graph = @import "../analysis/mir/memory/lifetimes/graph.quip"
+    make planning = @import "storage/plan.quip"
     make link = @import "link.quip"
 }
 

@@ -1,0 +1,293 @@
+@pure @const {
+    make session = @import "session.quip"
+    make model = @import "unit/pkg.quip"
+    make paths = @import "unit/paths.quip"
+    make exports = @import "unit/exports.quip"
+    make parse = @import "frontend/parse.quip"
+    make sources = @import "sources.quip"
+    make profile = @import "analysis_profile.quip"
+    make std = @import "std"
+    make hir = @import "../repr/hir/hir.quip"
+
+    make Unit: Type = model::Unit
+    make ImportInfo: Type = model::ImportInfo
+    make Session: Type = session::Session
+}
+
+@pub
+make discover (main: std::io::Path, names: str[], paths: std::io::Path[], hide_warnings: bool, os: str, timings: ref<profile::Profile>) -> !Session {
+    make manager = Session {}
+    manager.hide_warnings = hide_warnings
+    manager.platform_name = os
+    manager.package_names = names
+    manager.package_paths = paths
+
+    declare(manager.pin, main, timings) catch err {
+        return err
+    }
+
+    // the entry file is always declared first, so it is unit 0
+    if manager.units.len() > 0 {
+        manager.units[0].is_main = true
+    }
+
+    return manager
+}
+
+make import_path (state: ref<Session>, from: std::io::Path, path: str) -> std::io::Path {
+    make name: str = ""
+    make end: uint = 0
+
+    while end < path.len() && path[end] != '/' {
+        name.push(path[end])
+        end = end + 1
+    }
+
+    make i: uint = 0
+
+    while i < state.*.package_names.len() {
+        if name == state.*.package_names[i] {
+            make root = state.*.package_paths[i].copy()
+            if end == path.len() { return root }
+
+            make suffix: str = ""
+            end = end + 1
+
+            while end < path.len() {
+                suffix.push(path[end])
+                end = end + 1
+            }
+
+            return paths::resolve_import(root, suffix)
+        }
+
+        i = i + 1
+    }
+
+    make relative = paths::resolve_import(from, path.copy())
+    if path.len() == 0 || path[0] == '/' || path[0] == '~' { return relative }
+    if paths::can_open_import(relative.pin) { return relative }
+
+    make home = std::process::Environment.get("HOME", "")
+    if home.len() == 0 { return relative }
+
+    make installed = std::io::Path.create(home + "/.quip/current/lib/" + path)
+    if paths::can_open_import(installed.pin) { return installed }
+
+    return relative
+}
+
+make find_by_key (state: ref<Session>, key: str) -> uint? {
+    make i: uint = 0
+
+    while i < state.*.units.len() {
+        if state.*.units[i].key == key {
+            return i
+        }
+
+        i = i + 1
+    }
+
+    return none
+}
+
+make declare (state: ref<Session>, path: std::io::Path, timings: ref<profile::Profile>) -> !uint {
+    make key = sources::canonical(path.get())
+
+    match find_by_key(state, key.copy()) {
+        none {}
+        some { return some }
+    }
+
+    make id: uint = state.*.units.len()
+    make u = Unit.init(std::io::Path.create(key.copy()), id, state.*.hide_warnings) catch err {
+        return err
+    }
+
+    u.platform_name = state.*.platform_name.copy()
+    u.key = key
+    state.*.units.push(u)
+
+    parse::parse_self(state.*.units[id].pin, timings) catch err {
+        return err
+    }
+
+    // recurse into every import *before* pushing this unit onto the stack, so
+    // dependencies always end up earlier in `compilation_stack`
+    make ii: uint = 0
+
+    while ii < state.*.units[id].imports.len() {
+        make target = import_path(state, state.*.units[id].path_rel.copy(), state.*.units[id].imports[ii].path)
+        declare(state, target, timings) catch err {
+            return err
+        }
+
+        ii = ii + 1
+    }
+
+    state.*.compilation_stack.push(id)
+
+    return id
+}
+
+@pub
+make resolve_all (state: ref<Session>) -> void {
+    make si: uint = 0
+
+    while si < state.*.compilation_stack.len() {
+        make id = state.*.compilation_stack[si]
+
+        // import bindings are rebuilt from scratch so units retained across checks do not
+        // accumulate stale or duplicate entries
+        state.*.units[id].hir_imports = []
+
+        make ii: uint = 0
+
+        while ii < state.*.units[id].imports.len() {
+            state.*.units[id].imports[ii].resolved = false
+            make target = import_path(state, state.*.units[id].path_rel.copy(), state.*.units[id].imports[ii].path !)
+            make key = sources::canonical(target.get())
+
+            match find_by_key(state, key) {
+                none {}
+                some {
+                    state.*.units[id].imports[ii].unit = some
+                    state.*.units[id].imports[ii].resolved = true
+                    state.*.units[id].imports[ii].exports = exports::exports_of(state.*.units[some].program.pin, state.*.platform_name.copy())
+
+                    if state.*.units[id].imports[ii].alias.len() == 0 {
+                        ii++
+                        continue
+                    }
+                    make imp = hir::HirImport {}
+
+                    imp.alias = state.*.units[id].imports[ii].alias !
+                    imp.basename = exports::basename_of(state.*.units[id].imports[ii].path !)
+                    imp.exports = exports::exports_of(state.*.units[some].program.pin, state.*.platform_name.copy())
+                    state.*.units[id].hir_imports.push(imp)
+                }
+            }
+
+            ii = ii + 1
+        }
+
+        si = si + 1
+    }
+
+    // flatten nested namespaces now that every import chain has been resolved
+    make fi: uint = 0
+
+    while fi < state.*.compilation_stack.len() {
+        make id = state.*.compilation_stack[fi]
+        state.*.units[id].hir_namespaces = []
+        make ii: uint = 0
+
+        while ii < state.*.units[id].imports.len() {
+            if state.*.units[id].imports[ii].resolved && state.*.units[id].imports[ii].alias.len() > 0 {
+                make alias = state.*.units[id].imports[ii].alias !
+                make target = state.*.units[id].imports[ii].unit
+                add_namespace(state, id, alias, target)
+            }
+
+            ii = ii + 1
+        }
+
+        fi = fi + 1
+    }
+    rebuild_links(state)
+}
+
+make add_namespace (state: ref<Session>, host: uint, path: str, target: uint) {
+    make exports = exports::exports_of(state.*.units[target].program.pin, state.*.platform_name.copy())
+
+    // collect re-exported units before `exports` is moved into the namespace entry
+    make sub_names: str[] = []
+    make sub_units: uint[] = []
+    make ei: uint = 0
+
+    while ei < exports.len() {
+        if exports[ei].is_unit {
+            make sub = find_resolved_import(state, state.*.units[target].imports.pin, exports[ei].name !)
+
+            if sub < state.*.units.len() {
+                sub_names.push(exports[ei].name !)
+                sub_units.push(sub)
+            }
+        }
+
+        ei = ei + 1
+    }
+
+    make ns = hir::HirNamespace {}
+
+    ns.path = path.copy()
+    ns.module_name = state.*.units[target].path_rel.get()
+    ns.exports = exports
+    ns.unit = target
+    state.*.units[host].hir_namespaces.push(ns)
+
+    make sj: uint = 0
+
+    while sj < sub_names.len() {
+        add_namespace(state, host, path + "::" + sub_names[sj], sub_units[sj])
+        sj = sj + 1
+    }
+
+    while sub_names.len() > 0 { make _ = sub_names.pop() }
+
+    while sub_units.len() > 0 { make _ = sub_units.pop() }
+}
+
+make find_resolved_import (state: ref<Session>, imports: ref<ImportInfo[]>, alias: str) -> uint {
+    make i: uint = 0
+
+    while i < imports.*.len() {
+        if imports.*[i].alias == alias && imports.*[i].resolved {
+            return imports.*[i].unit
+        }
+
+        i = i + 1
+    }
+
+    return state.*.units.len()
+}
+
+@pub
+make has_errors (state: ref<Session>) -> bool {
+    make i: uint = 0
+
+    while i < state.*.compilation_stack.len() {
+        if state.*.units[state.*.compilation_stack[i]].diag.has_errors() { return true }
+
+        i = i + 1
+    }
+
+    return false
+}
+
+/// Rebuild direct and reverse links after resolving imports. Aliases share one edge.
+@pub
+make rebuild_links (state: ref<Session>) {
+    state.*.dependencies = []
+    state.*.importers = []
+    for unit : state.*.units {
+        _ = unit
+        state.*.dependencies.push(session::UnitLinks {})
+        state.*.importers.push(session::UnitLinks {})
+    }
+    make host: uint = 0
+    while host < state.*.units.len() {
+        for imported : state.*.units[host].imports {
+            if !imported.resolved || imported.unit >= state.*.units.len() { continue }
+            make seen = false
+            for target : state.*.dependencies[host].ids {
+                if target == imported.unit { seen = true }
+            }
+            if !seen {
+                state.*.dependencies[host].ids.push(imported.unit)
+                state.*.importers[imported.unit].ids.push(host)
+            }
+        }
+        host++
+    }
+}

@@ -1,0 +1,158 @@
+@pure @const {
+    make std = @import "std"
+    make lexer = @import "../token.quip"
+    make ast = @import "../../util/ast.quip"
+    make util = @import "../../util/pkg.quip"
+    make diags = @import "../../diag/diagnosis.quip"
+    make e = @import "../../diag/err.quip"
+    make linemap = @import "../../core/sourcemap.quip"
+    make hir = @import "../../repr/hir/hir.quip"
+    make mir = @import "../../repr/mir/mir.quip"
+    make ty = @import "../../repr/types/pkg.quip"
+    make typeck = @import "../../analysis/hir/types/check.quip"
+    make symcheck = @import "../../analysis/hir/semantics/symbol/resolve.quip"
+    make memr = @import "../../analysis/mir/memory/report.quip"
+}
+
+/// identifies the current stage or failure state of a compilation unit.
+@pub
+make enum UnitStatus {
+    Unloaded,
+    Lexing,
+    Parsing,
+    Checking,
+    PreAnalysis,
+    Analysis,
+    MemAnalysis,
+    LLVM,
+    Done,
+    Aborted     // stopped early, the compiler unwinds and cleans up
+}
+
+@pub
+make type ImportInfo {
+    @pub make span: util::Span = .{}
+    @pub make is_public: bool = false
+    @pub make provides_methods: bool = false
+    @pub make exports: hir::HirExport[] = []
+    @pub make alias: str = ""    // the name the importing file binds it to
+    @pub make path: str = ""     // the raw string literal, relative to the importing file
+    @pub make unit: uint = 0     // index into Session.units; set by `resolve_all` (phase 2)
+    @pub make resolved: bool = false
+}
+
+/// Owned outputs of type analysis. MIR construction consumes this bundle.
+@pub
+make type TypedOutput {
+    @pub make valid: bool = false
+    @pub make tys: ty::TyInterner = ty::TyInterner.create()
+    @pub make checked: typeck::ModuleTypeck = .{}
+}
+
+/// Owned outputs validated by memory analysis, ready for the backend.
+@pub
+make type AnalyzedOutput {
+    @pub make mir_valid: bool = false
+    @pub make memory_valid: bool = false
+    @pub make mir_module: mir::MirModule = .{}
+    @pub make mem_report: memr::MemReport = .{}
+}
+
+/// holds a source file and the intermediate results of its compilation.
+@pub
+make type Unit {
+    @pub {
+        make id: uint
+
+        make content: str
+        make map: linemap::LineMap
+        make tokens: lexer::Token[]
+        @pub make extra_warnings: bool = false
+
+        make path_rel: std::io::Path
+        make key: str = ""       // canonical absolute path, used to de-duplicate imports
+
+        make program: owned<ast::AST_Head>[]
+        make hir_module: hir::HirModule = .{}
+        make symbols: symcheck::SymbolTable = .{}
+        make typed: TypedOutput = .{}
+        make analyzed: AnalyzedOutput = .{}
+        make emit_mir: bool = false
+        make emit_mem: bool = false
+        make defer_llvm: bool = false
+        make emit_llvm: bool = true    // enable LLVM codegen + object emission
+        make print_llvm_optimized: bool = false
+        make print_llvm: bool = false  // dump the textual IR to stdout (--emit-llvm)
+        make llvm_ll: str = ""         // path for the .ll output; set by the Driver
+        make keep_llvm: bool = false
+        make verbose: bool = false
+        make llvm_optimization: str = "-O0"
+        make llvm_out: str = ""        // path for the .o output; set by the Driver
+        make entry_name: str = "main"  // entry point function; set by the Driver
+        make is_main: bool = false     // true for the entry file the user asked to compile
+        make platform_name: str = ""   // OS name for @target selection, set by the Driver
+
+        // populated by `parse_self`, during phase 1 (Declare)
+        make public_symbols: str[] = []
+        make imports: ImportInfo[] = []
+
+        // populated by `resolve_all` (phase 2): for each resolved import, the alias, the imported
+        // file's base name and its public exports. `proceed` hands these to the checker so that
+        // namespace-qualified references such as `posix::dup2` can be resolved.
+        make hir_imports: hir::HirImport[] = []
+
+        // populated by `resolve_all`: every namespace chain reachable from this unit's imports,
+        // flattened (direct aliases plus nested re-exports such as `os::syscall`)
+        make hir_namespaces: hir::HirNamespace[] = []
+
+        make status: UnitStatus
+
+
+        make diag: diags::Diagnostic
+    }
+
+    @pub
+    make init (path: std::io::Path, id: uint, hide_warnings: bool) -> !Unit {
+
+        make u = Unit {}
+
+        u.id = id
+        u.diag = diags::Diagnostic.init()
+
+        u.diag.hide_warnings = hide_warnings
+        u.diag.path = path.get()
+
+        make f = std::io::File.open(path.copy(), "r") catch {
+            u.diag.report(diags::Diag.panic(e::Err.Internal, "unable to open source file"))
+            return error.CompilationAborted
+        }
+
+        f.read() catch {
+            f.close()
+            u.diag.report(diags::Diag.panic(e::Err.Internal, "unable to read source file"))
+            return error.CompilationAborted
+        }
+
+        u.content = f.content
+        f.close()
+
+        u.map = linemap::LineMap.init(u.content.pin)
+        u.diag.set_source(path.get(), u.content !)
+
+        u.status = UnitStatus.Unloaded
+
+        u.path_rel = path
+
+        return u
+    }
+
+    /// Any HIR edit invalidates typed results and every downstream result.
+    /// MIR edits must at least clear memory_valid before memory checking again.
+    @pub @this
+    make invalidate_analysis () {
+        this.typed.valid = false
+        this.analyzed.mir_valid = false
+        this.analyzed.memory_valid = false
+    }
+
+}

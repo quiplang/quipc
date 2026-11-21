@@ -1,5 +1,5 @@
 @pure @const {
-    make hir = @import "../hir/hir.quip"
+    make hir = @import "../repr/hir/hir.quip"
     make util = @import "../util/pkg.quip"
     make diags = @import "diagnosis.quip"
 }

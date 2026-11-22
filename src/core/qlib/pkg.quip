@@ -1,0 +1,138 @@
+@pub @const make VERSION: uint = 1
+@pub @const make HEADER_SIZE: uint = 24
+@pub @const make ENTRY_SIZE: uint = 24
+@pub @const make MAX_SECTIONS: uint = 64
+
+@pub
+make type Section {
+    @pub make kind: uint = 0
+    @pub make offset: uint = 0
+    @pub make length: uint = 0
+}
+
+@pub
+make type Payload {
+    @pub make kind: uint = 0
+    @pub make bytes: str = ""
+}
+
+make word (bytes: ref<str>, offset: uint) -> uint {
+    make result: uint = 0
+    make i: uint = 0
+    while i < 8 {
+        @unsafe make byte: u8 = bytes.*[offset + i]
+        make wide: uint = byte
+        result = result | (wide << (i * 8))
+        i++
+    }
+
+    return result
+}
+
+make append_word (bytes: ref<str>, value: uint) {
+    make i: uint = 0
+    while i < 8 {
+        @unsafe make byte: char = (value >> (i * 8)) & 255
+        bytes.*.push(byte)
+        i++
+    }
+}
+
+// Returns only the small directory; offsets borrow the caller's original bytes.
+// Never interprets or copies section payloads. All ranges are checked up front.
+@pub
+make inspect (bytes: ref<str>) -> !Section[] {
+    if bytes.*.len() < HEADER_SIZE { return error.InvalidQlib }
+    if bytes.*[0] != 'Q' || bytes.*[1] != 'L' || bytes.*[2] != 'I' || bytes.*[3] != 'B' {
+        return error.InvalidQlib
+    }
+
+    if bytes.*[4] != '\0' || bytes.*[5] != '\0' || bytes.*[6] != '\0' || bytes.*[7] != '\0' {
+        return error.InvalidQlib
+    }
+
+    if word(bytes, 8) != VERSION { return error.UnsupportedQlibVersion }
+
+    make count = word(bytes, 16)
+    if count > MAX_SECTIONS { return error.InvalidQlib }
+
+    make end = HEADER_SIZE + count * ENTRY_SIZE
+    if end > bytes.*.len() { return error.InvalidQlib }
+
+    make sections: Section[] = []
+    make i: uint = 0
+    while i < count {
+        make entry = HEADER_SIZE + i * ENTRY_SIZE
+        make kind = word(bytes, entry)
+        make offset = word(bytes, entry + 8)
+        make length = word(bytes, entry + 16)
+
+        // Canonical contiguous ranges permit linear validation, no sorting.
+        if kind == 0 || offset != end || offset > bytes.*.len() { return error.InvalidQlib }
+        if length > bytes.*.len() - offset { return error.InvalidQlib }
+
+        make j: uint = 0
+        while j < sections.len() {
+            if sections[j].kind == kind { return error.InvalidQlib }
+            j++
+        }
+
+        sections.push(Section { kind = kind, offset = offset, length = length })
+        end = offset + length
+        i++
+    }
+
+    if end != bytes.*.len() { return error.InvalidQlib }
+
+    return sections
+}
+
+// Unknown nonzero section kinds are preserved for future payload schemas.
+@pub
+make encode (payloads: ref<Payload[]>) -> !str {
+    if payloads.*.len() > MAX_SECTIONS { return error.InvalidQlib }
+
+    make offset = HEADER_SIZE + payloads.*.len() * ENTRY_SIZE
+    make i: uint = 0
+    while i < payloads.*.len() {
+        if payloads.*[i].kind == 0 { return error.InvalidQlib }
+
+        make j: uint = 0
+        while j < i {
+            if payloads.*[j].kind == payloads.*[i].kind { return error.InvalidQlib }
+            j++
+        }
+
+        i++
+    }
+
+    make bytes: str = "QLIB\0\0\0\0"
+    append_word(bytes.pin, VERSION)
+    append_word(bytes.pin, payloads.*.len())
+
+    i = 0
+    while i < payloads.*.len() {
+        make length = payloads.*[i].bytes.len()
+        if length > 9223372036854775807 - offset { return error.QlibTooLarge }
+
+        append_word(bytes.pin, payloads.*[i].kind)
+        append_word(bytes.pin, offset)
+        append_word(bytes.pin, length)
+        offset = offset + length
+
+        i++
+    }
+
+    i = 0
+    while i < payloads.*.len() {
+        make j: uint = 0
+        while j < payloads.*[i].bytes.len() {
+            bytes.push(payloads.*[i].bytes[j])
+            j++
+        }
+
+        i++
+    }
+
+    return bytes
+}
